@@ -7,6 +7,7 @@ backend/db.sqlite3
 backend/.env
 backend/.env.*
 !backend/.env.example
+backend/media/
 
 # Frontend (Node/Vite)
 frontend/node_modules/

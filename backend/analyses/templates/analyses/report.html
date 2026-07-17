@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Analysis Report - {{ analysis.name }}</title>
+<style>
+  body { font-family: Helvetica, Arial, sans-serif; color: #222; font-size: 12px; }
+  h1 { font-size: 20px; margin-bottom: 0; }
+  .meta { color: #666; margin-bottom: 20px; }
+  .summary-table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+  .summary-table td { padding: 6px 10px; border: 1px solid #ddd; }
+  .summary-table td.label { font-weight: bold; width: 160px; background: #f5f5f5; }
+  h2 { font-size: 15px; border-bottom: 1px solid #ccc; padding-bottom: 4px; margin-top: 24px; }
+  table.issues { width: 100%; border-collapse: collapse; }
+  table.issues th, table.issues td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; font-size: 11px; }
+  table.issues th { background: #f5f5f5; }
+  pre { background: #f7f7f7; border: 1px solid #ddd; padding: 10px; white-space: pre-wrap; font-size: 10px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 3px; color: #fff; font-size: 11px; }
+  .status-completed { background: #2e7d32; }
+  .status-failed { background: #c62828; }
+  .status-pending { background: #757575; }
+  .status-running { background: #1565c0; }
+  .status-cancelled { background: #9e9e9e; }
+</style>
+</head>
+<body>
+  <h1>Code Analysis Report</h1>
+  <div class="meta">Generated {{ generated_at }}</div>
+
+  <table class="summary-table">
+    <tr><td class="label">Name</td><td>{{ analysis.name }}</td></tr>
+    <tr><td class="label">Language</td><td>{{ analysis.language|default:"Unknown" }}</td></tr>
+    <tr><td class="label">Status</td><td><span class="badge status-{{ analysis.status }}">{{ analysis.get_status_display }}</span></td></tr>
+    <tr><td class="label">Quality Score</td><td>{% if analysis.quality_score is not None %}{{ analysis.quality_score }}/100{% else %}N/A{% endif %}</td></tr>
+    <tr><td class="label">Lines of Code</td><td>{{ analysis.lines_of_code }}</td></tr>
+    <tr><td class="label">Issues Found</td><td>{{ analysis.issues_count }}</td></tr>
+    <tr><td class="label">Created</td><td>{{ analysis.created_at }}</td></tr>
+  </table>
+
+  <h2>Issues</h2>
+  {% if analysis.issues %}
+  <table class="issues">
+    <tr><th>Line</th><th>Type</th><th>Message</th></tr>
+    {% for issue in analysis.issues %}
+    <tr><td>{{ issue.line|default:"-" }}</td><td>{{ issue.type }}</td><td>{{ issue.message }}</td></tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p>No issues found.</p>
+  {% endif %}
+
+  {% if analysis.ai_explanation %}
+  <h2>AI Explanation</h2>
+  <p>{{ analysis.ai_explanation|linebreaks }}</p>
+  {% endif %}
+
+  {% if analysis.ai_suggestions %}
+  <h2>AI Suggestions</h2>
+  <ul>
+    {% for suggestion in analysis.ai_suggestions %}
+    <li>{{ suggestion }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+
+  {% if analysis.ai_refactored_code %}
+  <h2>AI-Refactored Code</h2>
+  <pre>{{ analysis.ai_refactored_code }}</pre>
+  {% endif %}
+</body>
+</html>
