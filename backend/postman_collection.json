@@ -1,0 +1,198 @@
+{
+  "info": {
+    "name": "Code Analyzer API - Full Collection",
+    "_postman_id": "e8b9c8a6-collection",
+    "description": "Collection of all API endpoints for the Code Analyzer project. Set `base_url` and `auth_token` in collection variables.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8000" },
+    { "key": "auth_token", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "Auth/Register",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": { "mode": "raw", "raw": "{\n  \"email\": \"user@example.com\",\n  \"username\": \"user1\",\n  \"password\": \"password123\"\n}" },
+        "url": { "raw": "{{base_url}}/api/auth/register/", "host": ["{{base_url}}"], "path": ["api","auth","register",""] }
+      }
+    },
+    {
+      "name": "Auth/Login (get JWT)",
+      "request": {
+        "method": "POST",
+        "header": [ { "key": "Content-Type", "value": "application/json" } ],
+        "body": { "mode": "raw", "raw": "{\n  \"username\": \"user1\",\n  \"password\": \"password123\"\n}" },
+        "url": { "raw": "{{base_url}}/api/auth/login/", "host": ["{{base_url}}"], "path": ["api","auth","login",""] }
+      }
+    },
+    {
+      "name": "Auth/Refresh",
+      "request": { "method": "POST", "header": [ { "key": "Content-Type", "value": "application/json" } ], "body": { "mode": "raw", "raw": "{\n  \"refresh\": \"{{refresh_token}}\"\n}" }, "url": { "raw": "{{base_url}}/api/auth/refresh/", "host": ["{{base_url}}"], "path": ["api","auth","refresh",""] } }
+    },
+    {
+      "name": "Auth/Logout",
+      "request": { "method": "POST", "header": [ { "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "body": { "mode": "raw", "raw": "{\n  \"refresh\": \"{{refresh_token}}\"\n}" }, "url": { "raw": "{{base_url}}/api/auth/logout/", "host": ["{{base_url}}"], "path": ["api","auth","logout",""] } }
+    },
+    {
+      "name": "Auth/Forgot Password",
+      "request": { "method": "POST", "header": [ { "key": "Content-Type", "value": "application/json" } ], "body": { "mode": "raw", "raw": "{\n  \"email\": \"user@example.com\"\n}" }, "url": { "raw": "{{base_url}}/api/auth/forgot-password/", "host": ["{{base_url}}"], "path": ["api","auth","forgot-password",""] } }
+    },
+    {
+      "name": "Auth/Reset Password",
+      "request": { "method": "POST", "header": [ { "key": "Content-Type", "value": "application/json" } ], "body": { "mode": "raw", "raw": "{\n  \"uid\": \"<uid from email>\",\n  \"token\": \"<token from email>\",\n  \"new_password\": \"newpass123\"\n}" }, "url": { "raw": "{{base_url}}/api/auth/reset-password/", "host": ["{{base_url}}"], "path": ["api","auth","reset-password",""] } }
+    },
+    {
+      "name": "Auth/Verify Email",
+      "request": { "method": "GET", "header": [], "url": { "raw": "{{base_url}}/api/auth/verify-email/?uid=<uid>&token=<token>", "host": ["{{base_url}}"], "path": ["api","auth","verify-email",""], "query": [ { "key": "uid", "value": "<uid>" }, { "key": "token", "value": "<token>" } ] } }
+    },
+    {
+      "name": "Auth/Resend Verification",
+      "request": { "method": "POST", "header": [ { "key": "Content-Type", "value": "application/json" } ], "body": { "mode": "raw", "raw": "{\n  \"email\": \"user@example.com\"\n}" }, "url": { "raw": "{{base_url}}/api/auth/resend-verification/", "host": ["{{base_url}}"], "path": ["api","auth","resend-verification",""] } }
+    },
+    {
+      "name": "Auth/Change Password",
+      "request": { "method": "POST", "header": [ { "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "body": { "mode": "raw", "raw": "{\n  \"old_password\": \"oldpass\",\n  \"new_password\": \"newpass123\"\n}" }, "url": { "raw": "{{base_url}}/api/auth/change-password/", "host": ["{{base_url}}"], "path": ["api","auth","change-password",""] } }
+    },
+    {
+      "name": "Profile/Get",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/users/profile/", "host": ["{{base_url}}"], "path": ["api","users","profile",""] } }
+    },
+    {
+      "name": "Profile/Patch",
+      "request": { "method": "PATCH", "header": [ { "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "body": { "mode": "raw", "raw": "{\n  \"display_name\": \"New Name\"\n}" }, "url": { "raw": "{{base_url}}/api/users/profile/", "host": ["{{base_url}}"], "path": ["api","users","profile",""] } }
+    },
+    {
+      "name": "Profile/Delete",
+      "request": { "method": "DELETE", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/users/profile/", "host": ["{{base_url}}"], "path": ["api","users","profile",""] } }
+    },
+    {
+      "name": "Avatar/Upload",
+      "request": { "method": "POST", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "body": { "mode": "formdata", "formdata": [ { "key": "avatar", "type": "file", "src": "<path-to-file>" } ] }, "url": { "raw": "{{base_url}}/api/users/avatar/", "host": ["{{base_url}}"], "path": ["api","users","avatar",""] } }
+    },
+
+    {
+      "name": "Dashboard/Summary",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/dashboard/", "host": ["{{base_url}}"], "path": ["api","dashboard",""] } }
+    },
+    {
+      "name": "Dashboard/Stats",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/dashboard/stats/", "host": ["{{base_url}}"], "path": ["api","dashboard","stats",""] } }
+    },
+    {
+      "name": "Dashboard/Recent",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/dashboard/recent/?limit=10", "host": ["{{base_url}}"], "path": ["api","dashboard","recent",""], "query": [ { "key": "limit", "value": "10" } ] } }
+    },
+    {
+      "name": "Dashboard/Languages",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/dashboard/languages/", "host": ["{{base_url}}"], "path": ["api","dashboard","languages",""] } }
+    },
+    {
+      "name": "Dashboard/Scores",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/dashboard/scores/", "host": ["{{base_url}}"], "path": ["api","dashboard","scores",""] } }
+    },
+
+    {
+      "name": "Analysis/List",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/analysis/", "host": ["{{base_url}}"], "path": ["api","analysis",""] } }
+    },
+    {
+      "name": "Analysis/Analyze (POST)",
+      "request": { "method": "POST", "header": [ { "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "body": { "mode": "raw", "raw": "{\n  \"language\": \"python\",\n  \"code\": \"print(\"hello\")\",\n  \"name\": \"example\"\n}" }, "url": { "raw": "{{base_url}}/api/analysis/analyze/", "host": ["{{base_url}}"], "path": ["api","analysis","analyze",""] } }
+    },
+    {
+      "name": "Analysis/Upload (file)",
+      "request": { "method": "POST", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "body": { "mode": "formdata", "formdata": [ { "key": "file", "type": "file", "src": "<path-to-file>" }, { "key": "name", "type": "text", "value": "optional-name" } ] }, "url": { "raw": "{{base_url}}/api/analysis/upload/", "host": ["{{base_url}}"], "path": ["api","analysis","upload",""] } }
+    },
+    {
+      "name": "Analysis/Detail (GET)",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/analysis/1/", "host": ["{{base_url}}"], "path": ["api","analysis","1",""] } }
+    },
+    {
+      "name": "Analysis/Delete (DELETE)",
+      "request": { "method": "DELETE", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/analysis/1/", "host": ["{{base_url}}"], "path": ["api","analysis","1",""] } }
+    },
+    {
+      "name": "Analysis/Reanalyze",
+      "request": { "method": "POST", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/analysis/1/reanalyze/", "host": ["{{base_url}}"], "path": ["api","analysis","1","reanalyze",""] } }
+    },
+    {
+      "name": "Analysis/Cancel",
+      "request": { "method": "POST", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/analysis/1/cancel/", "host": ["{{base_url}}"], "path": ["api","analysis","1","cancel",""] } }
+    },
+    {
+      "name": "Analysis/Status",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/analysis/1/status/", "host": ["{{base_url}}"], "path": ["api","analysis","1","status",""] } }
+    },
+    {
+      "name": "Analysis/Suggestions (AI)",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/analysis/1/suggestions/", "host": ["{{base_url}}"], "path": ["api","analysis","1","suggestions",""] } }
+    },
+    {
+      "name": "Analysis/Explanation (AI)",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/analysis/1/explanation/", "host": ["{{base_url}}"], "path": ["api","analysis","1","explanation",""] } }
+    },
+    {
+      "name": "Analysis/Refactor (AI)",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/analysis/1/refactor/", "host": ["{{base_url}}"], "path": ["api","analysis","1","refactor",""] } }
+    },
+
+    {
+      "name": "History/List",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/history/", "host": ["{{base_url}}"], "path": ["api","history",""] } }
+    },
+    {
+      "name": "History/Clear",
+      "request": { "method": "DELETE", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/history/clear/", "host": ["{{base_url}}"], "path": ["api","history","clear",""] } }
+    },
+
+    {
+      "name": "Reports/JSON",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/reports/1/json/", "host": ["{{base_url}}"], "path": ["api","reports","1","json",""] } }
+    },
+    {
+      "name": "Reports/HTML",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/reports/1/html/", "host": ["{{base_url}}"], "path": ["api","reports","1","html",""] } }
+    },
+    {
+      "name": "Reports/PDF",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/reports/1/pdf/", "host": ["{{base_url}}"], "path": ["api","reports","1","pdf",""] } }
+    },
+
+    {
+      "name": "Search",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/search/?q=example", "host": ["{{base_url}}"], "path": ["api","search",""], "query": [ { "key": "q", "value": "example" } ] } }
+    },
+
+    {
+      "name": "AI/Chat",
+      "request": { "method": "POST", "header": [ { "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "body": { "mode": "raw", "raw": "{\n  \"message\": \"Explain this code\",\n  \"history\": []\n}" }, "url": { "raw": "{{base_url}}/api/ai/chat/", "host": ["{{base_url}}"], "path": ["api","ai","chat",""] } }
+    },
+
+    {
+      "name": "Admin/Users (list)",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/admin/users/", "host": ["{{base_url}}"], "path": ["api","admin","users",""] } }
+    },
+    {
+      "name": "Admin/User/Delete",
+      "request": { "method": "DELETE", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/admin/users/1/", "host": ["{{base_url}}"], "path": ["api","admin","users","1",""] } }
+    },
+    {
+      "name": "Admin/Analysis (list)",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/admin/analysis/", "host": ["{{base_url}}"], "path": ["api","admin","analysis",""] } }
+    },
+    {
+      "name": "Admin/Stats",
+      "request": { "method": "GET", "header": [ { "key": "Authorization", "value": "Bearer {{auth_token}}" } ], "url": { "raw": "{{base_url}}/api/admin/stats/", "host": ["{{base_url}}"], "path": ["api","admin","stats",""] } }
+    },
+
+    {
+      "name": "Core/Health",
+      "request": { "method": "GET", "header": [], "url": { "raw": "{{base_url}}/api/health/", "host": ["{{base_url}}"], "path": ["api","health",""] } }
+    }
+  ]
+}
