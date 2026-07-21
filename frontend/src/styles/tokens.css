@@ -1,0 +1,32 @@
+:root {
+  --color-bg: #ffffff;
+  --color-text: #171717;
+  --color-text-secondary: #6b6b64;
+  --color-text-secondary-2: #8c8c85;
+  --color-text-muted: #a3a39c;
+  --color-border: #ececea;
+  --color-border-2: #dcdcd7;
+  --color-border-3: #e5e5e1;
+  --color-accent: #8ff26b;
+  --color-dots: #e6e6e2;
+  --color-success: #3fa54c;
+  --color-success-bg: rgba(63, 165, 76, 0.1);
+  --color-warning: #d97706;
+  --color-danger: #dc2626;
+  --color-danger-2: #e11d48;
+  --color-info: #2563eb;
+  --color-code-string: #059669;
+
+  --font-display: 'Newsreader', serif;
+  --font-body: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  --radius-pill: 100px;
+  --radius-card: 16px;
+  --radius-card-lg: 20px;
+
+  --shadow-hero: 0 24px 60px -30px rgba(0, 0, 0, 0.25);
+  --shadow-card: 0 24px 60px -30px rgba(0, 0, 0, 0.2);
+
+  --bg-dots: radial-gradient(var(--color-dots) 1px, transparent 1px);
+}

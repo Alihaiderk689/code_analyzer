@@ -17,7 +17,7 @@ from .serializers import (
 
 
 def _run_analysis(analysis):
-    result = analyze_code(analysis.source_code)
+    result = analyze_code(analysis.source_code, analysis.language)
     analysis.lines_of_code = result['lines_of_code']
     analysis.issues = result['issues']
     analysis.issues_count = result['issues_count']

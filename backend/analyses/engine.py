@@ -1,3 +1,4 @@
+import ast
 import re
 
 import parso
@@ -154,7 +155,7 @@ def detect_language(filename):
     return 'Unknown'
 
 
-def analyze_code(code):
+def analyze_code(code, language='Unknown'):
     lines = code.splitlines()
     lines_of_code = len([line for line in lines if line.strip()])
 
@@ -176,6 +177,9 @@ def analyze_code(code):
 
     if lines_of_code >= 30 and comment_lines == 0:
         issues.append({'line': None, 'type': 'no_comments', 'message': 'File has no comments.'})
+
+    if language == 'Python':
+        issues.extend(_python_issues(code))
 
     quality_score = _score(lines_of_code, issues)
     return {
