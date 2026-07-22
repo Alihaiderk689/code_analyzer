@@ -111,7 +111,15 @@ class RefactorView(APIView):
             return error
 
         if analysis.ai_refactored_code and not _wants_regenerate(request):
-            return Response({'refactored_code': analysis.ai_refactored_code, 'cached': True})
+            try:
+                cached_changes = json.loads(analysis.ai_refactor_explanation or '[]')
+            except json.JSONDecodeError:
+                cached_changes = []
+            return Response({
+                'refactored_code': analysis.ai_refactored_code,
+                'explanation': cached_changes,
+                'cached': True,
+            })
 
         prompt = (
             f'Language: {analysis.language}\n\n'
@@ -120,14 +128,34 @@ class RefactorView(APIView):
         )
         system_instruction = (
             'You are a senior software engineer. Rewrite the following code applying best practices and fixing '
-            'the listed issues, while preserving behavior. Respond with ONLY the refactored code, no explanation, '
-            'no markdown fences.'
+            'the listed issues, while preserving behavior. Respond with ONLY a JSON object of the shape '
+            '{"code": "<the refactored code, no markdown fences>", "changes": [{"summary": "<what changed, one '
+            'sentence>", "benefit": "<why it\'s better, one sentence>"}, ...]}, one entry per distinct change you '
+            'made, no other text.'
         )
         text, error = _call_ai(prompt, system_instruction)
         if error:
             return error
 
-        refactored_code = _strip_code_fences(text)
+        refactored_code, changes = _parse_refactor_response(text)
+
         analysis.ai_refactored_code = refactored_code
-        analysis.save(update_fields=['ai_refactored_code', 'updated_at'])
-        return Response({'refactored_code': refactored_code, 'cached': False})
+        analysis.ai_refactor_explanation = json.dumps(changes)
+        analysis.save(update_fields=['ai_refactored_code', 'ai_refactor_explanation', 'updated_at'])
+        return Response({'refactored_code': refactored_code, 'explanation': changes, 'cached': False})
+
+
+def _parse_refactor_response(text):
+    """Parses the {"code", "changes"} JSON the refactor prompt asks for. Falls back to
+    treating the whole response as raw code with no explanation if the model didn't
+    follow the format."""
+    try:
+        data = json.loads(_strip_code_fences(text))
+        code = data['code']
+        changes = data.get('changes', [])
+        if not isinstance(changes, list):
+            changes = []
+    except (json.JSONDecodeError, KeyError, TypeError):
+        code = _strip_code_fences(text)
+        changes = []
+    return code, changes
