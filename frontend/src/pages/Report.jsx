@@ -110,7 +110,6 @@ export default function Report() {
       return
     }
     sessionStorage.setItem('ca_pending_snippet', originalSource)
-    sessionStorage.setItem('ca_pending_language', analysis.language)
     sessionStorage.setItem('ca_pending_analysis_name', analysis.name)
     navigate('/analyze')
   }

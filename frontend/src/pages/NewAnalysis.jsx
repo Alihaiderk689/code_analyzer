@@ -3,15 +3,12 @@ import { useNavigate } from 'react-router-dom'
 import { submitAnalysis, uploadAnalysis } from '../lib/resources'
 import { ApiError } from '../lib/api'
 
-const LANGUAGES = ['Python', 'JavaScript', 'Java', 'C++', 'TypeScript', 'Go', 'PHP']
-
 export default function NewAnalysis() {
   const navigate = useNavigate()
   const [mode, setMode] = useState('paste')
   const [name, setName] = useState('')
   const [code, setCode] = useState('')
   const [uploadFile, setUploadFile] = useState(null)
-  const [selectedLanguage, setSelectedLanguage] = useState('Python')
   const [analyzing, setAnalyzing] = useState(false)
   const [error, setError] = useState('')
   const [dragOver, setDragOver] = useState(false)
@@ -59,7 +56,7 @@ export default function NewAnalysis() {
       let result
       let sourceForCache = code
       if (mode === 'paste') {
-        result = await submitAnalysis(trimmedName, selectedLanguage, code)
+        result = await submitAnalysis(trimmedName, code)
       } else {
         sourceForCache = await uploadFile.text()
         result = await uploadAnalysis(uploadFile, trimmedName)
@@ -83,7 +80,7 @@ export default function NewAnalysis() {
     <div style={{ maxWidth: 900, margin: '0 auto', padding: '44px 40px 100px' }}>
       <div style={{ fontFamily: 'var(--font-display)', fontSize: 32, fontWeight: 500 }}>New analysis</div>
       <div style={{ fontSize: 14, color: 'var(--color-text-secondary-2)', marginTop: 4 }}>
-        Paste your code, choose a language, and let AI review it.
+        Paste your code and let AI review it — the language is detected automatically.
       </div>
 
       <div
@@ -241,36 +238,6 @@ export default function NewAnalysis() {
           />
         </div>
       )}
-
-      <div style={{ marginTop: 26 }}>
-        <div style={{ fontSize: 13, color: 'var(--color-text-secondary-2)', marginBottom: 10 }}>
-          Language {mode === 'upload' && '(auto-detected from file extension)'}
-        </div>
-        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-          {LANGUAGES.map((lang) => {
-            const active = selectedLanguage === lang
-            return (
-              <button
-                key={lang}
-                disabled={mode === 'upload'}
-                onClick={() => setSelectedLanguage(lang)}
-                style={{
-                  border: `1px solid ${active ? '#171717' : 'var(--color-border-2)'}`,
-                  background: active ? '#171717' : '#fff',
-                  color: active ? '#fff' : '#171717',
-                  borderRadius: 100,
-                  padding: '9px 16px',
-                  fontSize: 13,
-                  cursor: mode === 'upload' ? 'default' : 'pointer',
-                  opacity: mode === 'upload' ? 0.5 : 1,
-                }}
-              >
-                {lang}
-              </button>
-            )
-          })}
-        </div>
-      </div>
 
       {error && <div className="msg-error" style={{ marginTop: 20, width: 'fit-content' }}>{error}</div>}
 

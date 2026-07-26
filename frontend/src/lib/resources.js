@@ -46,8 +46,8 @@ export const uploadAvatar = (file) => {
 }
 
 // Analyses
-export const submitAnalysis = (name, language, code) =>
-  apiFetch('/analysis/analyze/', { method: 'POST', body: { name, language, code } })
+export const submitAnalysis = (name, code) =>
+  apiFetch('/analysis/analyze/', { method: 'POST', body: { name, code } })
 
 export const uploadAnalysis = (file, name) => {
   const form = new FormData()

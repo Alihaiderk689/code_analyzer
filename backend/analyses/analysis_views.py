@@ -5,7 +5,7 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .engine import analyze_code, detect_language
+from .engine import analyze_code, detect_language, detect_language_from_code
 from .models import Analysis
 from .serializers import (
     AnalysisDetailSerializer,
@@ -35,7 +35,7 @@ class AnalyzeView(APIView):
         analysis = Analysis.objects.create(
             owner=request.user,
             name=data.get('name') or f'snippet-{timezone.now():%Y%m%d%H%M%S}',
-            language=data['language'],
+            language=detect_language_from_code(data['code']),
             source_code=data['code'],
             status=Analysis.Status.PENDING,
         )

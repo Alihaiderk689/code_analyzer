@@ -155,6 +155,91 @@ def detect_language(filename):
     return 'Unknown'
 
 
+# Weighted regex signatures for guessing a language straight from pasted code, where
+# (unlike an upload) there's no filename extension to go by. Weights are calibrated
+# so a couple of language-specific keywords/constructs outweigh generic ones (braces,
+# semicolons) that show up across several of these languages.
+_LANGUAGE_SIGNATURES = {
+    'Python': [
+        (re.compile(r'^\s*def\s+\w+\s*\(.*\)\s*:', re.M), 3),
+        (re.compile(r'^\s*(import|from)\s+\w+', re.M), 2),
+        (re.compile(r'^\s*class\s+\w+.*:\s*$', re.M), 2),
+        (re.compile(r'^\s*if\s+__name__\s*==\s*[\'"]__main__[\'"]\s*:', re.M), 3),
+        (re.compile(r'^\s*elif\b', re.M), 2),
+        (re.compile(r'\bself\b'), 1),
+        (re.compile(r'^\s*print\(', re.M), 1),
+    ],
+    'TypeScript': [
+        (re.compile(r'\binterface\s+\w+\s*\{'), 3),
+        (re.compile(r'\btype\s+\w+\s*='), 2),
+        (re.compile(r':\s*(string|number|boolean|any|void|unknown)\b'), 2),
+        (re.compile(r'\bexport\s+(default\s+)?(class|function|const|interface|type)\b'), 1),
+    ],
+    'JavaScript': [
+        (re.compile(r'\bfunction\s*\w*\s*\('), 2),
+        (re.compile(r'=>\s*\{?'), 2),
+        (re.compile(r'\bconsole\.log\('), 2),
+        (re.compile(r'\b(const|let|var)\s+\w+\s*='), 2),
+        (re.compile(r'\brequire\('), 1),
+        (re.compile(r'\bimport\s+.+\s+from\s+[\'"]'), 1),
+    ],
+    'Java': [
+        (re.compile(r'\bpublic\s+class\s+\w+'), 3),
+        (re.compile(r'\bpublic\s+static\s+void\s+main\s*\('), 3),
+        (re.compile(r'\bSystem\.out\.println\('), 2),
+        (re.compile(r'\b(private|protected)\s+\w+\s+\w+\s*\('), 1),
+    ],
+    'C++': [
+        (re.compile(r'#include\s*<\w+>'), 3),
+        (re.compile(r'\bstd::'), 3),
+        (re.compile(r'\bcout\s*<<'), 2),
+        (re.compile(r'\bcin\s*>>'), 2),
+        (re.compile(r'\bint\s+main\s*\('), 1),
+    ],
+    'Go': [
+        (re.compile(r'^\s*package\s+main', re.M), 3),
+        (re.compile(r'\bfunc\s+main\s*\(\)'), 3),
+        (re.compile(r'\bfmt\.(Println|Printf|Print)\('), 2),
+        (re.compile(r':=\s*'), 2),
+    ],
+    'PHP': [
+        (re.compile(r'<\?php'), 4),
+        (re.compile(r'\$\w+\s*='), 2),
+        (re.compile(r'\becho\s+'), 1),
+        (re.compile(r'->\w+\('), 1),
+    ],
+}
+
+
+def detect_language_from_code(code):
+    """Best-effort language guess from source alone (used for pasted snippets,
+    where there's no filename to go by). Returns 'Unknown' when nothing scores -
+    that's an honest answer for trivial/ambiguous snippets, better than guessing
+    wrong and running the wrong analyzer against them."""
+    if not code or not code.strip():
+        return 'Unknown'
+
+    scores = {}
+    for language, patterns in _LANGUAGE_SIGNATURES.items():
+        score = sum(weight for pattern, weight in patterns if pattern.search(code))
+        if score:
+            scores[language] = score
+
+    # Valid-Python-syntax is itself a useful (if weak) signal for otherwise-generic
+    # snippets that don't hit any of the keyword patterns above (e.g. bare arithmetic) -
+    # every other supported language's syntax (braces, semicolons, `<?php`, etc.) fails
+    # to parse as Python, so this never fires for genuine non-Python code.
+    try:
+        ast.parse(code)
+        scores['Python'] = scores.get('Python', 0) + 2
+    except SyntaxError:
+        pass
+
+    if not scores:
+        return 'Unknown'
+    return max(scores, key=scores.get)
+
+
 def analyze_code(code, language='Unknown'):
     lines = code.splitlines()
     lines_of_code = len([line for line in lines if line.strip()])

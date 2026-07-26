@@ -29,7 +29,6 @@ class AnalysisStatusSerializer(serializers.ModelSerializer):
 
 class AnalyzeRequestSerializer(serializers.Serializer):
     name = serializers.CharField(required=False, allow_blank=True)
-    language = serializers.CharField(max_length=50)
     code = serializers.CharField()
 
     def validate_code(self, value):
