@@ -194,30 +194,65 @@ export default function Report() {
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 18, marginTop: 28 }}>
         <MetricCard label="Quality score" value={`${formatScore(analysis.quality_score)}%`} pct={analysis.quality_score ?? 0} color={scoreColor(analysis.quality_score)} />
-        <MetricCard label="Lines of code" value={analysis.lines_of_code} pct={100} color="#2563eb" />
-        <MetricCard label="Issues found" value={analysis.issues_count} pct={Math.min(100, analysis.issues_count * 10)} color="#D97706" />
-        <MetricCard label="Status" value={STATUS_LABEL[analysis.status] || analysis.status} pct={isCompleted ? 100 : 40} color={isCompleted ? '#3fa54c' : '#8c8c85'} />
+        <MetricCard label="Lines of code" value={analysis.lines_of_code} pct={100} color="var(--color-info)" />
+        <MetricCard label="Issues found" value={analysis.issues_count} pct={Math.min(100, analysis.issues_count * 10)} color="var(--color-warning)" />
+        <MetricCard label="Status" value={STATUS_LABEL[analysis.status] || analysis.status} pct={isCompleted ? 100 : 40} color={isCompleted ? 'var(--color-success)' : 'var(--color-text-secondary-2)'} />
       </div>
 
-      <div style={{ display: 'flex', gap: 6, marginTop: 32, borderBottom: '1px solid var(--color-border)', overflowX: 'auto' }}>
-        {TABS.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setTab(t.key)}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 16,
+          marginTop: 32,
+          borderBottom: '1px solid var(--color-border)',
+          overflowX: 'auto',
+        }}
+      >
+        <div style={{ display: 'flex', gap: 6 }}>
+          {TABS.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              style={{
+                border: 'none',
+                background: 'none',
+                padding: '12px 16px',
+                fontSize: 14,
+                cursor: 'pointer',
+                whiteSpace: 'nowrap',
+                color: tab === t.key ? 'var(--color-text)' : 'var(--color-text-secondary-2)',
+                borderBottom: `2px solid ${tab === t.key ? 'var(--color-text)' : 'transparent'}`,
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {isCompleted && (
+          <Link
+            to={`/report/${id}/chat`}
             style={{
-              border: 'none',
-              background: 'none',
-              padding: '12px 16px',
-              fontSize: 14,
-              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              marginBottom: 8,
+              padding: '8px 14px',
+              fontSize: 13,
+              fontWeight: 500,
               whiteSpace: 'nowrap',
-              color: tab === t.key ? '#171717' : '#8c8c85',
-              borderBottom: `2px solid ${tab === t.key ? '#171717' : 'transparent'}`,
+              color: 'var(--color-text)',
+              background: 'var(--color-bg-subtle)',
+              border: '1px solid var(--color-border-2)',
+              borderRadius: 100,
+              textDecoration: 'none',
             }}
           >
-            {t.label}
-          </button>
-        ))}
+            💬 Chat with your code
+          </Link>
+        )}
       </div>
 
       <div style={{ marginTop: 22 }}>
@@ -241,7 +276,7 @@ function MetricCard({ label, value, pct, color }) {
     <div className="card" style={{ padding: 18 }}>
       <div style={{ fontSize: 12, color: 'var(--color-text-secondary-2)' }}>{label}</div>
       <div style={{ fontFamily: 'var(--font-display)', fontSize: 26, marginTop: 6 }}>{value}</div>
-      <div style={{ height: 6, background: '#f0f0ed', borderRadius: 100, marginTop: 10 }}>
+      <div style={{ height: 6, background: 'var(--color-bg-subtle)', borderRadius: 100, marginTop: 10 }}>
         <div style={{ height: '100%', width: `${Math.max(0, Math.min(100, pct))}%`, background: color, borderRadius: 100 }} />
       </div>
     </div>
@@ -314,7 +349,7 @@ function AiListTab({ id, isCompleted, loader }) {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
         {(data?.suggestions || []).map((text, i) => (
           <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 12, border: '1px solid var(--color-border)', borderRadius: 12, padding: '14px 16px' }}>
-            <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#059669', marginTop: 6, flexShrink: 0 }} />
+            <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--color-code-string)', marginTop: 6, flexShrink: 0 }} />
             <div style={{ fontSize: 14 }}>{text}</div>
           </div>
         ))}
@@ -416,7 +451,7 @@ function RefactorTab({ id, isCompleted }) {
               <span style={{ fontSize: 12, color: 'var(--color-text-secondary-2)', fontFamily: 'var(--font-mono)' }}>BEFORE</span>
               <CopyButton text={originalSource} />
             </div>
-            <DiffCodeBox lines={diff.beforeLines} changedBg="rgba(220,38,38,0.1)" changedPrefix="−" border="var(--color-border)" />
+            <DiffCodeBox lines={diff.beforeLines} changedBg="var(--color-diff-removed-bg)" changedPrefix="−" border="var(--color-border)" />
           </div>
         )}
         <div style={{ minWidth: 0 }}>
@@ -425,9 +460,9 @@ function RefactorTab({ id, isCompleted }) {
             <CopyButton text={data?.refactored_code} />
           </div>
           {diff ? (
-            <DiffCodeBox lines={diff.afterLines} changedBg="rgba(63,165,76,0.15)" changedPrefix="+" border="#c8ecb8" />
+            <DiffCodeBox lines={diff.afterLines} changedBg="var(--color-diff-added-bg)" changedPrefix="+" border="var(--color-diff-added-border)" />
           ) : (
-            <pre style={codeBoxStyle('#fafaf8', '#c8ecb8')}>{data?.refactored_code}</pre>
+            <pre style={codeBoxStyle('var(--color-bg-subtle)', 'var(--color-diff-added-border)')}>{data?.refactored_code}</pre>
           )}
         </div>
       </div>
@@ -436,7 +471,7 @@ function RefactorTab({ id, isCompleted }) {
           <div style={{ fontWeight: 600, fontSize: 14 }}>What changed, and why</div>
           {changes.map((change, i) => (
             <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 12, border: '1px solid var(--color-border)', borderRadius: 12, padding: '14px 16px' }}>
-              <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#059669', marginTop: 6, flexShrink: 0 }} />
+              <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--color-code-string)', marginTop: 6, flexShrink: 0 }} />
               <div>
                 <div style={{ fontSize: 14 }}>{change.summary}</div>
                 {change.benefit && (
@@ -454,13 +489,13 @@ function RefactorTab({ id, isCompleted }) {
 
 function DiffCodeBox({ lines, changedBg, changedPrefix, border }) {
   return (
-    <div style={{ ...codeBoxStyle('#fff', border), padding: '8px 0', overflowX: 'auto', overflowY: 'hidden' }}>
+    <div style={{ ...codeBoxStyle('var(--color-surface)', border), padding: '8px 0', overflowX: 'auto', overflowY: 'hidden' }}>
       <div style={{ minWidth: '100%', width: 'max-content' }}>
         {lines.map((line, i) => (
           <div
             key={i}
             style={{
-              background: line.empty ? 'rgba(0,0,0,0.03)' : line.changed ? changedBg : 'transparent',
+              background: line.empty ? 'var(--color-diff-empty-bg)' : line.changed ? changedBg : 'transparent',
               padding: '0 16px',
               whiteSpace: 'pre',
             }}
@@ -530,7 +565,7 @@ function CopyButton({ text }) {
       title="Copy code"
       style={{
         border: '1px solid var(--color-border-2)',
-        background: '#fff',
+        background: 'var(--color-surface)',
         borderRadius: 8,
         width: 26,
         height: 26,
