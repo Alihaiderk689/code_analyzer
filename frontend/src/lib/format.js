@@ -1,8 +1,8 @@
 export function scoreColor(score) {
   if (score == null) return 'var(--color-text-muted)'
-  if (score >= 85) return '#3fa54c'
-  if (score >= 70) return '#D97706'
-  return '#DC2626'
+  if (score >= 85) return 'var(--color-success)'
+  if (score >= 70) return 'var(--color-warning)'
+  return 'var(--color-danger)'
 }
 
 export function formatScore(score) {
@@ -23,21 +23,21 @@ export const STATUS_LABEL = {
 }
 
 export const ISSUE_TYPE = {
-  todo: { label: 'TODO marker', color: '#D97706' },
-  long_line: { label: 'Long line', color: '#2563EB' },
-  no_comments: { label: 'No comments', color: '#8c8c85' },
-  syntax_error: { label: 'Syntax error', color: '#DC2626' },
-  undefined_name: { label: 'Undefined name', color: '#E11D48' },
-  undefined_export: { label: 'Undefined export', color: '#E11D48' },
-  duplicate_argument: { label: 'Duplicate argument', color: '#DC2626' },
-  import_star_used: { label: 'Wildcard import', color: '#D97706' },
-  redefined_while_unused: { label: 'Redefined before use', color: '#D97706' },
-  unused_variable: { label: 'Unused variable', color: '#8c8c85' },
-  unused_import: { label: 'Unused import', color: '#8c8c85' },
-  runtime_error: { label: 'Runtime error', color: '#DC2626' },
-  execution_timeout: { label: 'Timed out', color: '#D97706' },
+  todo: { label: 'TODO marker', color: 'var(--color-warning)' },
+  long_line: { label: 'Long line', color: 'var(--color-info)' },
+  no_comments: { label: 'No comments', color: 'var(--color-text-secondary-2)' },
+  syntax_error: { label: 'Syntax error', color: 'var(--color-danger)' },
+  undefined_name: { label: 'Undefined name', color: 'var(--color-danger-2)' },
+  undefined_export: { label: 'Undefined export', color: 'var(--color-danger-2)' },
+  duplicate_argument: { label: 'Duplicate argument', color: 'var(--color-danger)' },
+  import_star_used: { label: 'Wildcard import', color: 'var(--color-warning)' },
+  redefined_while_unused: { label: 'Redefined before use', color: 'var(--color-warning)' },
+  unused_variable: { label: 'Unused variable', color: 'var(--color-text-secondary-2)' },
+  unused_import: { label: 'Unused import', color: 'var(--color-text-secondary-2)' },
+  runtime_error: { label: 'Runtime error', color: 'var(--color-danger)' },
+  execution_timeout: { label: 'Timed out', color: 'var(--color-warning)' },
 }
 
 export function issueMeta(type) {
-  return ISSUE_TYPE[type] || { label: type, color: '#8c8c85' }
+  return ISSUE_TYPE[type] || { label: type, color: 'var(--color-text-secondary-2)' }
 }

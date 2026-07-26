@@ -101,8 +101,8 @@ export default function NewAnalysis() {
             padding: '9px 18px',
             fontSize: 13,
             cursor: 'pointer',
-            background: mode === 'paste' ? '#171717' : 'transparent',
-            color: mode === 'paste' ? '#fff' : '#171717',
+            background: mode === 'paste' ? 'var(--color-text)' : 'transparent',
+            color: mode === 'paste' ? 'var(--color-bg)' : 'var(--color-text)',
           }}
           onClick={() => setMode('paste')}
         >
@@ -115,8 +115,8 @@ export default function NewAnalysis() {
             padding: '9px 18px',
             fontSize: 13,
             cursor: 'pointer',
-            background: mode === 'upload' ? '#171717' : 'transparent',
-            color: mode === 'upload' ? '#fff' : '#171717',
+            background: mode === 'upload' ? 'var(--color-text)' : 'transparent',
+            color: mode === 'upload' ? 'var(--color-bg)' : 'var(--color-text)',
           }}
           onClick={() => setMode('upload')}
         >
@@ -149,7 +149,7 @@ export default function NewAnalysis() {
             style={{
               flexShrink: 0,
               padding: '18px 0',
-              background: '#fafaf8',
+              background: 'var(--color-bg-subtle)',
               borderRight: '1px solid var(--color-border-2)',
               overflow: 'hidden',
               textAlign: 'right',
@@ -209,7 +209,7 @@ export default function NewAnalysis() {
           }}
           style={{
             marginTop: 18,
-            border: `1.5px dashed ${dragOver ? '#171717' : 'var(--color-border-2)'}`,
+            border: `1.5px dashed ${dragOver ? 'var(--color-text)' : 'var(--color-border-2)'}`,
             borderRadius: 14,
             padding: 50,
             textAlign: 'center',
@@ -244,8 +244,8 @@ export default function NewAnalysis() {
       <button
         style={{
           marginTop: 32,
-          background: '#171717',
-          color: '#fff',
+          background: 'var(--color-text)',
+          color: 'var(--color-bg)',
           border: 'none',
           borderRadius: 100,
           padding: '15px 28px',

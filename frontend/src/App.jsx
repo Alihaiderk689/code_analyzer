@@ -11,6 +11,7 @@ import Dashboard from './pages/Dashboard'
 import NewAnalysis from './pages/NewAnalysis'
 import History from './pages/History'
 import Report from './pages/Report'
+import AnalysisChat from './pages/AnalysisChat'
 import Admin from './pages/Admin'
 import Settings from './pages/Settings'
 
@@ -34,6 +35,7 @@ function App() {
             <Route path="/analyze" element={<NewAnalysis />} />
             <Route path="/history" element={<History />} />
             <Route path="/report/:id" element={<Report />} />
+            <Route path="/report/:id/chat" element={<AnalysisChat />} />
           </Route>
           <Route path="/settings" element={<Settings />} />
           <Route element={<AdminRoute />}>

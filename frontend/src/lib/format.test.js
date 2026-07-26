@@ -8,18 +8,18 @@ describe('scoreColor', () => {
   })
 
   it('returns green at and above the 85 threshold', () => {
-    expect(scoreColor(85)).toBe('#3fa54c')
-    expect(scoreColor(100)).toBe('#3fa54c')
+    expect(scoreColor(85)).toBe('var(--color-success)')
+    expect(scoreColor(100)).toBe('var(--color-success)')
   })
 
   it('returns amber between the 70 and 85 thresholds', () => {
-    expect(scoreColor(70)).toBe('#D97706')
-    expect(scoreColor(84)).toBe('#D97706')
+    expect(scoreColor(70)).toBe('var(--color-warning)')
+    expect(scoreColor(84)).toBe('var(--color-warning)')
   })
 
   it('returns red below the 70 threshold', () => {
-    expect(scoreColor(69)).toBe('#DC2626')
-    expect(scoreColor(0)).toBe('#DC2626')
+    expect(scoreColor(69)).toBe('var(--color-danger)')
+    expect(scoreColor(0)).toBe('var(--color-danger)')
   })
 })
 
@@ -52,10 +52,10 @@ describe('formatDate', () => {
 
 describe('issueMeta', () => {
   it('returns known metadata for a recognized issue type', () => {
-    expect(issueMeta('todo')).toEqual({ label: 'TODO marker', color: '#D97706' })
+    expect(issueMeta('todo')).toEqual({ label: 'TODO marker', color: 'var(--color-warning)' })
   })
 
   it('falls back to the raw type as the label for unknown issue types', () => {
-    expect(issueMeta('something_new')).toEqual({ label: 'something_new', color: '#8c8c85' })
+    expect(issueMeta('something_new')).toEqual({ label: 'something_new', color: 'var(--color-text-secondary-2)' })
   })
 })

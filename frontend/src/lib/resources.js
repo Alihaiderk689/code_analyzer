@@ -90,6 +90,15 @@ export const getReportHtml = (id) => apiFetch(`/reports/${id}/html/`, { response
 export const chatWithAi = (message, history, analysisId) =>
   apiFetch('/ai/chat/', { method: 'POST', body: { message, history, analysis_id: analysisId ?? null } })
 
+// Chat with Your Code - persisted, per-analysis conversation (distinct from the
+// stateless floating assistant above).
+export const startConversation = (analysisId) => apiFetch(`/chat/start/${analysisId}/`, { method: 'POST' })
+export const getChatHistory = (conversationId) => apiFetch(`/chat/history/${conversationId}/`)
+export const sendChatMessage = (conversationId, message) =>
+  apiFetch('/chat/message/', { method: 'POST', body: { conversation_id: conversationId, message } })
+export const clearChatHistory = (conversationId) =>
+  apiFetch(`/chat/history/${conversationId}/`, { method: 'DELETE' })
+
 // Admin
 export const adminListUsers = (q = '', isActive = null) => {
   const params = new URLSearchParams()

@@ -1,5 +1,6 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../lib/AuthContext'
+import { useTheme } from '../lib/ThemeContext'
 
 const NAV_LINKS = [
   { to: '/dashboard', label: 'Dashboard' },
@@ -11,6 +12,7 @@ export default function AppNav() {
   const location = useLocation()
   const navigate = useNavigate()
   const { user, isAdmin, logout } = useAuth()
+  const { theme, toggleTheme } = useTheme()
   const links = isAdmin ? [{ to: '/admin', label: 'Admin' }] : NAV_LINKS
   const homePath = isAdmin ? '/admin' : '/dashboard'
 
@@ -44,7 +46,10 @@ export default function AppNav() {
               <Link
                 key={link.to}
                 to={link.to}
-                style={{ color: active ? '#171717' : '#8c8c85', fontWeight: active ? 600 : 400 }}
+                style={{
+                  color: active ? 'var(--color-text)' : 'var(--color-text-secondary-2)',
+                  fontWeight: active ? 600 : 400,
+                }}
               >
                 {link.label}
               </Link>
@@ -53,6 +58,27 @@ export default function AppNav() {
         </div>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+        <button
+          onClick={toggleTheme}
+          title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+          aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+          style={{
+            width: 30,
+            height: 30,
+            borderRadius: '50%',
+            border: '1px solid var(--color-border-2)',
+            background: 'none',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: 14,
+            cursor: 'pointer',
+            color: 'var(--color-text)',
+            padding: 0,
+          }}
+        >
+          {theme === 'dark' ? '☀️' : '🌙'}
+        </button>
         <div
           onClick={() => navigate('/settings')}
           title="Settings"
@@ -77,7 +103,7 @@ export default function AppNav() {
             initial
           )}
         </div>
-        <Link to="/settings" style={{ fontSize: 14, color: '#171717' }}>
+        <Link to="/settings" style={{ fontSize: 14, color: 'var(--color-text)' }}>
           {displayName}
         </Link>
         <button className="btn btn-outline" style={{ padding: '8px 16px', fontSize: 13 }} onClick={handleLogout}>
