@@ -114,11 +114,19 @@ SIMPLE_JWT = {
 }
 
 # Email
-# Console backend for now: verification/reset emails print to the runserver
-# console instead of being sent. Swap EMAIL_BACKEND for the SMTP backend and
-# supply EMAIL_HOST/EMAIL_HOST_USER/EMAIL_HOST_PASSWORD env vars when ready.
-EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@codeanalyzer.local')
+# Uses real SMTP when EMAIL_HOST_USER/EMAIL_HOST_PASSWORD are set (e.g. a Gmail
+# address + App Password); otherwise falls back to printing emails to the
+# runserver console, so the app still works out of the box without credentials.
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+if EMAIL_HOST_USER and EMAIL_HOST_PASSWORD:
+    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+    EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
+    EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
+    EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True') == 'True'
+else:
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER or 'noreply@codeanalyzer.local')
 
 # Base URL of the frontend app, used to build links inside verification/reset emails.
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
