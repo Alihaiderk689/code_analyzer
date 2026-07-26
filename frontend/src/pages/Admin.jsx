@@ -31,8 +31,8 @@ export default function Admin() {
               padding: '12px 16px',
               fontSize: 14,
               cursor: 'pointer',
-              color: tab === t.key ? '#171717' : '#8c8c85',
-              borderBottom: `2px solid ${tab === t.key ? '#171717' : 'transparent'}`,
+              color: tab === t.key ? 'var(--color-text)' : 'var(--color-text-secondary-2)',
+              borderBottom: `2px solid ${tab === t.key ? 'var(--color-text)' : 'transparent'}`,
             }}
           >
             {t.label}
@@ -142,7 +142,7 @@ function UsersTab() {
       {error && <div className="msg-error" style={{ marginTop: 16 }}>{error}</div>}
 
       <div className="card" style={{ marginTop: 16, overflow: 'hidden' }}>
-        <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 0.6fr 0.6fr 0.6fr 0.8fr', padding: '12px 16px', background: '#fafaf8', fontSize: 12, color: 'var(--color-text-secondary-2)', fontFamily: 'var(--font-mono)' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 0.6fr 0.6fr 0.6fr 0.8fr', padding: '12px 16px', background: 'var(--color-bg-subtle)', fontSize: 12, color: 'var(--color-text-secondary-2)', fontFamily: 'var(--font-mono)' }}>
           <span>USER</span>
           <span>EMAIL</span>
           <span>ANALYSES</span>
@@ -152,7 +152,7 @@ function UsersTab() {
         </div>
         {users === null && <div style={{ padding: 16, fontSize: 14, color: 'var(--color-text-muted)' }}>Loading…</div>}
         {users?.map((u) => (
-          <div key={u.id} style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 0.6fr 0.6fr 0.6fr 0.8fr', padding: '12px 16px', borderTop: '1px solid #f2f2ef', fontSize: 13, alignItems: 'center' }}>
+          <div key={u.id} style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 0.6fr 0.6fr 0.6fr 0.8fr', padding: '12px 16px', borderTop: '1px solid var(--color-border)', fontSize: 13, alignItems: 'center' }}>
             <span>{u.username}</span>
             <span style={{ color: 'var(--color-text-secondary)' }}>{u.email}</span>
             <span>{u.analyses_count}</span>
@@ -202,7 +202,7 @@ function AnalysesTab() {
       {error && <div className="msg-error" style={{ marginTop: 16 }}>{error}</div>}
 
       <div className="card" style={{ marginTop: 16, overflow: 'hidden' }}>
-        <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 0.8fr 0.6fr 0.8fr', padding: '12px 16px', background: '#fafaf8', fontSize: 12, color: 'var(--color-text-secondary-2)', fontFamily: 'var(--font-mono)' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 0.8fr 0.6fr 0.8fr', padding: '12px 16px', background: 'var(--color-bg-subtle)', fontSize: 12, color: 'var(--color-text-secondary-2)', fontFamily: 'var(--font-mono)' }}>
           <span>NAME</span>
           <span>OWNER</span>
           <span>LANGUAGE</span>
@@ -211,7 +211,7 @@ function AnalysesTab() {
         </div>
         {rows === null && <div style={{ padding: 16, fontSize: 14, color: 'var(--color-text-muted)' }}>Loading…</div>}
         {rows?.map((r) => (
-          <div key={r.id} style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 0.8fr 0.6fr 0.8fr', padding: '12px 16px', borderTop: '1px solid #f2f2ef', fontSize: 13, alignItems: 'center' }}>
+          <div key={r.id} style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 0.8fr 0.6fr 0.8fr', padding: '12px 16px', borderTop: '1px solid var(--color-border)', fontSize: 13, alignItems: 'center' }}>
             <span>{r.name}</span>
             <span style={{ color: 'var(--color-text-secondary)' }}>{r.owner_username}</span>
             <span>{r.language}</span>

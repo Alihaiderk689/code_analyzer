@@ -31,6 +31,7 @@ urlpatterns = [
     path('api/reports/', include('analyses.report_urls')),
     path('api/search/', include('analyses.search_urls')),
     path('api/admin/', include('adminapi.urls')),
+    path('api/chat/', include('chat.urls')),
 ]
 
 if settings.DEBUG:

@@ -6,12 +6,8 @@ from rest_framework.views import APIView
 from analyses.models import Analysis
 
 from .client import generate_chat_reply
+from .prompts import BASE_CHAT_INSTRUCTION, build_analysis_context
 from .serializers import ChatRequestSerializer
-
-BASE_SYSTEM_INSTRUCTION = (
-    'You are a helpful AI assistant for a code analysis tool. Answer clearly and concisely, '
-    'formatting code with markdown fences when useful.'
-)
 
 
 class ChatView(APIView):
@@ -20,16 +16,11 @@ class ChatView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        system_instruction = BASE_SYSTEM_INSTRUCTION
+        system_instruction = BASE_CHAT_INSTRUCTION
         analysis_id = data.get('analysis_id')
         if analysis_id is not None:
             analysis = get_object_or_404(Analysis, pk=analysis_id, owner=request.user)
-            system_instruction += (
-                f'\n\nThe user is asking about this analysis:\n'
-                f'Name: {analysis.name}\nLanguage: {analysis.language}\n'
-                f'Quality score: {analysis.quality_score}\nIssues: {analysis.issues}\n'
-                f'Source code:\n{analysis.source_code}'
-            )
+            system_instruction += build_analysis_context(analysis)
 
         try:
             reply = generate_chat_reply(data['message'], data['history'], system_instruction)

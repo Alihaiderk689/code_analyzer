@@ -6,10 +6,10 @@ import { scoreColor, formatScore, formatDate } from '../lib/format'
 import { ApiError } from '../lib/api'
 
 const DISTRIBUTION_BUCKETS = [
-  { key: 'excellent', label: 'Excellent (≥90)', color: '#3fa54c' },
+  { key: 'excellent', label: 'Excellent (≥90)', color: 'var(--color-success)' },
   { key: 'good', label: 'Good (≥70)', color: 'var(--color-accent)' },
-  { key: 'fair', label: 'Fair (≥50)', color: '#D97706' },
-  { key: 'poor', label: 'Poor (<50)', color: '#DC2626' },
+  { key: 'fair', label: 'Fair (≥50)', color: 'var(--color-warning)' },
+  { key: 'poor', label: 'Poor (<50)', color: 'var(--color-danger)' },
 ]
 
 export default function Dashboard() {
@@ -85,7 +85,7 @@ export default function Dashboard() {
                   <span style={{ fontFamily: 'var(--font-mono)' }}>{lang.language}</span>
                   <span style={{ color: 'var(--color-text-secondary-2)' }}>{lang.analyses_count}</span>
                 </div>
-                <div style={{ height: 8, background: '#f0f0ed', borderRadius: 100, overflow: 'hidden' }}>
+                <div style={{ height: 8, background: 'var(--color-bg-subtle)', borderRadius: 100, overflow: 'hidden' }}>
                   <div
                     style={{
                       height: '100%',
@@ -117,12 +117,12 @@ export default function Dashboard() {
                   alignItems: 'center',
                   justifyContent: 'space-between',
                   padding: '12px 0',
-                  borderBottom: '1px solid #f2f2ef',
+                  borderBottom: '1px solid var(--color-border)',
                   cursor: 'pointer',
                 }}
               >
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, background: '#f7f7f4', padding: '4px 8px', borderRadius: 6 }}>
+                  <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, background: 'var(--color-bg-subtle)', padding: '4px 8px', borderRadius: 6 }}>
                     {row.language}
                   </div>
                   <span style={{ fontSize: 14 }}>{row.name}</span>
@@ -153,7 +153,7 @@ export default function Dashboard() {
                     <span>{bucket.label}</span>
                     <span style={{ color: 'var(--color-text-secondary-2)' }}>{count}</span>
                   </div>
-                  <div style={{ height: 8, background: '#f0f0ed', borderRadius: 100, overflow: 'hidden' }}>
+                  <div style={{ height: 8, background: 'var(--color-bg-subtle)', borderRadius: 100, overflow: 'hidden' }}>
                     <div
                       style={{
                         height: '100%',
