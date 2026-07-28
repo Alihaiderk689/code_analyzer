@@ -32,6 +32,8 @@ urlpatterns = [
     path('api/search/', include('analyses.search_urls')),
     path('api/admin/', include('adminapi.urls')),
     path('api/chat/', include('chat.urls')),
+    path('api/github/', include('github_integration.urls')),
+    path('api/webhooks/', include('github_integration.webhook_urls')),
 ]
 
 if settings.DEBUG:

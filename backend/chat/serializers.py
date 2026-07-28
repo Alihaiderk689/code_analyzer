@@ -18,6 +18,10 @@ class ConversationSerializer(serializers.ModelSerializer):
 class SendMessageSerializer(serializers.Serializer):
     conversation_id = serializers.IntegerField()
     message = serializers.CharField()
+    # The client's UTC offset in minutes (JS Date.getTimezoneOffset() convention),
+    # used to reset the daily chat quota at the user's own local midnight rather
+    # than a server-time boundary. Defaults to UTC if the client doesn't send it.
+    tz_offset_minutes = serializers.IntegerField(required=False, default=0)
 
     def validate_message(self, value):
         if not value.strip():

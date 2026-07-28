@@ -14,6 +14,10 @@ import Report from './pages/Report'
 import AnalysisChat from './pages/AnalysisChat'
 import Admin from './pages/Admin'
 import Settings from './pages/Settings'
+import GitHub from './pages/GitHub'
+import GitHubPullRequests from './pages/GitHubPullRequests'
+import GitHubPullRequestDetail from './pages/GitHubPullRequestDetail'
+import GitHubRepositoryFiles from './pages/GitHubRepositoryFiles'
 
 function App() {
   return (
@@ -36,6 +40,10 @@ function App() {
             <Route path="/history" element={<History />} />
             <Route path="/report/:id" element={<Report />} />
             <Route path="/report/:id/chat" element={<AnalysisChat />} />
+            <Route path="/github" element={<GitHub />} />
+            <Route path="/github/pull-requests" element={<GitHubPullRequests />} />
+            <Route path="/github/pull-requests/:id" element={<GitHubPullRequestDetail />} />
+            <Route path="/github/repositories/:pk/files" element={<GitHubRepositoryFiles />} />
           </Route>
           <Route path="/settings" element={<Settings />} />
           <Route element={<AdminRoute />}>

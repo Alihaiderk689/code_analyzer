@@ -144,6 +144,8 @@ def _python_runtime_issues(code):
     # 'ok' -> ran cleanly, nothing to report. 'unavailable' -> no sandboxing primitive
     # on this host (see sandbox.is_available) - degrades silently to static-only
     # analysis rather than surfacing a "sandbox unavailable" issue on every submission.
+    # 'import_error' -> failed on a missing third-party package in the sandbox's bare
+    # system Python, not a real bug in the code - see sandbox.run_python's docstring.
     return []
 
 

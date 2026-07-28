@@ -101,10 +101,15 @@ def _parse_traceback(stderr_text):
     return {'exception_type': exception_type, 'message': message[:300], 'line': line}
 
 
+_IMPORT_ERROR_TYPES = {'ModuleNotFoundError', 'ImportError'}
+
+
 def run_python(code):
     """Runs `code` in the sandbox described above. Returns a dict:
       {'status': 'ok'}                                        - exited cleanly
       {'status': 'error', 'exception_type', 'message', 'line'} - uncaught exception
+      {'status': 'import_error', ...}                          - failed on a missing third-party
+                                                                  package, not a real bug (see below)
       {'status': 'timeout'}                                    - exceeded the wall-clock timeout
       {'status': 'unavailable'}                                - no sandboxing primitive on this host
     """
@@ -145,4 +150,12 @@ def run_python(code):
         parsed = _parse_traceback(result.stderr.decode('utf-8', errors='replace'))
         if parsed is None:
             return {'status': 'ok'}
+        if parsed['exception_type'] in _IMPORT_ERROR_TYPES:
+            # The sandbox deliberately runs with a bare system Python, not this
+            # project's venv or the analyzed code's own environment - it has
+            # none of Django/requests/numpy/whatever third-party packages the
+            # real code depends on. A failed import here says nothing about
+            # whether the code itself is correct, so it must not be reported
+            # as a bug (see analyses.engine._python_runtime_issues).
+            return {'status': 'import_error', **parsed}
         return {'status': 'error', **parsed}

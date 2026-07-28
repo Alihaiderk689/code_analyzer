@@ -6,6 +6,7 @@ const NAV_LINKS = [
   { to: '/dashboard', label: 'Dashboard' },
   { to: '/analyze', label: 'New Analysis' },
   { to: '/history', label: 'History' },
+  { to: '/github', label: 'GitHub' },
 ]
 
 export default function AppNav() {
@@ -14,7 +15,6 @@ export default function AppNav() {
   const { user, isAdmin, logout } = useAuth()
   const { theme, toggleTheme } = useTheme()
   const links = isAdmin ? [{ to: '/admin', label: 'Admin' }] : NAV_LINKS
-  const homePath = isAdmin ? '/admin' : '/dashboard'
 
   const displayName = user?.first_name || user?.username || user?.email || ''
   const initial = (displayName || 'U').charAt(0).toUpperCase()
@@ -35,7 +35,7 @@ export default function AppNav() {
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 36 }}>
-        <div className="logo" onClick={() => navigate(homePath)}>
+        <div className="logo" onClick={() => navigate('/')}>
           <div className="logo-mark sm" />
           <span style={{ fontSize: 16, fontWeight: 600 }}>Code Analyzer</span>
         </div>

@@ -8,6 +8,7 @@ from ai.prompts import BASE_CHAT_INSTRUCTION, build_analysis_context
 from analyses.models import Analysis
 
 from .models import ChatMessage, Conversation
+from .rate_limit import get_rate_limit_status
 from .serializers import ChatMessageSerializer, ConversationSerializer, SendMessageSerializer
 
 # How many previous turns get sent to the LLM as context. Bounds prompt size/cost
@@ -25,11 +26,27 @@ class StartConversationView(APIView):
         return Response(ConversationSerializer(conversation).data)
 
 
+class RateLimitStatusView(APIView):
+    """Lets the frontend show 'X chats left' / a reset countdown without having
+    to attempt (and get rejected on) a real message first."""
+
+    def get(self, request):
+        tz_offset_minutes = request.query_params.get('tz_offset_minutes', 0)
+        return Response(get_rate_limit_status(request.user, tz_offset_minutes))
+
+
 class SendMessageView(APIView):
     def post(self, request):
         serializer = SendMessageSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
+        limit_status = get_rate_limit_status(request.user, data.get('tz_offset_minutes', 0))
+        if limit_status['remaining'] <= 0:
+            return Response(
+                {'detail': "You've used today's chat messages. Try again after the reset.", **limit_status},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
 
         conversation = get_object_or_404(
             Conversation.objects.select_related('analysis'),

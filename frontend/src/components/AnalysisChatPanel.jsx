@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { startConversation, getChatHistory, sendChatMessage, clearChatHistory } from '../lib/resources'
+import { startConversation, getChatHistory, sendChatMessage, clearChatHistory, getChatLimitStatus } from '../lib/resources'
+import { useCountdown, formatCountdown } from '../lib/useCountdown'
 import { ApiError } from '../lib/api'
 
 // Persisted, per-analysis "Chat with Your Code" panel - distinct from the
@@ -16,7 +17,17 @@ export default function AnalysisChatPanel({ analysisId, listHeight = 380 }) {
   const [sending, setSending] = useState(false)
   const [sendError, setSendError] = useState('')
   const [clearing, setClearing] = useState(false)
+  const [limitStatus, setLimitStatus] = useState(null)
   const listRef = useRef(null)
+
+  const refreshLimitStatus = async () => {
+    try {
+      setLimitStatus(await getChatLimitStatus())
+    } catch {
+      // Non-critical - the send button just won't show a live quota until this
+      // succeeds again; the backend still enforces the real limit either way.
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -26,10 +37,11 @@ export default function AnalysisChatPanel({ analysisId, listHeight = 380 }) {
       setLoadError('')
       try {
         const conversation = await startConversation(analysisId)
-        const history = await getChatHistory(conversation.id)
+        const [history, limit] = await Promise.all([getChatHistory(conversation.id), getChatLimitStatus()])
         if (cancelled) return
         setConversationId(conversation.id)
         setMessages(history)
+        setLimitStatus(limit)
       } catch (err) {
         if (!cancelled) setLoadError(err instanceof ApiError ? err.message : 'Could not load the conversation.')
       } finally {
@@ -47,10 +59,13 @@ export default function AnalysisChatPanel({ analysisId, listHeight = 380 }) {
     if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight
   }, [messages, sending])
 
+  const msUntilReset = useCountdown(limitStatus?.reset_at, refreshLimitStatus)
+  const isLimited = limitStatus && limitStatus.remaining <= 0
+
   const handleSend = async (e) => {
     e.preventDefault()
     const text = input.trim()
-    if (!text || sending || !conversationId) return
+    if (!text || sending || !conversationId || isLimited) return
 
     // Optimistic: show the user's message immediately. Whether the AI call
     // below succeeds or fails, the backend always persists the user's message
@@ -64,17 +79,22 @@ export default function AnalysisChatPanel({ analysisId, listHeight = 380 }) {
       await sendChatMessage(conversationId, text)
       setMessages(await getChatHistory(conversationId))
     } catch (err) {
-      setSendError(err instanceof ApiError ? err.message : 'AI service is currently unavailable.')
-      // The user's message is usually still saved server-side even when the AI call
-      // fails (see chat/views.py), so try to sync up - but if this fetch fails too
-      // (e.g. the network itself is down), just leave the optimistic message in place.
-      try {
-        setMessages(await getChatHistory(conversationId))
-      } catch {
-        // Handled above via sendError; local optimistic state is the best we can show.
+      if (err instanceof ApiError && err.status === 429) {
+        setLimitStatus(err.data)
+      } else {
+        setSendError(err instanceof ApiError ? err.message : 'AI service is currently unavailable.')
+        // The user's message is usually still saved server-side even when the AI call
+        // fails (see chat/views.py), so try to sync up - but if this fetch fails too
+        // (e.g. the network itself is down), just leave the optimistic message in place.
+        try {
+          setMessages(await getChatHistory(conversationId))
+        } catch {
+          // Handled above via sendError; local optimistic state is the best we can show.
+        }
       }
     } finally {
       setSending(false)
+      refreshLimitStatus()
     }
   }
 
@@ -117,16 +137,23 @@ export default function AnalysisChatPanel({ analysisId, listHeight = 380 }) {
             Ask follow-up questions about this analysis — it remembers the conversation.
           </div>
         </div>
-        {!loading && !loadError && messages.length > 0 && (
-          <button
-            className="btn-ghost"
-            style={{ fontSize: 12, color: 'var(--color-danger)', whiteSpace: 'nowrap' }}
-            disabled={clearing}
-            onClick={handleClear}
-          >
-            {clearing ? 'Deleting…' : 'Delete chat'}
-          </button>
-        )}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          {limitStatus && (
+            <div style={{ fontSize: 12, color: 'var(--color-text-secondary-2)', fontFamily: 'var(--font-mono)', whiteSpace: 'nowrap' }}>
+              {limitStatus.remaining}/{limitStatus.limit} chats today
+            </div>
+          )}
+          {!loading && !loadError && messages.length > 0 && (
+            <button
+              className="btn-ghost"
+              style={{ fontSize: 12, color: 'var(--color-danger)', whiteSpace: 'nowrap' }}
+              disabled={clearing}
+              onClick={handleClear}
+            >
+              {clearing ? 'Deleting…' : 'Delete chat'}
+            </button>
+          )}
+        </div>
       </div>
 
       {loadError ? (
@@ -161,24 +188,42 @@ export default function AnalysisChatPanel({ analysisId, listHeight = 380 }) {
             </div>
           )}
 
-          <form
-            onSubmit={handleSend}
-            style={{ display: 'flex', gap: 10, padding: 16, borderTop: '1px solid var(--color-border)' }}
-          >
-            <input
-              type="text"
-              className="field"
-              placeholder="Ask a question about this analysis…"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              disabled={sending}
-              style={{ flex: 1 }}
-            />
-            <button className="btn btn-dark" style={{ padding: '10px 20px', fontSize: 14 }} disabled={sending || !input.trim()}>
-              Send
-            </button>
-          </form>
+          {isLimited ? (
+            <div
+              style={{
+                padding: 16,
+                borderTop: '1px solid var(--color-border)',
+                textAlign: 'center',
+              }}
+            >
+              <div style={{ fontSize: 13, color: 'var(--color-text-secondary)' }}>
+                You've used today's {limitStatus.limit} chat messages for this account.
+              </div>
+              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 20, marginTop: 6 }}>
+                {msUntilReset != null ? formatCountdown(msUntilReset) : '—'}
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 2 }}>until it resets</div>
+            </div>
+          ) : (
+            <form
+              onSubmit={handleSend}
+              style={{ display: 'flex', gap: 10, padding: 16, borderTop: '1px solid var(--color-border)' }}
+            >
+              <input
+                type="text"
+                className="field"
+                placeholder="Ask a question about this analysis…"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                disabled={sending}
+                style={{ flex: 1 }}
+              />
+              <button className="btn btn-dark" style={{ padding: '10px 20px', fontSize: 14 }} disabled={sending || !input.trim()}>
+                Send
+              </button>
+            </form>
+          )}
         </>
       )}
     </div>
