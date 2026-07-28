@@ -41,3 +41,21 @@ export const ISSUE_TYPE = {
 export function issueMeta(type) {
   return ISSUE_TYPE[type] || { label: type, color: 'var(--color-text-secondary-2)' }
 }
+
+// Shared by GitHub PR file-analysis issues (security + quality findings both
+// carry one of these four severities).
+export const SEVERITY_META = {
+  critical: { label: 'Critical', color: 'var(--color-danger)' },
+  high: { label: 'High', color: 'var(--color-danger-2)' },
+  medium: { label: 'Medium', color: 'var(--color-warning)' },
+  low: { label: 'Low', color: 'var(--color-info)' },
+}
+
+export function severityMeta(severity) {
+  return SEVERITY_META[severity] || { label: severity, color: 'var(--color-text-secondary-2)' }
+}
+
+export function formatDateTime(iso) {
+  if (!iso) return ''
+  return new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+}

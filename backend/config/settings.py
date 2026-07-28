@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/4.2/ref/settings/
 """
 
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -78,6 +79,7 @@ INSTALLED_APPS = [
     'ai',
     'adminapi',
     'chat',
+    'github_integration',
 ]
 
 MIDDLEWARE = [
@@ -135,6 +137,49 @@ FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
 # Groq (https://console.groq.com) - powers the AI suggestions/explanation/refactor/chat endpoints.
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 GROQ_MODEL = os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile')
+
+# Celery - runs the GitHub PR analysis pipeline off the request path (a webhook
+# must be acknowledged in seconds or GitHub retries the delivery). Redis is
+# used as both broker and result backend; no separate results database/table
+# is needed since task outcomes are already persisted as WebhookEvent/
+# PullRequestAnalysis rows, which are the real source of truth.
+CELERY_BROKER_URL = os.environ.get('CELERY_BROKER_URL', 'redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = os.environ.get('CELERY_RESULT_BACKEND', CELERY_BROKER_URL)
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_TIME_LIMIT = 300
+# Runs tasks synchronously, in-process, when true - used by the test suite so
+# "queue a Celery task" tests don't need a real worker/broker running.
+CELERY_TASK_ALWAYS_EAGER = os.environ.get('CELERY_TASK_ALWAYS_EAGER', '').lower() == 'true'
+CELERY_TASK_EAGER_PROPAGATES = True
+
+# GitHub OAuth App (https://github.com/settings/developers - "OAuth Apps", not
+# a GitHub App) + webhook secret + the key used to encrypt stored access
+# tokens at rest. All optional at startup - endpoints that need one of these
+# return a clear 503 rather than the whole app failing to boot when GitHub
+# integration hasn't been configured yet (same pattern as GROQ_API_KEY above).
+GITHUB_CLIENT_ID = os.environ.get('GITHUB_CLIENT_ID', '')
+GITHUB_CLIENT_SECRET = os.environ.get('GITHUB_CLIENT_SECRET', '')
+# Where GitHub redirects back to after the user approves access - must exactly
+# match one of the "Authorization callback URL" values on the OAuth App.
+GITHUB_OAUTH_REDIRECT_URI = os.environ.get(
+    'GITHUB_OAUTH_REDIRECT_URI', 'http://localhost:8000/api/github/callback/',
+)
+# Shared secret configured on each webhook GitHubClient creates, used to
+# verify the X-Hub-Signature-256 header on every incoming webhook POST.
+GITHUB_WEBHOOK_SECRET = os.environ.get('GITHUB_WEBHOOK_SECRET', '')
+# Fernet key (Fernet.generate_key()) encrypting GitHubIntegration.access_token
+# at rest - see github_integration/services/encryption.py.
+GITHUB_TOKEN_ENCRYPTION_KEY = os.environ.get('GITHUB_TOKEN_ENCRYPTION_KEY', '')
+# Publicly reachable base URL GitHub can deliver webhooks to (ngrok/deployed
+# host in practice - GitHub cannot reach "localhost"). Used to build the
+# webhook URL passed to GitHubClient.create_webhook().
+GITHUB_WEBHOOK_BASE_URL = os.environ.get('GITHUB_WEBHOOK_BASE_URL', 'http://localhost:8000')
+# Files larger than this are skipped entirely rather than analyzed - keeps a
+# single huge changed file (e.g. an accidentally-committed data dump) from
+# blowing up analysis time/cost.
+GITHUB_MAX_FILE_SIZE_BYTES = int(os.environ.get('GITHUB_MAX_FILE_SIZE_BYTES', 500_000))
 
 ROOT_URLCONF = 'config.urls'
 
@@ -214,6 +259,49 @@ STATIC_URL = 'static/'
 # Media files (user uploads, e.g. avatars)
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# Logging
+# StructuredFormatter appends any `extra={...}` passed to a log call as a
+# trailing JSON blob - without it those fields are silently dropped, which
+# would defeat the point of the structured logger.info(..., extra={...})
+# calls throughout github_integration (OAuth, webhooks, Celery jobs, GitHub
+# API requests, comment posting, failures).
+# Quieter during `manage.py test`: the suite deliberately exercises every
+# logged failure path (invalid signatures, retries exhausted, etc.), and at
+# INFO those all print - WARNING keeps real problems visible without the noise.
+_RUNNING_TESTS = 'test' in sys.argv
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'structured': {
+            '()': 'core.logging_formatters.StructuredFormatter',
+            'format': '%(asctime)s %(levelname)s %(name)s: %(message)s',
+        },
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'structured',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'WARNING' if _RUNNING_TESTS else 'INFO',
+    },
+    'loggers': {
+        'django': {
+            'handlers': ['console'],
+            'level': 'WARNING',
+            'propagate': False,
+        },
+        'github_integration': {
+            'handlers': ['console'],
+            'level': 'WARNING' if _RUNNING_TESTS else 'INFO',
+            'propagate': False,
+        },
+    },
+}
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field

@@ -384,3 +384,216 @@ class SearchTests(APITestCase):
 
         response = self.client.get(reverse('search'), {'q': 'payment'})
         self.assertEqual(response.data['count'], 1)
+
+
+class SecurityAnalysisViewTests(APITestCase):
+    def setUp(self):
+        self.client, self.user = make_authenticated_client('security@example.com')
+        self.analysis = Analysis.objects.create(
+            owner=self.user, name='vuln.py', language='Python',
+            source_code='password = "hardcoded123"\n',
+            status=Analysis.Status.COMPLETED, quality_score=90.0,
+        )
+
+    def test_post_requires_authentication(self):
+        anon = APIClient()
+        response = anon.post(reverse('analysis-security', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_post_404_for_another_users_analysis(self):
+        other_client, _other_user = make_authenticated_client('intruder-sec@example.com')
+        response = other_client.post(reverse('analysis-security', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_post_rejects_analysis_not_yet_completed(self):
+        pending = Analysis.objects.create(owner=self.user, name='pending.py', language='Python', source_code='x = 1\n')
+        response = self.client.post(reverse('analysis-security', args=[pending.id]))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @patch('analyses.security_views.SecurityAnalysisService')
+    def test_post_runs_analysis_and_caches_on_the_model(self, mock_service_cls):
+        mock_service_cls.return_value.analyze.return_value = {
+            'score': 70, 'risk_level': 'medium',
+            'summary': {'critical': 0, 'high': 0, 'medium': 1, 'low': 0, 'total': 1},
+            'vulnerabilities': [{
+                'id': 'bandit:B105:1', 'scanner': 'bandit', 'rule_id': 'B105',
+                'vulnerability_type': 'hardcoded_password', 'severity': 'medium',
+                'title': 'Hardcoded Password', 'description': 'Possible hardcoded password',
+                'line_number': 1, 'code_snippet': 'password = "hardcoded123"',
+                'confidence': 'MEDIUM', 'explanation': 'Anyone reading the source gets the password.',
+                'remediation': 'Load it from an environment variable instead.',
+            }],
+        }
+
+        response = self.client.post(reverse('analysis-security', args=[self.analysis.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['score'], 70)
+        self.assertEqual(response.data['risk_level'], 'medium')
+        self.assertEqual(len(response.data['vulnerabilities']), 1)
+        self.assertFalse(response.data['cached'])
+
+        self.analysis.refresh_from_db()
+        self.assertEqual(self.analysis.security_report['score'], 70)
+
+    @patch('analyses.security_views.SecurityAnalysisService')
+    def test_post_returns_cached_report_without_rerunning(self, mock_service_cls):
+        mock_service_cls.return_value.analyze.return_value = {
+            'score': 90, 'risk_level': 'low',
+            'summary': {'critical': 0, 'high': 0, 'medium': 0, 'low': 1, 'total': 1},
+            'vulnerabilities': [],
+        }
+        first = self.client.post(reverse('analysis-security', args=[self.analysis.id]))
+        self.assertEqual(mock_service_cls.return_value.analyze.call_count, 1)
+
+        second = self.client.post(reverse('analysis-security', args=[self.analysis.id]))
+        self.assertEqual(mock_service_cls.return_value.analyze.call_count, 1)  # not called again
+        self.assertTrue(second.data['cached'])
+        self.assertEqual(second.data['score'], first.data['score'])
+
+    @patch('analyses.security_views.SecurityAnalysisService')
+    def test_post_regenerate_true_forces_a_rerun(self, mock_service_cls):
+        mock_service_cls.return_value.analyze.return_value = {
+            'score': 100, 'risk_level': 'minimal',
+            'summary': {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'total': 0},
+            'vulnerabilities': [],
+        }
+        self.client.post(reverse('analysis-security', args=[self.analysis.id]))
+        self.client.post(f"{reverse('analysis-security', args=[self.analysis.id])}?regenerate=true")
+        self.assertEqual(mock_service_cls.return_value.analyze.call_count, 2)
+
+    @patch('analyses.security_views.SecurityAnalysisService')
+    def test_post_service_exception_returns_503(self, mock_service_cls):
+        mock_service_cls.return_value.analyze.side_effect = RuntimeError('boom')
+        response = self.client.post(reverse('analysis-security', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.analysis.refresh_from_db()
+        self.assertEqual(self.analysis.security_report, {})
+
+    def test_get_requires_authentication(self):
+        anon = APIClient()
+        response = anon.get(reverse('analysis-security', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_get_404_when_never_run(self):
+        response = self.client.get(reverse('analysis-security', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch('analyses.security_views.SecurityAnalysisService')
+    def test_get_returns_cached_report_after_post(self, mock_service_cls):
+        mock_service_cls.return_value.analyze.return_value = {
+            'score': 85, 'risk_level': 'low',
+            'summary': {'critical': 0, 'high': 0, 'medium': 0, 'low': 1, 'total': 1},
+            'vulnerabilities': [],
+        }
+        self.client.post(reverse('analysis-security', args=[self.analysis.id]))
+
+        response = self.client.get(reverse('analysis-security', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['score'], 85)
+        self.assertTrue(response.data['cached'])
+
+    @patch('analyses.services.ai_security_service.generate_text')
+    def test_end_to_end_with_real_scanners_through_the_real_view(self, mock_generate):
+        """Only the network-calling AI step is mocked - Bandit and the custom
+        rules scanner run for real, through the real HTTP view, proving the
+        whole pipeline (subprocess -> parse -> dedupe -> enrich -> score ->
+        serialize) actually works end to end, not just each piece in isolation."""
+        mock_generate.return_value = '[{"explanation": "Anyone reading the source gets the password.", "remediation": "Load it from an environment variable."}]'
+
+        response = self.client.post(reverse('analysis-security', args=[self.analysis.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertLess(response.data['score'], 100)
+        self.assertTrue(response.data['vulnerabilities'])
+        finding = response.data['vulnerabilities'][0]
+        self.assertEqual(finding['explanation'], 'Anyone reading the source gets the password.')
+        self.assertEqual(finding['remediation'], 'Load it from an environment variable.')
+
+
+class SuggestionsViewTests(APITestCase):
+    """SuggestionsView is otherwise untested (pre-existing gap) - covering it
+    now since this change touches its response shape directly."""
+
+    def setUp(self):
+        self.client, self.user = make_authenticated_client('suggestions@example.com')
+        self.analysis = Analysis.objects.create(
+            owner=self.user, name='snippet.py', language='Python', source_code='x = 1\n',
+            status=Analysis.Status.COMPLETED, quality_score=90.0,
+        )
+
+    def test_requires_authentication(self):
+        anon = APIClient()
+        response = anon.get(reverse('analysis-suggestions', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_404_for_another_users_analysis(self):
+        other_client, _other_user = make_authenticated_client('intruder-sugg@example.com')
+        response = other_client.get(reverse('analysis-suggestions', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_rejects_analysis_not_yet_completed(self):
+        pending = Analysis.objects.create(owner=self.user, name='pending.py', language='Python', source_code='x = 1\n')
+        response = self.client.get(reverse('analysis-suggestions', args=[pending.id]))
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @patch('analyses.ai_views.generate_text')
+    def test_parses_categorized_suggestions_from_ai(self, mock_generate):
+        mock_generate.return_value = (
+            '[{"category": "security", "text": "Use parameterized queries."}, '
+            '{"category": "general", "text": "Add a docstring."}]'
+        )
+        response = self.client.get(reverse('analysis-suggestions', args=[self.analysis.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['suggestions'], [
+            {'category': 'security', 'text': 'Use parameterized queries.'},
+            {'category': 'general', 'text': 'Add a docstring.'},
+        ])
+        self.analysis.refresh_from_db()
+        self.assertEqual(self.analysis.ai_suggestions[0]['category'], 'security')
+
+    @patch('analyses.ai_views.generate_text')
+    def test_invalid_category_from_ai_coerced_to_general(self, mock_generate):
+        mock_generate.return_value = '[{"category": "made_up_category", "text": "Something."}]'
+        response = self.client.get(reverse('analysis-suggestions', args=[self.analysis.id]))
+        self.assertEqual(response.data['suggestions'], [{'category': 'general', 'text': 'Something.'}])
+
+    @patch('analyses.ai_views.generate_text')
+    def test_non_json_response_falls_back_to_uncategorized_lines(self, mock_generate):
+        mock_generate.return_value = '- Add type hints\n- Handle the empty-list case\n'
+        response = self.client.get(reverse('analysis-suggestions', args=[self.analysis.id]))
+        self.assertEqual(response.data['suggestions'], [
+            {'category': 'general', 'text': 'Add type hints'},
+            {'category': 'general', 'text': 'Handle the empty-list case'},
+        ])
+
+    def test_old_flat_string_cache_is_upgraded_on_read(self):
+        # Simulates an analysis that got its suggestions cached before
+        # categories existed - a plain list of strings.
+        self.analysis.ai_suggestions = ['Add a docstring.', 'Rename this variable.']
+        self.analysis.save(update_fields=['ai_suggestions'])
+
+        response = self.client.get(reverse('analysis-suggestions', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['suggestions'], [
+            {'category': 'general', 'text': 'Add a docstring.'},
+            {'category': 'general', 'text': 'Rename this variable.'},
+        ])
+        self.assertTrue(response.data['cached'])
+
+    @patch('analyses.ai_views.generate_text')
+    def test_regenerate_bypasses_cache(self, mock_generate):
+        self.analysis.ai_suggestions = [{'category': 'general', 'text': 'Old suggestion.'}]
+        self.analysis.save(update_fields=['ai_suggestions'])
+        mock_generate.return_value = '[{"category": "security", "text": "New suggestion."}]'
+
+        response = self.client.get(f"{reverse('analysis-suggestions', args=[self.analysis.id])}?regenerate=true")
+
+        self.assertFalse(response.data['cached'])
+        self.assertEqual(response.data['suggestions'], [{'category': 'security', 'text': 'New suggestion.'}])
+
+    @patch('analyses.ai_views.generate_text', side_effect=RuntimeError('groq down'))
+    def test_ai_failure_returns_503(self, _mock_generate):
+        response = self.client.get(reverse('analysis-suggestions', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)

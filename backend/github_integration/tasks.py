@@ -1,0 +1,120 @@
+"""The async pipeline a webhook delivery triggers: fetch -> analyze -> store
+-> comment. Lives here (not in services/) because Celery's autodiscover_tasks()
+looks for a top-level tasks.py per app by convention.
+"""
+from __future__ import annotations
+
+import logging
+
+from celery import shared_task
+from django.utils import timezone
+
+from .models import GitHubRepository, PullRequestAnalysis, WebhookEvent
+from .services.comment_service import CommentService
+from .services.github_client import GitHubAPIError, GitHubAuthError, GitHubRateLimitError
+from .services.pr_analysis_service import PRAnalysisService
+
+logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 3
+DEFAULT_RETRY_COUNTDOWN_SECONDS = 60
+
+
+def _mark_permanently_failed(pr_analysis: PullRequestAnalysis, webhook_event: WebhookEvent, message: str) -> None:
+    pr_analysis.status = PullRequestAnalysis.Status.FAILED
+    pr_analysis.error = message[:4000]
+    pr_analysis.save(update_fields=['status', 'error', 'updated_at'])
+    webhook_event.processed = True
+    webhook_event.error = message[:4000]
+    webhook_event.save(update_fields=['processed', 'error'])
+
+
+@shared_task(bind=True, max_retries=MAX_RETRIES)
+def process_pull_request_webhook(self, webhook_event_id: int) -> None:
+    try:
+        webhook_event = WebhookEvent.objects.get(pk=webhook_event_id)
+    except WebhookEvent.DoesNotExist:
+        logger.error('github_task.webhook_event_missing', extra={'webhook_event_id': webhook_event_id})
+        return
+
+    payload = webhook_event.payload
+    pr_data = payload['pull_request']
+    repository_payload = payload['repository']
+
+    try:
+        repository = GitHubRepository.objects.select_related('integration').get(
+            repository_id=repository_payload['id'], is_active=True,
+        )
+    except GitHubRepository.DoesNotExist:
+        # Repo was deselected between the webhook firing and this task
+        # running - not an error, just nothing to do anymore.
+        logger.info('github_task.repository_not_monitored', extra={'repository_id': repository_payload['id']})
+        webhook_event.processed = True
+        webhook_event.save(update_fields=['processed'])
+        return
+
+    integration = repository.integration
+    pr_analysis, created = PullRequestAnalysis.objects.get_or_create(
+        repository=repository,
+        pull_request_number=pr_data['number'],
+        commit_sha=pr_data['head']['sha'],
+        defaults={
+            'title': (pr_data.get('title') or '')[:500],
+            'author': (pr_data.get('user') or {}).get('login', ''),
+            'status': PullRequestAnalysis.Status.RUNNING,
+        },
+    )
+
+    if not created and pr_analysis.status == PullRequestAnalysis.Status.COMPLETED:
+        # This exact commit was already analyzed - most likely a redelivered
+        # webhook that happened to arrive with a *different* delivery_id (see
+        # WebhookEvent's docstring). Nothing new to do.
+        logger.info('github_task.already_analyzed', extra={'pr_analysis_id': pr_analysis.id})
+        webhook_event.processed = True
+        webhook_event.save(update_fields=['processed'])
+        return
+
+    pr_analysis.status = PullRequestAnalysis.Status.RUNNING
+    pr_analysis.save(update_fields=['status', 'updated_at'])
+
+    try:
+        access_token = integration.get_access_token()
+        file_results = PRAnalysisService().analyze(pr_analysis, access_token)
+        CommentService().post_review(pr_analysis, file_results, access_token)
+
+    except GitHubAuthError:
+        # Not retryable - a revoked/expired token won't start working on retry.
+        integration.token_invalid = True
+        integration.save(update_fields=['token_invalid'])
+        logger.error('github_task.auth_failed', extra={'pr_analysis_id': pr_analysis.id})
+        _mark_permanently_failed(pr_analysis, webhook_event, 'GitHub access token is invalid or was revoked.')
+        return
+
+    except GitHubRateLimitError as exc:
+        if self.request.retries >= self.max_retries:
+            logger.warning('github_task.rate_limit_retries_exhausted', extra={'pr_analysis_id': pr_analysis.id})
+            _mark_permanently_failed(pr_analysis, webhook_event, 'GitHub API rate limit exceeded repeatedly.')
+            return
+        countdown = (
+            max(1, exc.reset_at - int(timezone.now().timestamp())) if exc.reset_at else DEFAULT_RETRY_COUNTDOWN_SECONDS
+        )
+        logger.warning(
+            'github_task.rate_limited', extra={'pr_analysis_id': pr_analysis.id, 'retry_in_seconds': countdown},
+        )
+        raise self.retry(exc=exc, countdown=countdown)
+
+    except GitHubAPIError as exc:
+        logger.error('github_task.github_api_error', exc_info=True, extra={'pr_analysis_id': pr_analysis.id})
+        if self.request.retries >= self.max_retries:
+            _mark_permanently_failed(pr_analysis, webhook_event, str(exc))
+            return
+        # Exponential backoff: 30s, 60s, 120s.
+        raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
+
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: any unexpected failure must still leave clean state, not a stuck "running" row and an un-retried webhook
+        logger.exception('github_task.unexpected_error', extra={'pr_analysis_id': pr_analysis.id})
+        _mark_permanently_failed(pr_analysis, webhook_event, str(exc))
+        return
+
+    webhook_event.processed = True
+    webhook_event.save(update_fields=['processed'])

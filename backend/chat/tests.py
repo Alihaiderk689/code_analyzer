@@ -1,14 +1,17 @@
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
 from analyses.models import Analysis
 
 from .models import ChatMessage, Conversation
+from .rate_limit import DAILY_MESSAGE_LIMIT, get_rate_limit_status
 
 User = get_user_model()
 
@@ -213,3 +216,207 @@ class DeleteChatHistoryTests(APITestCase):
         response = other_client.delete(reverse('chat-history', args=[self.conversation.id]))
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
         self.assertEqual(self.conversation.messages.count(), 2)
+
+
+class RateLimitStatusTests(APITestCase):
+    def setUp(self):
+        self.client, self.user = make_authenticated_client()
+        self.analysis = make_analysis(self.user)
+        self.conversation = Conversation.objects.create(analysis=self.analysis)
+
+    def test_requires_authentication(self):
+        anon = APIClient()
+        response = anon.get(reverse('chat-limit'))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_fresh_user_has_full_quota(self):
+        response = self.client.get(reverse('chat-limit'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['limit'], DAILY_MESSAGE_LIMIT)
+        self.assertEqual(response.data['used'], 0)
+        self.assertEqual(response.data['remaining'], DAILY_MESSAGE_LIMIT)
+        self.assertIsNone(response.data['reset_at'])
+
+    def test_reflects_messages_sent_today(self):
+        ChatMessage.objects.create(conversation=self.conversation, role='user', message='q1')
+        response = self.client.get(reverse('chat-limit'))
+        self.assertEqual(response.data['used'], 1)
+        self.assertEqual(response.data['remaining'], DAILY_MESSAGE_LIMIT - 1)
+        self.assertIsNone(response.data['reset_at'])
+
+    def test_exhausted_quota_sets_reset_at(self):
+        for _ in range(DAILY_MESSAGE_LIMIT):
+            ChatMessage.objects.create(conversation=self.conversation, role='user', message='q')
+
+        response = self.client.get(reverse('chat-limit'))
+        self.assertEqual(response.data['remaining'], 0)
+        self.assertIsNotNone(response.data['reset_at'])
+
+    def test_messages_older_than_24h_do_not_count(self):
+        old = ChatMessage.objects.create(conversation=self.conversation, role='user', message='old')
+        ChatMessage.objects.filter(pk=old.pk).update(created_at=timezone.now() - timedelta(hours=25))
+
+        response = self.client.get(reverse('chat-limit'))
+        self.assertEqual(response.data['used'], 0)
+        self.assertEqual(response.data['remaining'], DAILY_MESSAGE_LIMIT)
+
+    def test_assistant_messages_do_not_count_against_quota(self):
+        ChatMessage.objects.create(conversation=self.conversation, role='assistant', message='a reply')
+        response = self.client.get(reverse('chat-limit'))
+        self.assertEqual(response.data['used'], 0)
+
+    def test_quota_is_global_across_conversations(self):
+        other_analysis = make_analysis(self.user, name='other.py')
+        other_conversation = Conversation.objects.create(analysis=other_analysis)
+        ChatMessage.objects.create(conversation=self.conversation, role='user', message='q1')
+        ChatMessage.objects.create(conversation=other_conversation, role='user', message='q2')
+
+        response = self.client.get(reverse('chat-limit'))
+        self.assertEqual(response.data['used'], 2)
+
+    def test_quota_scoped_to_owner(self):
+        other_client, other_user = make_authenticated_client('other-quota@example.com')
+        other_analysis = make_analysis(other_user, name='theirs.py')
+        other_conversation = Conversation.objects.create(analysis=other_analysis)
+        for _ in range(DAILY_MESSAGE_LIMIT):
+            ChatMessage.objects.create(conversation=other_conversation, role='user', message='q')
+
+        response = self.client.get(reverse('chat-limit'))
+        self.assertEqual(response.data['used'], 0)
+        self.assertEqual(response.data['remaining'], DAILY_MESSAGE_LIMIT)
+
+
+class SendMessageRateLimitTests(APITestCase):
+    def setUp(self):
+        self.client, self.user = make_authenticated_client()
+        self.analysis = make_analysis(self.user)
+        self.conversation = Conversation.objects.create(analysis=self.analysis)
+
+    @patch('chat.views.generate_chat_reply', return_value='ok')
+    def test_allows_up_to_the_daily_limit(self, _mock_generate):
+        for i in range(DAILY_MESSAGE_LIMIT):
+            response = self.client.post(reverse('chat-message'), {
+                'conversation_id': self.conversation.id, 'message': f'question {i}',
+            })
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    @patch('chat.views.generate_chat_reply', return_value='ok')
+    def test_blocks_the_message_after_the_limit(self, mock_generate):
+        for i in range(DAILY_MESSAGE_LIMIT):
+            self.client.post(reverse('chat-message'), {
+                'conversation_id': self.conversation.id, 'message': f'question {i}',
+            })
+        mock_generate.reset_mock()
+
+        response = self.client.post(reverse('chat-message'), {
+            'conversation_id': self.conversation.id, 'message': 'one too many',
+        })
+
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        self.assertEqual(response.data['remaining'], 0)
+        self.assertIsNotNone(response.data['reset_at'])
+        # Blocked before ever reaching the LLM, and nothing extra was saved.
+        mock_generate.assert_not_called()
+        self.assertEqual(
+            ChatMessage.objects.filter(conversation=self.conversation, role='user').count(),
+            DAILY_MESSAGE_LIMIT,
+        )
+
+    @patch('chat.views.generate_chat_reply', return_value='ok')
+    def test_limit_is_global_across_the_users_conversations(self, _mock_generate):
+        other_analysis = make_analysis(self.user, name='other.py')
+        other_conversation = Conversation.objects.create(analysis=other_analysis)
+
+        self.client.post(reverse('chat-message'), {'conversation_id': self.conversation.id, 'message': 'q1'})
+        self.client.post(reverse('chat-message'), {'conversation_id': other_conversation.id, 'message': 'q2'})
+        self.client.post(reverse('chat-message'), {'conversation_id': self.conversation.id, 'message': 'q3'})
+
+        response = self.client.post(reverse('chat-message'), {
+            'conversation_id': other_conversation.id, 'message': 'q4 should be blocked',
+        })
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    @patch('chat.views.generate_chat_reply', return_value='ok')
+    def test_access_restored_once_the_window_passes(self, _mock_generate):
+        for i in range(DAILY_MESSAGE_LIMIT):
+            self.client.post(reverse('chat-message'), {
+                'conversation_id': self.conversation.id, 'message': f'question {i}',
+            })
+        ChatMessage.objects.filter(conversation=self.conversation, role='user').update(
+            created_at=timezone.now() - timedelta(hours=25),
+        )
+
+        response = self.client.post(reverse('chat-message'), {
+            'conversation_id': self.conversation.id, 'message': 'fresh start',
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class RateLimitMidnightBoundaryTests(APITestCase):
+    """Direct unit tests against get_rate_limit_status with a controlled `now` -
+    day-boundary logic is exactly the kind of thing that's flaky to test by
+    guessing what 'today' happens to be when the suite runs."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(username='midnight', email='midnight@example.com', password='TestPass123!')
+        self.analysis = make_analysis(self.user)
+        self.conversation = Conversation.objects.create(analysis=self.analysis)
+
+    def test_message_just_before_local_midnight_does_not_count_after_it(self):
+        # UTC+5 (offset -300). "Now" is 00:05 local on Jan 2nd. A message sent
+        # at 23:55 local on Jan 1st - only 10 minutes earlier in real time - is
+        # still "yesterday" locally and must not count toward today's quota.
+        now = timezone.datetime(2026, 1, 1, 19, 5, tzinfo=timezone.utc)
+        msg = ChatMessage.objects.create(conversation=self.conversation, role='user', message='late night q')
+        ChatMessage.objects.filter(pk=msg.pk).update(created_at=timezone.datetime(2026, 1, 1, 18, 55, tzinfo=timezone.utc))
+
+        result = get_rate_limit_status(self.user, tz_offset_minutes=-300, now=now)
+        self.assertEqual(result['used'], 0)
+
+    def test_message_just_after_local_midnight_counts(self):
+        now = timezone.datetime(2026, 1, 1, 19, 5, tzinfo=timezone.utc)
+        msg = ChatMessage.objects.create(conversation=self.conversation, role='user', message='right after midnight')
+        ChatMessage.objects.filter(pk=msg.pk).update(created_at=timezone.datetime(2026, 1, 1, 19, 1, tzinfo=timezone.utc))
+
+        result = get_rate_limit_status(self.user, tz_offset_minutes=-300, now=now)
+        self.assertEqual(result['used'], 1)
+
+    def test_same_instant_different_reported_timezones_see_different_days(self):
+        # Same real message, same real "now" - but a client reporting a
+        # timezone that's further behind UTC hasn't rolled into the new day
+        # yet, so yesterday's-by-UTC message is still "today" for them.
+        now = timezone.datetime(2026, 1, 1, 0, 10, tzinfo=timezone.utc)  # just after UTC midnight
+        msg = ChatMessage.objects.create(conversation=self.conversation, role='user', message='q')
+        ChatMessage.objects.filter(pk=msg.pk).update(created_at=timezone.datetime(2025, 12, 31, 23, 50, tzinfo=timezone.utc))
+
+        utc_result = get_rate_limit_status(self.user, tz_offset_minutes=0, now=now)
+        self.assertEqual(utc_result['used'], 0)  # message was "yesterday" (Dec 31) in UTC
+
+        utc_minus_5_result = get_rate_limit_status(self.user, tz_offset_minutes=300, now=now)
+        self.assertEqual(utc_minus_5_result['used'], 1)  # local time is only 19:10 Dec 31 - still today
+
+    def test_reset_at_is_next_local_midnight_not_24h_from_last_message(self):
+        # Matches the exact scenario this was designed around: using the last
+        # of 3 messages at 9pm local should count down to midnight (~3h away),
+        # not a full 24h from 9pm.
+        now = timezone.datetime(2026, 1, 1, 16, 0, tzinfo=timezone.utc)  # 21:00 local (UTC+5)
+        for _ in range(DAILY_MESSAGE_LIMIT):
+            msg = ChatMessage.objects.create(conversation=self.conversation, role='user', message='q')
+            ChatMessage.objects.filter(pk=msg.pk).update(created_at=now)
+
+        result = get_rate_limit_status(self.user, tz_offset_minutes=-300, now=now)
+        self.assertEqual(result['reset_at'], timezone.datetime(2026, 1, 1, 19, 0, tzinfo=timezone.utc))
+
+    def test_offset_is_clamped_to_real_world_range(self):
+        now = timezone.now()
+        ChatMessage.objects.create(conversation=self.conversation, role='user', message='q')
+
+        wild = get_rate_limit_status(self.user, tz_offset_minutes=999_999, now=now)
+        clamped_equivalent = get_rate_limit_status(self.user, tz_offset_minutes=12 * 60, now=now)
+        self.assertEqual(wild['used'], clamped_equivalent['used'])
+
+    def test_non_numeric_offset_falls_back_to_utc(self):
+        now = timezone.now()
+        result = get_rate_limit_status(self.user, tz_offset_minutes='not-a-number', now=now)
+        utc_result = get_rate_limit_status(self.user, tz_offset_minutes=0, now=now)
+        self.assertEqual(result, utc_result)

@@ -45,6 +45,38 @@ def _call_ai(prompt, system_instruction):
         )
 
 
+_SUGGESTION_CATEGORIES = {'security', 'general'}
+
+
+def _normalize_suggestions(raw):
+    """Each suggestion is {"category": "security"|"general", "text": "..."} so
+    the frontend can group security-related suggestions under their own
+    heading, separate from general style/quality ones. Also upgrades older
+    cached analyses, which stored suggestions as a flat list of strings before
+    categories existed, on the fly - no data migration needed."""
+    normalized = []
+    for item in raw:
+        if isinstance(item, dict) and isinstance(item.get('text'), str):
+            category = item.get('category') if item.get('category') in _SUGGESTION_CATEGORIES else 'general'
+            normalized.append({'category': category, 'text': item['text']})
+        elif isinstance(item, str):
+            normalized.append({'category': 'general', 'text': item})
+    return normalized
+
+
+def _parse_suggestions(text):
+    try:
+        data = json.loads(_strip_code_fences(text))
+        if not isinstance(data, list):
+            raise ValueError
+    except (json.JSONDecodeError, ValueError):
+        # Model didn't follow the requested JSON shape - fall back to treating
+        # each non-empty line as an uncategorized suggestion rather than
+        # dropping the response entirely.
+        data = [line.strip('- ').strip() for line in text.strip().splitlines() if line.strip()]
+    return _normalize_suggestions(data)
+
+
 class SuggestionsView(APIView):
     def get(self, request, pk):
         analysis, error = _get_owned_completed_analysis(request, pk)
@@ -52,7 +84,7 @@ class SuggestionsView(APIView):
             return error
 
         if analysis.ai_suggestions and not _wants_regenerate(request):
-            return Response({'suggestions': analysis.ai_suggestions, 'cached': True})
+            return Response({'suggestions': _normalize_suggestions(analysis.ai_suggestions), 'cached': True})
 
         prompt = (
             f'Language: {analysis.language}\n\n'
@@ -62,18 +94,16 @@ class SuggestionsView(APIView):
         system_instruction = (
             'You are a senior software engineer performing a code review. Given source code and a list of '
             'static-analysis issues, produce concise, concrete, actionable suggestions to improve code quality. '
-            'Respond with ONLY a JSON array of strings, no other text, no markdown fences.'
+            'Tag each suggestion with a category: "security" if it relates to a security concern (injection, '
+            'secrets, authentication, unsafe input handling, etc.), or "general" for anything else (style, '
+            'performance, readability, correctness). Respond with ONLY a JSON array of the shape '
+            '[{"category": "security"|"general", "text": "<the suggestion>"}, ...], no other text, no markdown fences.'
         )
         text, error = _call_ai(prompt, system_instruction)
         if error:
             return error
 
-        try:
-            suggestions = json.loads(_strip_code_fences(text))
-            if not isinstance(suggestions, list):
-                raise ValueError
-        except (json.JSONDecodeError, ValueError):
-            suggestions = [line.strip('- ').strip() for line in text.strip().splitlines() if line.strip()]
+        suggestions = _parse_suggestions(text)
 
         analysis.ai_suggestions = suggestions
         analysis.save(update_fields=['ai_suggestions', 'updated_at'])

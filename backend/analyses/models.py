@@ -23,6 +23,7 @@ class Analysis(models.Model):
     ai_explanation = models.TextField(blank=True)
     ai_refactored_code = models.TextField(blank=True)
     ai_refactor_explanation = models.TextField(blank=True)
+    security_report = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

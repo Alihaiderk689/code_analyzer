@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import ai_views, analysis_views as views
+from . import ai_views, analysis_views as views, security_views
 
 urlpatterns = [
     path('', views.AnalysisListView.as_view(), name='analysis-list'),
@@ -13,4 +13,5 @@ urlpatterns = [
     path('<int:pk>/suggestions/', ai_views.SuggestionsView.as_view(), name='analysis-suggestions'),
     path('<int:pk>/explanation/', ai_views.ExplanationView.as_view(), name='analysis-explanation'),
     path('<int:pk>/refactor/', ai_views.RefactorView.as_view(), name='analysis-refactor'),
+    path('<int:pk>/security/', security_views.SecurityAnalysisView.as_view(), name='analysis-security'),
 ]
