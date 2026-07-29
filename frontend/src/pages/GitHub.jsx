@@ -121,22 +121,11 @@ export default function GitHub() {
 
   return (
     <div style={{ maxWidth: 900, margin: '0 auto', padding: '44px 40px 100px' }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
-        <div>
-          <div style={{ fontFamily: 'var(--font-display)', fontSize: 32, fontWeight: 500 }}>GitHub integration</div>
-          <div style={{ fontSize: 14, color: 'var(--color-text-secondary-2)', marginTop: 4 }}>
-            Connect a repository to get automatic AI code review on every pull request.
-          </div>
+      <div>
+        <div style={{ fontFamily: 'var(--font-display)', fontSize: 32, fontWeight: 500 }}>GitHub integration</div>
+        <div style={{ fontSize: 14, color: 'var(--color-text-secondary-2)', marginTop: 4 }}>
+          Connect a repository to get automatic AI code review on every pull request.
         </div>
-        {status.connected && (
-          <button
-            className="btn btn-outline"
-            style={{ padding: '10px 18px', fontSize: 13, whiteSpace: 'nowrap' }}
-            onClick={() => navigate('/github/pull-requests')}
-          >
-            View pull requests →
-          </button>
-        )}
       </div>
 
       {callbackNotice && (
