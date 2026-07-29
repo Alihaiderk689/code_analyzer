@@ -1,10 +1,9 @@
 import { Navigate, Outlet, useLocation } from 'react-router-dom'
 import { useAuth } from '../lib/AuthContext'
 import AppNav from './AppNav'
-import ChatWidget from './ChatWidget'
 
 export default function ProtectedRoute() {
-  const { user, isAdmin, initializing } = useAuth()
+  const { user, initializing } = useAuth()
   const location = useLocation()
 
   if (initializing) return <div className="page-loading">Loading...</div>
@@ -14,7 +13,6 @@ export default function ProtectedRoute() {
     <>
       <AppNav />
       <Outlet />
-      {!isAdmin && <ChatWidget />}
     </>
   )
 }

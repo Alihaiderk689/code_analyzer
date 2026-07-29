@@ -86,10 +86,6 @@ export const downloadReportPdf = (id) => apiFetch(`/reports/${id}/pdf/`, { respo
 export const downloadReportJson = (id) => apiFetch(`/reports/${id}/json/`, { responseType: 'blob' })
 export const getReportHtml = (id) => apiFetch(`/reports/${id}/html/`, { responseType: 'blob' })
 
-// AI chat
-export const chatWithAi = (message, history, analysisId) =>
-  apiFetch('/ai/chat/', { method: 'POST', body: { message, history, analysis_id: analysisId ?? null } })
-
 // Chat with Your Code - persisted, per-analysis conversation (distinct from the
 // stateless floating assistant above).
 // The daily chat quota resets at the user's own local midnight, not server
