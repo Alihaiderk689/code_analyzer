@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from analyses.models import Analysis
+from core.throttling import AIRateThrottle
 
 from .client import generate_chat_reply
 from .prompts import BASE_CHAT_INSTRUCTION, build_analysis_context
@@ -11,6 +12,8 @@ from .serializers import ChatRequestSerializer
 
 
 class ChatView(APIView):
+    throttle_classes = [AIRateThrottle]
+
     def post(self, request):
         serializer = ChatRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)

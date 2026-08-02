@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState, useCallback } from 'react'
-import { getAccessToken, getRefreshToken, setTokens, clearTokens, ApiError } from './api'
+import { primeCsrf, ApiError } from './api'
 import { loginUser, logoutUser, fetchProfile, updateProfile, adminStats } from './resources'
 
 // The profile endpoint never returns is_staff, so the only reliable way to know
@@ -15,7 +15,8 @@ async function checkIsAdmin() {
   }
 }
 
-const PENDING_NAME_KEY = 'ca_pending_name'
+const PENDING_FIRST_NAME_KEY = 'ca_pending_first_name'
+const PENDING_LAST_NAME_KEY = 'ca_pending_last_name'
 
 const AuthContext = createContext(null)
 
@@ -27,10 +28,12 @@ export function AuthProvider({ children }) {
   useEffect(() => {
     let cancelled = false
     async function restore() {
-      if (!getAccessToken() && !getRefreshToken()) {
-        setInitializing(false)
-        return
-      }
+      // The CSRF cookie must exist before any mutating request this session
+      // might make; access/refresh tokens are httpOnly, so JS can't check
+      // for them up front the way it used to - just attempt the profile
+      // fetch and let a 401 (even after apiFetch's automatic refresh retry)
+      // mean "not logged in".
+      await primeCsrf()
       try {
         const profile = await fetchProfile()
         const admin = await checkIsAdmin()
@@ -39,7 +42,8 @@ export function AuthProvider({ children }) {
           setIsAdmin(admin)
         }
       } catch {
-        clearTokens()
+        // Not logged in (or session expired) - nothing to clean up client-side
+        // anymore, the cookies are what they are.
       } finally {
         if (!cancelled) setInitializing(false)
       }
@@ -52,14 +56,18 @@ export function AuthProvider({ children }) {
 
   const login = useCallback(async (email, password) => {
     const data = await loginUser(email, password)
-    setTokens({ access: data.access, refresh: data.refresh })
 
-    const pendingName = sessionStorage.getItem(PENDING_NAME_KEY)
+    const pendingFirstName = sessionStorage.getItem(PENDING_FIRST_NAME_KEY)
+    const pendingLastName = sessionStorage.getItem(PENDING_LAST_NAME_KEY)
     let finalUser = data.user
-    if (pendingName) {
-      sessionStorage.removeItem(PENDING_NAME_KEY)
+    if (pendingFirstName || pendingLastName) {
+      sessionStorage.removeItem(PENDING_FIRST_NAME_KEY)
+      sessionStorage.removeItem(PENDING_LAST_NAME_KEY)
       try {
-        const profile = await updateProfile({ first_name: pendingName })
+        const profile = await updateProfile({
+          first_name: pendingFirstName || '',
+          last_name: pendingLastName || '',
+        })
         finalUser = { ...data.user, ...profile }
       } catch {
         // Name is a nice-to-have; don't block login if this fails.
@@ -73,13 +81,11 @@ export function AuthProvider({ children }) {
   }, [])
 
   const logout = useCallback(async () => {
-    const refresh = getRefreshToken()
     try {
-      if (refresh) await logoutUser(refresh)
+      await logoutUser()
     } catch {
-      // best-effort; clear local session regardless
+      // best-effort; clear local UI state regardless
     }
-    clearTokens()
     setUser(null)
     setIsAdmin(false)
   }, [])

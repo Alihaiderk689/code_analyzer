@@ -1,9 +1,13 @@
+import logging
+
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from core.throttling import AnalysisCreateRateThrottle
 
 from .engine import analyze_code, detect_language, detect_language_from_code
 from .models import Analysis
@@ -15,9 +19,23 @@ from .serializers import (
     UploadRequestSerializer,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def _run_analysis(analysis):
-    result = analyze_code(analysis.source_code, analysis.language)
+    """Runs the (possibly sandboxed) analysis engine and marks the row COMPLETED.
+    On any unexpected failure (e.g. the sandboxed subprocess itself misbehaving in
+    a way engine.py/sandbox.py didn't already anticipate), the row is marked
+    FAILED instead of being left stuck in PENDING/RUNNING forever, and the error
+    is logged rather than propagating into a raw 500."""
+    try:
+        result = analyze_code(analysis.source_code, analysis.language)
+    except Exception:
+        logger.exception('analysis_run_failed', extra={'analysis_id': analysis.pk})
+        analysis.status = Analysis.Status.FAILED
+        analysis.save(update_fields=['status', 'updated_at'])
+        return analysis
+
     analysis.lines_of_code = result['lines_of_code']
     analysis.issues = result['issues']
     analysis.issues_count = result['issues_count']
@@ -28,6 +46,8 @@ def _run_analysis(analysis):
 
 
 class AnalyzeView(APIView):
+    throttle_classes = [AnalysisCreateRateThrottle]
+
     def post(self, request):
         serializer = AnalyzeRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -45,6 +65,7 @@ class AnalyzeView(APIView):
 
 class UploadView(APIView):
     parser_classes = [MultiPartParser, FormParser]
+    throttle_classes = [AnalysisCreateRateThrottle]
 
     def post(self, request):
         serializer = UploadRequestSerializer(data=request.data)
@@ -88,6 +109,8 @@ class AnalysisDetailView(APIView):
 
 
 class ReanalyzeView(APIView):
+    throttle_classes = [AnalysisCreateRateThrottle]
+
     def post(self, request, pk):
         analysis = get_object_or_404(Analysis, pk=pk, owner=request.user)
         if not analysis.source_code:

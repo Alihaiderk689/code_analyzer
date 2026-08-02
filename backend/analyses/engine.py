@@ -46,6 +46,9 @@ ISSUE_PENALTIES = {
     'unused_import': 2,
     'runtime_error': 50,
     'execution_timeout': 30,
+    # Informational only (sandboxed execution isn't available on this host) -
+    # not a code quality problem, so it must not move the score.
+    'runtime_check_unavailable': 0,
 }
 
 # pyflakes message class name -> (issue type, penalty override or None to use the
@@ -141,11 +144,22 @@ def _python_runtime_issues(code):
             'message': f'Execution exceeded {sandbox.TIMEOUT_SECONDS} seconds and was terminated - possible infinite loop.',
         }]
 
-    # 'ok' -> ran cleanly, nothing to report. 'unavailable' -> no sandboxing primitive
-    # on this host (see sandbox.is_available) - degrades silently to static-only
-    # analysis rather than surfacing a "sandbox unavailable" issue on every submission.
-    # 'import_error' -> failed on a missing third-party package in the sandbox's bare
-    # system Python, not a real bug in the code - see sandbox.run_python's docstring.
+    if result['status'] == 'unavailable':
+        # No sandboxing primitive on this host (see sandbox.is_available) - told to
+        # the user as a zero-penalty informational note (see ISSUE_PENALTIES) rather
+        # than degrading to static-only analysis without saying so.
+        return [{
+            'line': None,
+            'type': 'runtime_check_unavailable',
+            'message': (
+                'Runtime error detection is unavailable on this server (requires macOS); '
+                'only static analysis was performed for this submission.'
+            ),
+        }]
+
+    # 'ok' -> ran cleanly, nothing to report. 'import_error' -> failed on a missing
+    # third-party package in the sandbox's bare system Python, not a real bug in the
+    # code - see sandbox.run_python's docstring.
     return []
 
 

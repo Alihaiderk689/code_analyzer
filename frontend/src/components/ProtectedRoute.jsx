@@ -36,3 +36,14 @@ export function UserRoute() {
 
   return <Outlet />
 }
+
+// Guards routes like /login and /register — an already-authenticated user
+// hitting them should land back in the app instead of seeing the auth forms again.
+export function GuestRoute() {
+  const { user, isAdmin, initializing } = useAuth()
+
+  if (initializing) return <div className="page-loading">Loading...</div>
+  if (user) return <Navigate to={isAdmin ? '/admin' : '/dashboard'} replace />
+
+  return <Outlet />
+}

@@ -3,7 +3,11 @@ from rest_framework import serializers
 
 class ChatMessageSerializer(serializers.Serializer):
     role = serializers.ChoiceField(choices=['user', 'assistant'])
-    content = serializers.CharField()
+    # Same cap as ChatRequestSerializer.message below - history entries are
+    # client-supplied (unlike chat.SendMessageView, whose history comes from
+    # already-validated stored ChatMessage rows), so without this a client
+    # could send 20 arbitrarily large entries and inflate the Groq prompt.
+    content = serializers.CharField(max_length=8000)
 
 
 class ChatRequestSerializer(serializers.Serializer):

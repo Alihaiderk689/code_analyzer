@@ -2,28 +2,49 @@ import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { registerUser } from '../lib/resources'
 import { ApiError } from '../lib/api'
+import PasswordChecklist from '../components/PasswordChecklist'
+import {
+  validateName,
+  validateEmail,
+  validatePassword,
+  validateConfirmPassword,
+  normalizeEmail,
+} from '../lib/validation'
 
 export default function Register() {
   const navigate = useNavigate()
-  const [name, setName] = useState('')
+  const [firstName, setFirstName] = useState('')
+  const [lastName, setLastName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [password2, setPassword2] = useState('')
+  const [passwordFocused, setPasswordFocused] = useState(false)
+  const [fieldErrors, setFieldErrors] = useState({})
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
 
   const handleSubmit = async (e) => {
     e.preventDefault()
     setError('')
-    if (password !== password2) {
-      setError('Passwords do not match.')
-      return
+
+    const errors = {
+      firstName: validateName(firstName, 'First name'),
+      lastName: validateName(lastName, 'Last name'),
+      email: validateEmail(email),
+      password: validatePassword(password),
+      password2: validateConfirmPassword(password, password2),
     }
+    setFieldErrors(errors)
+    if (Object.values(errors).some(Boolean)) return
+
+    const cleanEmail = normalizeEmail(email)
+
     setSubmitting(true)
     try {
-      await registerUser(email, password, password2)
-      if (name.trim()) sessionStorage.setItem('ca_pending_name', name.trim())
-      navigate('/verify-email', { state: { email } })
+      await registerUser(cleanEmail, password, password2)
+      sessionStorage.setItem('ca_pending_first_name', firstName.trim())
+      sessionStorage.setItem('ca_pending_last_name', lastName.trim())
+      navigate('/verify-email', { state: { email: cleanEmail } })
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
     } finally {
@@ -38,38 +59,64 @@ export default function Register() {
         <div style={{ fontSize: 14, color: 'var(--color-text-secondary-2)', marginTop: 6 }}>
           Start analyzing code in seconds.
         </div>
-        <form onSubmit={handleSubmit} style={{ marginTop: 24, display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <form onSubmit={handleSubmit} style={{ marginTop: 24, display: 'flex', flexDirection: 'column', gap: 12 }} noValidate>
           <input
             type="text"
-            placeholder="Full name"
+            placeholder="First name"
             className="field"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
+            value={firstName}
+            onChange={(e) => setFirstName(e.target.value)}
+            onBlur={() => setFieldErrors((prev) => ({ ...prev, firstName: validateName(firstName, 'First name') }))}
           />
+          {fieldErrors.firstName && <div className="field-error">{fieldErrors.firstName}</div>}
+
+          <input
+            type="text"
+            placeholder="Last name"
+            className="field"
+            value={lastName}
+            onChange={(e) => setLastName(e.target.value)}
+            onBlur={() => setFieldErrors((prev) => ({ ...prev, lastName: validateName(lastName, 'Last name') }))}
+          />
+          {fieldErrors.lastName && <div className="field-error">{fieldErrors.lastName}</div>}
+
           <input
             type="email"
-            required
             placeholder="Email address"
             className="field"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
+            onBlur={() => {
+              setEmail((prev) => normalizeEmail(prev))
+              setFieldErrors((prev) => ({ ...prev, email: validateEmail(email) }))
+            }}
           />
+          {fieldErrors.email && <div className="field-error">{fieldErrors.email}</div>}
+
           <input
             type="password"
-            required
             placeholder="Password"
             className="field"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
+            onFocus={() => setPasswordFocused(true)}
+            onBlur={() => setFieldErrors((prev) => ({ ...prev, password: validatePassword(password) }))}
           />
+          {passwordFocused && <PasswordChecklist password={password} />}
+          {fieldErrors.password && <div className="field-error">{fieldErrors.password}</div>}
+
           <input
             type="password"
-            required
             placeholder="Confirm password"
             className="field"
             value={password2}
             onChange={(e) => setPassword2(e.target.value)}
+            onBlur={() =>
+              setFieldErrors((prev) => ({ ...prev, password2: validateConfirmPassword(password, password2) }))
+            }
           />
+          {fieldErrors.password2 && <div className="field-error">{fieldErrors.password2}</div>}
+
           {error && <div className="msg-error">{error}</div>}
           <button type="submit" className="btn btn-dark btn-block" style={{ marginTop: 6 }} disabled={submitting}>
             {submitting ? 'Creating account…' : 'Create account'}
