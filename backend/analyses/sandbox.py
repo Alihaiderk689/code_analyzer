@@ -20,14 +20,26 @@ uses macOS's Seatbelt sandbox (`sandbox-exec`) instead:
 Known gaps, disclosed rather than silently ignored:
   - `sandbox-exec` is macOS-only. On any other platform (i.e. most real Linux
     production servers) this refuses to execute rather than silently running
-    unsandboxed - see `is_available()`.
+    unsandboxed - see `is_available()`. Callers surface this to the user
+    (see analyses.engine._python_runtime_issues) instead of degrading quietly.
   - Memory limits (RLIMIT_AS / RLIMIT_DATA) cannot be lowered at all on macOS
     - confirmed empirically, not an oversight - so the wall-clock timeout is
       the only real bound on memory exhaustion, not a hard memory cap.
-  - General file reads outside this project are allowed, so a submission
-    could still read other world-readable files on the host. The one thing
-    specifically and deliberately blocked is this project's own directory
-    (where .env/secrets live).
+    RLIMIT_FSIZE *does* work, though, and is set below to stop a submission
+    from filling the disk with output before the timeout fires.
+  - General file reads outside this project are allowed (Python's stdlib
+    needs to read broadly just to start up), so a submission could still
+    read other world-readable files on the host. What's specifically and
+    deliberately blocked is this project's own directory (.env/secrets) and
+    the invoking user's home directory (SSH keys, cloud credentials, shell
+    history, etc.) - the two places real secrets are actually likely to be.
+  - process-exec is intentionally left unrestricted (tried narrowing it to
+    just SYSTEM_PYTHON and reverted - on this and presumably many macOS hosts
+    /usr/bin/python3 is itself an Xcode Command Line Tools stub that re-execs
+    into a *different* real binary path, so a literal-path allowlist broke
+    the sandbox's own interpreter startup). Contained instead by the
+    network-deny and scratch-dir-only-write rules applying to the whole
+    process tree, same as before.
 """
 import re
 import shutil
@@ -38,8 +50,10 @@ from pathlib import Path
 TIMEOUT_SECONDS = 5
 CPU_TIME_SECONDS = 5
 MAX_PROCESSES = 16
+MAX_OUTPUT_FILE_BYTES = 10 * 1024 * 1024
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+HOME_DIR = str(Path.home())
 SYSTEM_PYTHON = '/usr/bin/python3'
 
 
@@ -56,6 +70,7 @@ def _build_profile(scratch_dir):
 (allow process-fork)
 (allow file-read*)
 (deny file-read* (subpath "{PROJECT_ROOT}"))
+(deny file-read* (subpath "{HOME_DIR}"))
 (allow file-read* file-write* (subpath "{scratch_dir}"))
 (deny file-write*)
 (deny network*)
@@ -71,6 +86,7 @@ def _limit_resources():
     resource.setrlimit(resource.RLIMIT_CPU, (CPU_TIME_SECONDS, CPU_TIME_SECONDS))
     resource.setrlimit(resource.RLIMIT_NPROC, (MAX_PROCESSES, MAX_PROCESSES))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_OUTPUT_FILE_BYTES, MAX_OUTPUT_FILE_BYTES))
 
 
 _TRACEBACK_LAST_FRAME = re.compile(r'File "(?P<file>[^"]+)", line (?P<line>\d+)')

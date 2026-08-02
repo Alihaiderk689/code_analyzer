@@ -50,6 +50,10 @@ DEBUG = ENVIRONMENT == 'development'
 
 ALLOWED_HOSTS = [h for h in os.environ.get('ALLOWED_HOSTS', '').split(',') if h]
 
+# Used below (REST_FRAMEWORK throttle rates) and further down (LOGGING levels)
+# to quiet things down / relax limits specifically while `manage.py test` runs.
+_RUNNING_TESTS = 'test' in sys.argv
+
 if ENVIRONMENT == 'production':
     # https://docs.djangoproject.com/en/4.2/topics/security/
     SECURE_SSL_REDIRECT = True
@@ -59,6 +63,27 @@ if ENVIRONMENT == 'production':
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
     SECURE_CONTENT_TYPE_NOSNIFF = True
+
+# JWT access/refresh tokens live in httpOnly cookies (see accounts/cookies.py,
+# accounts/authentication.py) rather than being readable by frontend JS, so an
+# XSS bug can't just read them out of localStorage. That means the browser now
+# attaches them automatically on every request, which is exactly what SameSite
+# and the CSRF double-submit check (CookieJWTAuthentication) exist to contain.
+#
+# SameSite=None requires Secure, and Secure cookies are never sent over plain
+# http:// - so dev (http://localhost) uses Lax (sufficient there: frontend and
+# backend differ only by port, which is the same "site"), and production uses
+# None+Secure so it still works if frontend/backend end up on genuinely
+# different domains, not just different subdomains of one.
+#
+# Cookie-based CSRF *requires* frontend and backend to share a registrable
+# domain (e.g. app.example.com / api.example.com) - the frontend JS must be
+# able to read the (non-httpOnly) csrftoken cookie via document.cookie to echo
+# it back as a header, and cookies aren't readable across unrelated domains.
+AUTH_COOKIE_SECURE = ENVIRONMENT == 'production'
+AUTH_COOKIE_SAMESITE = 'None' if ENVIRONMENT == 'production' else 'Lax'
+CSRF_COOKIE_SAMESITE = AUTH_COOKIE_SAMESITE
+# CSRF_TRUSTED_ORIGINS is set below, once CORS_ALLOWED_ORIGINS exists.
 
 
 # Application definition
@@ -97,6 +122,33 @@ _default_cors_origins = 'http://localhost:5173,http://127.0.0.1:5173' if ENVIRON
 CORS_ALLOWED_ORIGINS = [
     o for o in os.environ.get('CORS_ALLOWED_ORIGINS', _default_cors_origins).split(',') if o
 ]
+# Cookies (JWT + CSRF) must be allowed to flow with cross-origin requests -
+# the frontend and backend are separate origins even in dev (5173 vs 8000).
+CORS_ALLOW_CREDENTIALS = True
+# Django's CSRF check validates the request's Origin/Referer against this list
+# for any cookie-authenticated unsafe request (see accounts/authentication.py).
+CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS
+
+# Baseline throttle rates, keyed by 'scope' (see core/throttling.py for the
+# named ScopedRateThrottle subclasses that opt individual views into these).
+# 'anon' and 'user' are applied to every view automatically (DEFAULT_THROTTLE_CLASSES
+# below); the rest only apply to views that explicitly set throttle_classes.
+# During `manage.py test` these are widened to effectively unlimited - the
+# Django test client reuses the same REMOTE_ADDR for every request, so real
+# rates would make unrelated tests bleed into each other's throttle counters
+# (LocMemCache persists for the whole test-run process). Tests that need to
+# exercise real throttling do so with their own override_settings + cache.clear().
+_THROTTLE_RATES = {
+    'anon': '60/min',
+    'user': '300/min',
+    'login': '10/min',
+    'register': '5/hour',
+    'password_reset': '20/hour',
+    'ai': '30/min',
+    'analysis_create': '30/min',
+}
+if _RUNNING_TESTS:
+    _THROTTLE_RATES = {scope: '1000000/day' for scope in _THROTTLE_RATES}
 
 REST_FRAMEWORK = {
     # Secure by default: endpoints must opt in to AllowAny explicitly (see core/views.py).
@@ -104,8 +156,14 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.IsAuthenticated',
     ],
     'DEFAULT_AUTHENTICATION_CLASSES': [
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'accounts.authentication.CookieJWTAuthentication',
     ],
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': _THROTTLE_RATES,
+    'EXCEPTION_HANDLER': 'core.exceptions.custom_exception_handler',
 }
 
 SIMPLE_JWT = {
@@ -269,7 +327,6 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # Quieter during `manage.py test`: the suite deliberately exercises every
 # logged failure path (invalid signatures, retries exhausted, etc.), and at
 # INFO those all print - WARNING keeps real problems visible without the noise.
-_RUNNING_TESTS = 'test' in sys.argv
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,

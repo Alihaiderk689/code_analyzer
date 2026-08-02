@@ -9,6 +9,13 @@ from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from .validators import (
+    normalize_email,
+    validate_password_strength,
+    validate_person_name,
+    validate_username_format,
+)
+
 User = get_user_model()
 
 
@@ -26,7 +33,7 @@ def _generate_username(email):
 
 
 class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, validators=[validate_password])
+    password = serializers.CharField(write_only=True, validators=[validate_password_strength, validate_password])
     password2 = serializers.CharField(write_only=True)
 
     class Meta:
@@ -34,8 +41,9 @@ class RegisterSerializer(serializers.ModelSerializer):
         fields = ['email', 'password', 'password2']
 
     def validate_email(self, value):
+        value = normalize_email(value)
         if User.objects.filter(email__iexact=value).exists():
-            raise serializers.ValidationError('A user with this email already exists.')
+            raise serializers.ValidationError('This email is already registered.')
         return value
 
     def validate(self, attrs):
@@ -57,6 +65,7 @@ class EmailLoginSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True)
 
     def validate(self, attrs):
+        attrs['email'] = normalize_email(attrs['email'])
         user = User.objects.filter(email__iexact=attrs['email']).first()
         if user is None or not user.is_active or not user.check_password(attrs['password']):
             raise serializers.ValidationError('No active account found with the given credentials.')
@@ -77,7 +86,7 @@ class EmailLoginSerializer(serializers.Serializer):
 
 class ChangePasswordSerializer(serializers.Serializer):
     old_password = serializers.CharField(write_only=True)
-    new_password = serializers.CharField(write_only=True, validators=[validate_password])
+    new_password = serializers.CharField(write_only=True, validators=[validate_password_strength, validate_password])
     new_password2 = serializers.CharField(write_only=True)
 
     def validate_old_password(self, value):
@@ -95,15 +104,21 @@ class ChangePasswordSerializer(serializers.Serializer):
 class ForgotPasswordSerializer(serializers.Serializer):
     email = serializers.EmailField()
 
+    def validate_email(self, value):
+        return normalize_email(value)
+
 
 class ResendVerificationSerializer(serializers.Serializer):
     email = serializers.EmailField()
+
+    def validate_email(self, value):
+        return normalize_email(value)
 
 
 class ResetPasswordSerializer(serializers.Serializer):
     uid = serializers.CharField()
     token = serializers.CharField()
-    new_password = serializers.CharField(write_only=True, validators=[validate_password])
+    new_password = serializers.CharField(write_only=True, validators=[validate_password_strength, validate_password])
     new_password2 = serializers.CharField(write_only=True)
 
     def validate(self, attrs):
@@ -140,11 +155,19 @@ class ProfileSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(avatar.url) if request else avatar.url
 
     def validate_username(self, value):
+        validate_username_format(value)
         if User.objects.filter(username__iexact=value).exclude(pk=self.instance.pk).exists():
             raise serializers.ValidationError('This username is already taken.')
         return value
 
+    def validate_first_name(self, value):
+        return validate_person_name(value, 'First name') if value else value
+
+    def validate_last_name(self, value):
+        return validate_person_name(value, 'Last name') if value else value
+
     def validate_email(self, value):
+        value = normalize_email(value)
         if User.objects.filter(email__iexact=value).exclude(pk=self.instance.pk).exists():
             raise serializers.ValidationError('This email is already in use.')
         return value

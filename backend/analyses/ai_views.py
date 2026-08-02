@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ai.client import generate_text
+from core.throttling import AIRateThrottle
 
 from .models import Analysis
 
@@ -78,6 +79,8 @@ def _parse_suggestions(text):
 
 
 class SuggestionsView(APIView):
+    throttle_classes = [AIRateThrottle]
+
     def get(self, request, pk):
         analysis, error = _get_owned_completed_analysis(request, pk)
         if error:
@@ -111,6 +114,8 @@ class SuggestionsView(APIView):
 
 
 class ExplanationView(APIView):
+    throttle_classes = [AIRateThrottle]
+
     def get(self, request, pk):
         analysis, error = _get_owned_completed_analysis(request, pk)
         if error:
@@ -135,6 +140,8 @@ class ExplanationView(APIView):
 
 
 class RefactorView(APIView):
+    throttle_classes = [AIRateThrottle]
+
     def get(self, request, pk):
         analysis, error = _get_owned_completed_analysis(request, pk)
         if error:

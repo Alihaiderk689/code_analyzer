@@ -1,25 +1,8 @@
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'
 
-const ACCESS_KEY = 'ca_access'
-const REFRESH_KEY = 'ca_refresh'
-
-export function getAccessToken() {
-  return localStorage.getItem(ACCESS_KEY)
-}
-
-export function getRefreshToken() {
-  return localStorage.getItem(REFRESH_KEY)
-}
-
-export function setTokens({ access, refresh }) {
-  if (access) localStorage.setItem(ACCESS_KEY, access)
-  if (refresh) localStorage.setItem(REFRESH_KEY, refresh)
-}
-
-export function clearTokens() {
-  localStorage.removeItem(ACCESS_KEY)
-  localStorage.removeItem(REFRESH_KEY)
-}
+// Auth is entirely httpOnly cookies now (access_token/refresh_token, set by
+// the backend on login/refresh - see accounts/cookies.py) - frontend JS never
+// sees the raw tokens, so there's nothing to store or attach as a header here.
 
 export class ApiError extends Error {
   constructor(status, data) {
@@ -41,35 +24,19 @@ function extractMessage(data) {
   return null
 }
 
-let refreshPromise = null
+// status 0 signals "the request never got a response at all" (offline, DNS
+// failure, CORS rejection, backend down) - distinct from any real HTTP status
+// the server returned, so callers checking `err.status` can tell them apart.
+const NETWORK_ERROR_DATA = { detail: 'Unable to reach the server. Check your connection and try again.' }
 
-async function refreshAccessToken() {
-  if (refreshPromise) return refreshPromise
-
-  refreshPromise = (async () => {
-    const refresh = getRefreshToken()
-    if (!refresh) throw new ApiError(401, { detail: 'No refresh token.' })
-
-    const res = await fetch(`${API_BASE_URL}/auth/refresh/`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refresh }),
-    })
-
-    if (!res.ok) {
-      clearTokens()
-      throw new ApiError(res.status, await safeJson(res))
-    }
-
-    const data = await res.json()
-    setTokens({ access: data.access, refresh: data.refresh })
-    return data.access
-  })()
-
+// fetch() only rejects for network-level failures, never for HTTP error
+// statuses - wrapping it here means every caller of doFetch()/refreshAccessToken()
+// only ever has to deal with ApiError, not a raw TypeError from the browser.
+async function safeFetch(...args) {
   try {
-    return await refreshPromise
-  } finally {
-    refreshPromise = null
+    return await fetch(...args)
+  } catch {
+    throw new ApiError(0, NETWORK_ERROR_DATA)
   }
 }
 
@@ -81,6 +48,45 @@ async function safeJson(res) {
   }
 }
 
+const CSRF_COOKIE_RE = /(?:^|;\s*)csrftoken=([^;]+)/
+
+// Read fresh from document.cookie rather than caching - primeCsrf() can
+// re-issue it and this is cheap. Only meaningful for cookie-authenticated
+// requests; Django's CSRF check itself only applies to unsafe methods.
+function csrfHeaders() {
+  if (typeof document === 'undefined') return {}
+  const match = document.cookie.match(CSRF_COOKIE_RE)
+  return match ? { 'X-CSRFToken': decodeURIComponent(match[1]) } : {}
+}
+
+// Primes the (JS-readable, non-httpOnly) csrftoken cookie so every mutating
+// request afterward has something to echo back. Call once on app boot -
+// before that, any POST/PUT/PATCH/DELETE would 403 with "CSRF token missing".
+export async function primeCsrf() {
+  await safeFetch(`${API_BASE_URL}/auth/csrf/`, { credentials: 'include' })
+}
+
+let refreshPromise = null
+
+async function refreshAccessToken() {
+  if (refreshPromise) return refreshPromise
+
+  refreshPromise = (async () => {
+    const res = await safeFetch(`${API_BASE_URL}/auth/refresh/`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: csrfHeaders(),
+    })
+    if (!res.ok) throw new ApiError(res.status, await safeJson(res))
+  })()
+
+  try {
+    await refreshPromise
+  } finally {
+    refreshPromise = null
+  }
+}
+
 /**
  * @param {string} path
  * @param {{method?: string, body?: any, isForm?: boolean, auth?: boolean, responseType?: 'json'|'blob'}} opts
@@ -88,25 +94,26 @@ async function safeJson(res) {
 export async function apiFetch(path, opts = {}) {
   const { method = 'GET', body, isForm = false, auth = true, responseType = 'json' } = opts
 
-  const doFetch = async (accessToken) => {
-    const headers = {}
+  const doFetch = () => {
+    const headers = { ...csrfHeaders() }
     if (!isForm) headers['Content-Type'] = 'application/json'
-    if (auth && accessToken) headers['Authorization'] = `Bearer ${accessToken}`
 
-    return fetch(`${API_BASE_URL}${path}`, {
+    return safeFetch(`${API_BASE_URL}${path}`, {
       method,
       headers,
+      credentials: 'include',
       body: body == null ? undefined : isForm ? body : JSON.stringify(body),
     })
   }
 
-  let res = await doFetch(auth ? getAccessToken() : null)
+  let res = await doFetch()
 
-  if (res.status === 401 && auth && getRefreshToken()) {
+  if (res.status === 401 && auth) {
     try {
-      const newAccess = await refreshAccessToken()
-      res = await doFetch(newAccess)
-    } catch {
+      await refreshAccessToken()
+      res = await doFetch()
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 0) throw err
       throw new ApiError(401, { detail: 'Session expired. Please sign in again.' })
     }
   }

@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { ApiError } from './api'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { apiFetch, ApiError } from './api'
 
 // ApiError's message-extraction logic decides what every page in the app
 // shows the user when a request fails, so it's worth pinning down directly.
@@ -23,5 +23,23 @@ describe('ApiError', () => {
   it('ignores non-string field values it cannot render', () => {
     const err = new ApiError(400, { count: 3 })
     expect(err.message).toBe('Request failed (400)')
+  })
+})
+
+// A network-level failure (offline, DNS, CORS, backend down) makes fetch()
+// reject with a raw TypeError rather than resolving with a bad status - every
+// caller in the app expects an ApiError, so apiFetch must convert it.
+describe('apiFetch network failures', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('wraps a rejected fetch() in an ApiError with status 0', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')))
+
+    await expect(apiFetch('/health/', { auth: false })).rejects.toMatchObject({
+      status: 0,
+      message: 'Unable to reach the server. Check your connection and try again.',
+    })
   })
 })

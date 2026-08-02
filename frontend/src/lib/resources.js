@@ -10,8 +10,8 @@ export const registerUser = (email, password, password2) =>
 export const loginUser = (email, password) =>
   apiFetch('/auth/login/', { method: 'POST', auth: false, body: { email, password } })
 
-export const logoutUser = (refresh) =>
-  apiFetch('/auth/logout/', { method: 'POST', body: { refresh } })
+// No refresh token to send - the backend reads it from its own httpOnly cookie.
+export const logoutUser = () => apiFetch('/auth/logout/', { method: 'POST' })
 
 export const requestPasswordReset = (email) =>
   apiFetch('/auth/forgot-password/', { method: 'POST', auth: false, body: { email } })

@@ -132,6 +132,28 @@ button {
   border-radius: 8px;
 }
 
+.field-error {
+  font-size: 12px;
+  color: var(--color-danger);
+  margin-top: -6px;
+}
+
+.pw-checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  margin-top: -4px;
+}
+
+.pw-check-item {
+  color: var(--color-text-muted);
+}
+
+.pw-check-item.met {
+  color: var(--color-success);
+}
+
 /* Logo */
 .logo {
   display: flex;
