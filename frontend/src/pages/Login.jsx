@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../lib/AuthContext'
 import { requestPasswordReset } from '../lib/resources'
 import { ApiError } from '../lib/api'
+import { validateEmail, normalizeEmail } from '../lib/validation'
 
 export default function Login() {
   const { login } = useAuth()
@@ -13,15 +14,24 @@ export default function Login() {
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+  const [fieldErrors, setFieldErrors] = useState({})
   const [forgotSent, setForgotSent] = useState(false)
   const [forgotBusy, setForgotBusy] = useState(false)
 
   const handleSubmit = async (e) => {
     e.preventDefault()
     setError('')
+
+    const errors = {
+      email: validateEmail(email),
+      password: password ? '' : 'Password is required.',
+    }
+    setFieldErrors(errors)
+    if (Object.values(errors).some(Boolean)) return
+
     setSubmitting(true)
     try {
-      const { isAdmin } = await login(email, password)
+      const { isAdmin } = await login(normalizeEmail(email), password)
       navigate(isAdmin ? '/admin' : location.state?.from?.pathname || '/dashboard', { replace: true })
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
@@ -32,13 +42,15 @@ export default function Login() {
 
   const handleForgot = async (e) => {
     e.preventDefault()
-    if (!email) {
+    const emailError = validateEmail(email)
+    if (emailError) {
       setError('Enter your email above first, then click "Forgot password?".')
+      setFieldErrors((prev) => ({ ...prev, email: emailError }))
       return
     }
     setForgotBusy(true)
     try {
-      await requestPasswordReset(email)
+      await requestPasswordReset(normalizeEmail(email))
       setForgotSent(true)
     } catch {
       setForgotSent(true) // backend never reveals whether the email exists; show the same message
@@ -54,23 +66,25 @@ export default function Login() {
         <div style={{ fontSize: 14, color: 'var(--color-text-secondary-2)', marginTop: 6 }}>
           Sign in to view your analyses.
         </div>
-        <form onSubmit={handleSubmit} style={{ marginTop: 24, display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <form onSubmit={handleSubmit} style={{ marginTop: 24, display: 'flex', flexDirection: 'column', gap: 12 }} noValidate>
           <input
             type="email"
-            required
             placeholder="Email address"
             className="field"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
+            onBlur={() => setFieldErrors((prev) => ({ ...prev, email: validateEmail(email) }))}
           />
+          {fieldErrors.email && <div className="field-error">{fieldErrors.email}</div>}
           <input
             type="password"
-            required
             placeholder="Password"
             className="field"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
+            onBlur={() => setFieldErrors((prev) => ({ ...prev, password: password ? '' : 'Password is required.' }))}
           />
+          {fieldErrors.password && <div className="field-error">{fieldErrors.password}</div>}
           <div style={{ textAlign: 'right' }}>
             <button
               type="button"

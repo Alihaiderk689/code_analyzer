@@ -162,9 +162,11 @@ class AnalyzeCodePythonSandboxTests(SimpleTestCase):
         self.assertIn('execution_timeout', types)
 
     @patch('analyses.engine.sandbox.run_python', return_value={'status': 'unavailable'})
-    def test_sandbox_unavailable_degrades_silently(self, _mock_run):
+    def test_sandbox_unavailable_surfaces_zero_penalty_notice(self, _mock_run):
         result = engine.analyze_code('x = 1\n', language='Python')
-        self.assertEqual(result['issues'], [])
+        self.assertEqual([i['type'] for i in result['issues']], ['runtime_check_unavailable'])
+        # Informational only - must not affect the quality score.
+        self.assertEqual(result['quality_score'], 100.0)
 
 
 def make_authenticated_client(email='owner@example.com'):

@@ -3,6 +3,8 @@ import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../lib/AuthContext'
 import { updateProfile, changePassword, deleteAccount, uploadAvatar } from '../lib/resources'
 import { ApiError } from '../lib/api'
+import PasswordChecklist from '../components/PasswordChecklist'
+import { validateName, validatePassword, validateConfirmPassword } from '../lib/validation'
 
 export default function Settings() {
   return (
@@ -92,14 +94,25 @@ function ProfileSection() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [saved, setSaved] = useState(false)
+  const [fieldErrors, setFieldErrors] = useState({})
+
+  const checkName = (value, label) => (value.trim() ? validateName(value, label) : '')
 
   const handleSubmit = async (e) => {
     e.preventDefault()
-    setBusy(true)
     setError('')
     setSaved(false)
+
+    const errors = {
+      firstName: checkName(firstName, 'First name'),
+      lastName: checkName(lastName, 'Last name'),
+    }
+    setFieldErrors(errors)
+    if (Object.values(errors).some(Boolean)) return
+
+    setBusy(true)
     try {
-      const profile = await updateProfile({ first_name: firstName, last_name: lastName })
+      const profile = await updateProfile({ first_name: firstName.trim(), last_name: lastName.trim() })
       setUser((prev) => ({ ...prev, ...profile }))
       setSaved(true)
       setTimeout(() => setSaved(false), 2500)
@@ -112,9 +125,23 @@ function ProfileSection() {
 
   return (
     <Section title="Profile">
-      <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-        <input className="field" placeholder="First name" value={firstName} onChange={(e) => setFirstName(e.target.value)} />
-        <input className="field" placeholder="Last name" value={lastName} onChange={(e) => setLastName(e.target.value)} />
+      <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }} noValidate>
+        <input
+          className="field"
+          placeholder="First name"
+          value={firstName}
+          onChange={(e) => setFirstName(e.target.value)}
+          onBlur={() => setFieldErrors((prev) => ({ ...prev, firstName: checkName(firstName, 'First name') }))}
+        />
+        {fieldErrors.firstName && <div className="field-error">{fieldErrors.firstName}</div>}
+        <input
+          className="field"
+          placeholder="Last name"
+          value={lastName}
+          onChange={(e) => setLastName(e.target.value)}
+          onBlur={() => setFieldErrors((prev) => ({ ...prev, lastName: checkName(lastName, 'Last name') }))}
+        />
+        {fieldErrors.lastName && <div className="field-error">{fieldErrors.lastName}</div>}
         <div style={{ fontSize: 13, color: 'var(--color-text-secondary-2)' }}>{user?.email}</div>
         {saved && <div className="msg-success">Saved.</div>}
         {error && <div className="msg-error">{error}</div>}
@@ -133,15 +160,21 @@ function PasswordSection() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [done, setDone] = useState(false)
+  const [passwordFocused, setPasswordFocused] = useState(false)
+  const [fieldErrors, setFieldErrors] = useState({})
 
   const handleSubmit = async (e) => {
     e.preventDefault()
     setError('')
     setDone(false)
-    if (newPassword !== newPassword2) {
-      setError('New passwords do not match.')
-      return
+
+    const errors = {
+      newPassword: validatePassword(newPassword),
+      newPassword2: validateConfirmPassword(newPassword, newPassword2),
     }
+    setFieldErrors(errors)
+    if (Object.values(errors).some(Boolean)) return
+
     setBusy(true)
     try {
       await changePassword(oldPassword, newPassword, newPassword2)
@@ -159,7 +192,7 @@ function PasswordSection() {
 
   return (
     <Section title="Change password">
-      <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 12 }} noValidate>
         <input
           type="password"
           className="field"
@@ -174,16 +207,24 @@ function PasswordSection() {
           placeholder="New password"
           value={newPassword}
           onChange={(e) => setNewPassword(e.target.value)}
+          onFocus={() => setPasswordFocused(true)}
+          onBlur={() => setFieldErrors((prev) => ({ ...prev, newPassword: validatePassword(newPassword) }))}
           required
         />
+        {passwordFocused && <PasswordChecklist password={newPassword} />}
+        {fieldErrors.newPassword && <div className="field-error">{fieldErrors.newPassword}</div>}
         <input
           type="password"
           className="field"
           placeholder="Confirm new password"
           value={newPassword2}
           onChange={(e) => setNewPassword2(e.target.value)}
+          onBlur={() =>
+            setFieldErrors((prev) => ({ ...prev, newPassword2: validateConfirmPassword(newPassword, newPassword2) }))
+          }
           required
         />
+        {fieldErrors.newPassword2 && <div className="field-error">{fieldErrors.newPassword2}</div>}
         {done && <div className="msg-success">Password changed.</div>}
         {error && <div className="msg-error">{error}</div>}
         <button className="btn btn-dark" style={{ width: 'fit-content', padding: '10px 20px', fontSize: 13 }} disabled={busy}>

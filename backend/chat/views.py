@@ -6,6 +6,7 @@ from rest_framework.views import APIView
 from ai.client import generate_chat_reply
 from ai.prompts import BASE_CHAT_INSTRUCTION, build_analysis_context
 from analyses.models import Analysis
+from core.throttling import AIRateThrottle
 
 from .models import ChatMessage, Conversation
 from .rate_limit import get_rate_limit_status
@@ -36,6 +37,8 @@ class RateLimitStatusView(APIView):
 
 
 class SendMessageView(APIView):
+    throttle_classes = [AIRateThrottle]
+
     def post(self, request):
         serializer = SendMessageSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)

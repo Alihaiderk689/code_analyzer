@@ -1,12 +1,18 @@
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.core import mail
+from django.core.cache import cache
 from django.urls import reverse
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
+from core.throttling import LoginRateThrottle
+
+from .cookies import ACCESS_COOKIE, REFRESH_COOKIE
 from .tokens import email_verification_token
 
 User = get_user_model()
@@ -57,15 +63,24 @@ class RegisterTests(APITestCase):
 class LoginTests(APITestCase):
     url = reverse('auth-login')
 
-    def test_login_success_returns_tokens_and_user(self):
+    def test_login_success_sets_httponly_cookies_and_returns_user(self):
         make_user(email='login@example.com', password='TestPass123!', verified=True)
         response = self.client.post(self.url, {'email': 'login@example.com', 'password': 'TestPass123!'})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertIn('access', response.data)
-        self.assertIn('refresh', response.data)
+        # Tokens must never appear in the JSON body - only in httpOnly cookies,
+        # otherwise JS could just read them there regardless of httponly.
+        self.assertNotIn('access', response.data)
+        self.assertNotIn('refresh', response.data)
         self.assertEqual(response.data['user']['email'], 'login@example.com')
         self.assertTrue(response.data['user']['is_verified'])
+
+        access_cookie = response.cookies[ACCESS_COOKIE]
+        self.assertTrue(access_cookie.value)
+        self.assertTrue(access_cookie['httponly'])
+        refresh_cookie = response.cookies[REFRESH_COOKIE]
+        self.assertTrue(refresh_cookie.value)
+        self.assertTrue(refresh_cookie['httponly'])
 
     def test_login_wrong_password_rejected(self):
         make_user(email='login2@example.com', password='TestPass123!')
@@ -87,27 +102,149 @@ class LoginTests(APITestCase):
 class LogoutTests(APITestCase):
     def _login(self):
         make_user(email='logout@example.com', password='TestPass123!')
-        resp = self.client.post(reverse('auth-login'), {'email': 'logout@example.com', 'password': 'TestPass123!'})
-        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {resp.data["access"]}')
-        return resp.data['refresh']
+        self.client.post(reverse('auth-login'), {'email': 'logout@example.com', 'password': 'TestPass123!'})
 
-    def test_logout_blacklists_refresh_token(self):
-        refresh = self._login()
-        response = self.client.post(reverse('auth-logout'), {'refresh': refresh})
+    def test_logout_blacklists_refresh_token_and_clears_cookies(self):
+        self._login()
+        refresh_value = self.client.cookies[REFRESH_COOKIE].value
+
+        response = self.client.post(reverse('auth-logout'))
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.cookies[ACCESS_COOKIE].value, '')
+        self.assertEqual(response.cookies[REFRESH_COOKIE].value, '')
 
-        refresh_response = self.client.post(reverse('auth-refresh'), {'refresh': refresh})
+        # Logout just cleared this client's own cookie jar, so replay the
+        # captured pre-logout value directly - proves the token itself was
+        # blacklisted server-side, not just that the cookie is gone locally.
+        self.client.cookies[REFRESH_COOKIE] = refresh_value
+        refresh_response = self.client.post(reverse('auth-refresh'))
         self.assertEqual(refresh_response.status_code, status.HTTP_401_UNAUTHORIZED)
 
-    def test_logout_without_refresh_token_400(self):
+    def test_logout_without_refresh_cookie_still_succeeds(self):
+        # Logout still requires a valid access token (IsAuthenticated, same as
+        # before) - but with one, a *missing* refresh cookie (e.g. it already
+        # expired, or a client that never had one) is a no-op, not an error.
         self._login()
-        response = self.client.post(reverse('auth-logout'), {})
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        del self.client.cookies[REFRESH_COOKIE]
+        response = self.client.post(reverse('auth-logout'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
 
-    def test_logout_invalid_token_400(self):
+    def test_logout_with_garbage_refresh_cookie_still_succeeds(self):
         self._login()
-        response = self.client.post(reverse('auth-logout'), {'refresh': 'not-a-real-token'})
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.client.cookies[REFRESH_COOKIE] = 'not-a-real-token'
+        response = self.client.post(reverse('auth-logout'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class CookieAuthCSRFTests(APITestCase):
+    """APITestCase's default client doesn't enforce CSRF (enforce_csrf_checks=
+    False), which is why none of the other tests above need to think about it.
+    These use a client that does, to prove CookieJWTAuthentication's CSRF
+    double-submit check is actually wired up and not just present in name."""
+
+    def _login(self, client, email='csrf@example.com'):
+        make_user(email=email, password='TestPass123!')
+        response = client.post(reverse('auth-login'), {'email': email, 'password': 'TestPass123!'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_unsafe_request_without_csrf_token_rejected(self):
+        client = APIClient(enforce_csrf_checks=True)
+        self._login(client)
+
+        response = client.post(reverse('auth-change-password'), {
+            'old_password': 'TestPass123!', 'new_password': 'NewPass456!', 'new_password2': 'NewPass456!',
+        })
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_unsafe_request_with_valid_csrf_token_succeeds(self):
+        client = APIClient(enforce_csrf_checks=True)
+        self._login(client, email='csrf2@example.com')
+
+        csrf_response = client.get(reverse('auth-csrf'))
+        self.assertEqual(csrf_response.status_code, status.HTTP_204_NO_CONTENT)
+        csrf_token = client.cookies['csrftoken'].value
+
+        response = client.post(
+            reverse('auth-change-password'),
+            {'old_password': 'TestPass123!', 'new_password': 'NewPass456!', 'new_password2': 'NewPass456!'},
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_bearer_header_auth_does_not_require_csrf(self):
+        """A non-cookie client (script, mobile app) using the Authorization
+        header directly is unaffected by CSRF enforcement - only browser
+        cookie auth needs it, since only cookies are attached automatically
+        by something other than the client's own code."""
+        make_user(email='bearer@example.com', password='TestPass123!')
+        self.client.post(reverse('auth-login'), {'email': 'bearer@example.com', 'password': 'TestPass123!'})
+        access_token = self.client.cookies[ACCESS_COOKIE].value
+
+        client = APIClient(enforce_csrf_checks=True)
+        client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token}')
+        response = client.post(reverse('auth-change-password'), {
+            'old_password': 'TestPass123!', 'new_password': 'NewPass456!', 'new_password2': 'NewPass456!',
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class RefreshViewTests(APITestCase):
+    def _login(self):
+        make_user(email='refresh@example.com', password='TestPass123!')
+        self.client.post(reverse('auth-login'), {'email': 'refresh@example.com', 'password': 'TestPass123!'})
+
+    def test_refresh_rotates_cookies(self):
+        self._login()
+        old_access = self.client.cookies[ACCESS_COOKIE].value
+        old_refresh = self.client.cookies[REFRESH_COOKIE].value
+
+        response = self.client.post(reverse('auth-refresh'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Never leaks the token into the body - cookies only, same as login.
+        self.assertNotIn('access', response.data)
+        self.assertNotIn('refresh', response.data)
+
+        new_access = response.cookies[ACCESS_COOKIE].value
+        new_refresh = response.cookies[REFRESH_COOKIE].value
+        self.assertTrue(new_access)
+        self.assertTrue(new_refresh)
+        self.assertNotEqual(new_access, old_access)
+        self.assertNotEqual(new_refresh, old_refresh)  # ROTATE_REFRESH_TOKENS=True
+
+        # The rotated-out refresh token is now blacklisted (BLACKLIST_AFTER_ROTATION=True).
+        self.client.cookies[REFRESH_COOKIE] = old_refresh
+        reuse_response = self.client.post(reverse('auth-refresh'))
+        self.assertEqual(reuse_response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_refresh_without_cookie_401(self):
+        response = self.client.post(reverse('auth-refresh'))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_refresh_with_garbage_cookie_401_and_clears_cookies(self):
+        self.client.cookies[REFRESH_COOKIE] = 'not-a-real-token'
+        response = self.client.post(reverse('auth-refresh'))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(response.cookies[ACCESS_COOKIE].value, '')
+        self.assertEqual(response.cookies[REFRESH_COOKIE].value, '')
+
+    def test_refresh_ignores_body_and_only_trusts_cookie(self):
+        """The whole point of moving to cookies is that the frontend never
+        handles the raw token - a refresh token in the body must be ignored,
+        not treated as a trusted alternative source."""
+        self._login()
+        response = self.client.post(reverse('auth-refresh'), {'refresh': 'not-a-real-token'})
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class CsrfCookieViewTests(APITestCase):
+    def test_sets_readable_csrf_cookie(self):
+        response = self.client.get(reverse('auth-csrf'))
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        csrf_cookie = response.cookies['csrftoken']
+        self.assertTrue(csrf_cookie.value)
+        # Must be JS-readable (not httponly) - the frontend reads it via
+        # document.cookie to echo it back as X-CSRFToken.
+        self.assertFalse(csrf_cookie['httponly'])
 
 
 class ForgotPasswordTests(APITestCase):
@@ -296,3 +433,33 @@ class ProfileViewTests(APITestCase):
         self.client.force_authenticate(user=user)
         response = self.client.patch(self.url, {'email': 'taken@example.com'})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+class ThrottlingTests(APITestCase):
+    """Real throttle rates are widened to effectively-unlimited while testing
+    (see settings.py) so the rest of the suite doesn't trip over shared IP-based
+    throttle buckets - this test patches the 'login' rate directly on the throttle
+    class to prove the LoginRateThrottle wiring actually works. (override_settings
+    on DEFAULT_THROTTLE_RATES doesn't work here: SimpleRateThrottle.THROTTLE_RATES
+    is bound to api_settings.DEFAULT_THROTTLE_RATES once at import time, not
+    re-read per request.)"""
+
+    def setUp(self):
+        cache.clear()
+
+    def tearDown(self):
+        cache.clear()
+
+    @patch.object(LoginRateThrottle, 'THROTTLE_RATES', {'login': '2/min'})
+    def test_login_throttled_after_too_many_attempts(self):
+        url = reverse('auth-login')
+        payload = {'email': 'nobody@example.com', 'password': 'wrong'}
+
+        first = self.client.post(url, payload)
+        second = self.client.post(url, payload)
+        third = self.client.post(url, payload)
+
+        self.assertEqual(first.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(third.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        self.assertIn('detail', third.data)

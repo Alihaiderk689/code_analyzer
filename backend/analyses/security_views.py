@@ -5,6 +5,8 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from core.throttling import AnalysisCreateRateThrottle
+
 from .models import Analysis
 from .serializers import SecurityReportSerializer
 from .services.security_service import SecurityAnalysisService
@@ -22,6 +24,8 @@ class SecurityAnalysisView(APIView):
     POST /api/analysis/<id>/security/  - runs the scan (or re-runs it with
                                           ?regenerate=true) and caches the result.
     """
+
+    throttle_classes = [AnalysisCreateRateThrottle]
 
     def _get_owned_completed_analysis(self, request, pk):
         analysis = get_object_or_404(Analysis, pk=pk, owner=request.user)

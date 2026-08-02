@@ -1,6 +1,6 @@
 import { Route, Routes } from 'react-router-dom'
 import MarketingLayout from './components/MarketingLayout'
-import ProtectedRoute, { AdminRoute, UserRoute } from './components/ProtectedRoute'
+import ProtectedRoute, { AdminRoute, UserRoute, GuestRoute } from './components/ProtectedRoute'
 import ConnectivityBanner from './components/ConnectivityBanner'
 import Landing from './pages/Landing'
 import Login from './pages/Login'
@@ -26,8 +26,10 @@ function App() {
       <Routes>
         <Route element={<MarketingLayout />}>
           <Route path="/" element={<Landing />} />
-          <Route path="/login" element={<Login />} />
-          <Route path="/register" element={<Register />} />
+          <Route element={<GuestRoute />}>
+            <Route path="/login" element={<Login />} />
+            <Route path="/register" element={<Register />} />
+          </Route>
         </Route>
 
         <Route path="/verify-email" element={<VerifyEmail />} />
