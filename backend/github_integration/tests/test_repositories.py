@@ -5,7 +5,7 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient
 
-from ..models import GitHubRepository
+from ..models import GitHubRepository, RepositoryContextCheck, RepositoryIndex
 from ..services.github_client import GitHubAPIError, GitHubAuthError, GitHubRateLimitError
 from ..services.repository_service import RepositoryService
 from .factories import TEST_ENCRYPTION_KEY, make_authenticated_client, make_integration, make_repository, make_user
@@ -18,8 +18,9 @@ _SETTINGS = dict(
 
 @override_settings(**_SETTINGS)
 class RepositoryServiceTests(TestCase):
+    @patch('github_integration.services.repository_service.build_repository_index')
     @patch('github_integration.services.repository_service.GitHubClient')
-    def test_select_repository_creates_webhook_and_stores_id(self, mock_client_cls):
+    def test_select_repository_creates_webhook_and_stores_id(self, mock_client_cls, mock_build_index):
         integration = make_integration(make_user())
         mock_client_cls.return_value.create_webhook.return_value = {'id': 12345}
 
@@ -29,6 +30,7 @@ class RepositoryServiceTests(TestCase):
         mock_client_cls.return_value.create_webhook.assert_called_once_with(
             'octocat', 'hello-world', 'http://localhost:8000/api/webhooks/github/', 'wh-secret',
         )
+        mock_build_index.delay.assert_called_once_with(repository.id)
 
     @patch('github_integration.services.repository_service.GitHubClient')
     def test_selecting_already_monitored_repository_is_a_noop(self, mock_client_cls):
@@ -39,8 +41,9 @@ class RepositoryServiceTests(TestCase):
 
         mock_client_cls.return_value.create_webhook.assert_not_called()
 
+    @patch('github_integration.services.repository_service.build_repository_index')
     @patch('github_integration.services.repository_service.GitHubClient')
-    def test_reselecting_an_inactive_repository_creates_a_new_webhook(self, mock_client_cls):
+    def test_reselecting_an_inactive_repository_creates_a_new_webhook(self, mock_client_cls, _mock_build_index):
         integration = make_integration(make_user())
         make_repository(integration, repository_id=99, webhook_id=None, is_active=False)
         mock_client_cls.return_value.create_webhook.return_value = {'id': 777}
@@ -213,3 +216,315 @@ class RepositoryDeselectViewTests(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         mock_service_cls.return_value.deselect_repository.assert_called_once()
+
+
+@override_settings(**_SETTINGS)
+class RepositoryTreeViewTests(TestCase):
+    def test_requires_authentication(self):
+        response = APIClient().get(reverse('github-repository-tree', args=[1]))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_404_for_another_users_repository(self):
+        client, user = make_authenticated_client()
+        make_integration(user)
+        other_integration = make_integration(make_user('other@example.com'), github_user_id=2)
+        repository = make_repository(other_integration)
+
+        response = client.get(reverse('github-repository-tree', args=[repository.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    @patch('github_integration.repository_views.GitHubClient')
+    def test_returns_entries_and_truncated_flag(self, mock_client_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_client_cls.return_value.get_repository_tree.return_value = {
+            'entries': [{'path': 'app.py', 'type': 'file', 'size': 10}],
+            'truncated': True,
+        }
+
+        response = client.get(reverse('github-repository-tree', args=[repository.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['results'], [{'path': 'app.py', 'type': 'file', 'size': 10}])
+        self.assertTrue(response.data['truncated'])
+
+    @patch('github_integration.repository_views.GitHubClient')
+    def test_github_api_error_handled(self, mock_client_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_client_cls.return_value.get_repository_tree.side_effect = GitHubAPIError('down', 500)
+
+        response = client.get(reverse('github-repository-tree', args=[repository.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+@override_settings(**_SETTINGS)
+class RepositoryFileContentViewTests(TestCase):
+    def test_requires_authentication(self):
+        response = APIClient().get(reverse('github-repository-file', args=[1]), {'path': 'app.py'})
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_404_for_another_users_repository(self):
+        client, user = make_authenticated_client()
+        make_integration(user)
+        other_integration = make_integration(make_user('other@example.com'), github_user_id=2)
+        repository = make_repository(other_integration)
+
+        response = client.get(reverse('github-repository-file', args=[repository.pk]), {'path': 'app.py'})
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_requires_path(self):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+
+        response = client.get(reverse('github-repository-file', args=[repository.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_skips_unsupported_file_without_calling_github(self):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+
+        response = client.get(reverse('github-repository-file', args=[repository.pk]), {'path': 'yarn.lock'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['skipped'])
+        self.assertEqual(response.data['skip_reason'], 'lock_file')
+        self.assertIsNone(response.data['content'])
+
+    @patch('github_integration.repository_views.GitHubClient')
+    def test_returns_raw_content_without_analyzing(self, mock_client_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration, full_name='octocat/hello-world')
+        mock_client_cls.return_value.get_file_content.return_value = 'print("hi")\n'
+
+        response = client.get(reverse('github-repository-file', args=[repository.pk]), {'path': 'app.py'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data['skipped'])
+        self.assertEqual(response.data['content'], 'print("hi")\n')
+        self.assertEqual(response.data['language'], 'Python')
+        mock_client_cls.return_value.get_file_content.assert_called_once_with(
+            'octocat', 'hello-world', 'app.py', repository.default_branch,
+        )
+
+    @override_settings(GITHUB_MAX_FILE_SIZE_BYTES=5)
+    @patch('github_integration.repository_views.GitHubClient')
+    def test_flags_oversized_file_as_skipped(self, mock_client_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_client_cls.return_value.get_file_content.return_value = 'this is way more than five bytes'
+
+        response = client.get(reverse('github-repository-file', args=[repository.pk]), {'path': 'app.py'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['skipped'])
+        self.assertEqual(response.data['skip_reason'], 'too_large')
+
+    @patch('github_integration.repository_views.GitHubClient')
+    def test_github_api_error_handled(self, mock_client_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_client_cls.return_value.get_file_content.side_effect = GitHubAPIError('down', 500)
+
+        response = client.get(reverse('github-repository-file', args=[repository.pk]), {'path': 'app.py'})
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+@override_settings(**_SETTINGS)
+class RepositoryIndexStatusViewTests(TestCase):
+    def test_requires_authentication(self):
+        response = APIClient().get(reverse('github-repository-index', args=[1]))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_not_started_when_no_index_exists_yet(self):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+
+        response = client.get(reverse('github-repository-index', args=[repository.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['status'], 'not_started')
+
+    def test_returns_existing_index_status(self):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        RepositoryIndex.objects.create(
+            repository=repository, status=RepositoryIndex.Status.COMPLETED,
+            files_total=10, files_indexed=8, truncated=False,
+        )
+
+        response = client.get(reverse('github-repository-index', args=[repository.pk]))
+
+        self.assertEqual(response.data['status'], RepositoryIndex.Status.COMPLETED)
+        self.assertEqual(response.data['files_total'], 10)
+        self.assertEqual(response.data['files_indexed'], 8)
+
+    def test_404_for_another_users_repository(self):
+        client, user = make_authenticated_client()
+        make_integration(user)
+        other_integration = make_integration(make_user('other@example.com'), github_user_id=2)
+        repository = make_repository(other_integration)
+
+        response = client.get(reverse('github-repository-index', args=[repository.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+@override_settings(**_SETTINGS)
+class RepositoryReindexViewTests(TestCase):
+    def test_requires_authentication(self):
+        response = APIClient().post(reverse('github-repository-reindex', args=[1]))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    @patch('github_integration.repository_views.build_repository_index')
+    def test_queues_index_build_and_returns_202(self, mock_task):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+
+        response = client.post(reverse('github-repository-reindex', args=[repository.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        mock_task.delay.assert_called_once_with(repository.id)
+
+    @patch('github_integration.repository_views.build_repository_index')
+    def test_404_for_another_users_repository(self, _mock_task):
+        client, user = make_authenticated_client()
+        make_integration(user)
+        other_integration = make_integration(make_user('other@example.com'), github_user_id=2)
+        repository = make_repository(other_integration)
+
+        response = client.post(reverse('github-repository-reindex', args=[repository.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+_CONTEXT_RESULT = {
+    'path': 'app.py', 'language': 'Python', 'skipped': False, 'skip_reason': None,
+    'content': 'print(1)\n', 'issues': [], 'score': 100.0, 'repo_context': '',
+    'related': [{'path': 'utils.py', 'language': 'Python', 'relation': 'imports', 'issues': [], 'score': 100.0}],
+}
+
+
+@override_settings(**_SETTINGS)
+class ContextCheckQuotaViewTests(TestCase):
+    def test_requires_authentication(self):
+        response = APIClient().get(reverse('github-context-check-quota'))
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_defaults_to_full_quota_with_no_checks_yet(self):
+        client, _user = make_authenticated_client()
+
+        response = client.get(reverse('github-context-check-quota'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['remaining'], 1)
+        self.assertIsNone(response.data['today_check'])
+
+
+@override_settings(**_SETTINGS)
+class RepositoryFileContextAnalyzeViewTests(TestCase):
+    def test_requires_authentication(self):
+        response = APIClient().post(reverse('github-repository-analyze-file-context', args=[1]), {'path': 'app.py'})
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_404_for_another_users_repository(self):
+        client, user = make_authenticated_client()
+        make_integration(user)
+        other_integration = make_integration(make_user('other@example.com'), github_user_id=2)
+        repository = make_repository(other_integration)
+
+        response = client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'app.py'})
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_requires_path(self):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+
+        response = client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_skip_eligible_file_is_free_and_not_persisted(self):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+
+        response = client.post(
+            reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'yarn.lock'},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['skipped'])
+        self.assertEqual(RepositoryContextCheck.objects.count(), 0)
+
+    @patch('github_integration.repository_views.PRAnalysisService')
+    def test_creates_context_check_with_related_files_and_backing_analysis(self, mock_service_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_service_cls.return_value.analyze_file_with_context.return_value = _CONTEXT_RESULT
+
+        response = client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'app.py'})
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(len(response.data['related']), 1)
+        self.assertEqual(response.data['related'][0]['path'], 'utils.py')
+        self.assertIsNotNone(response.data['analysis_id'])
+        check = RepositoryContextCheck.objects.get()
+        self.assertEqual(check.path, 'app.py')
+        self.assertEqual(len(check.related), 1)
+        self.assertIsNotNone(check.analysis_id)
+
+    @patch('github_integration.repository_views.PRAnalysisService')
+    def test_different_file_same_day_returns_429(self, mock_service_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_service_cls.return_value.analyze_file_with_context.return_value = _CONTEXT_RESULT
+
+        client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'app.py'})
+        response = client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'other.py'})
+
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    @patch('github_integration.repository_views.PRAnalysisService')
+    def test_reanalyzing_same_file_same_day_is_free(self, mock_service_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_service_cls.return_value.analyze_file_with_context.return_value = _CONTEXT_RESULT
+
+        client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'app.py'})
+        response = client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'app.py'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['cached'])
+        mock_service_cls.return_value.analyze_file_with_context.assert_called_once()
+
+    @patch('github_integration.repository_views.PRAnalysisService')
+    def test_github_api_error_handled(self, mock_service_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_service_cls.return_value.analyze_file_with_context.side_effect = GitHubAPIError('down', 500)
+
+        response = client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'app.py'})
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)

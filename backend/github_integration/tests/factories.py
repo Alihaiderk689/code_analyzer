@@ -65,8 +65,19 @@ def pull_request_webhook_payload(
     }
 
 
+def push_webhook_payload(
+    ref='refs/heads/main', deleted=False, repository_id=2001,
+    repository_full_name='octocat/hello-world', default_branch='main',
+):
+    return {
+        'ref': ref,
+        'deleted': deleted,
+        'repository': {'id': repository_id, 'full_name': repository_full_name, 'default_branch': default_branch},
+    }
+
+
 def make_webhook_event(delivery_id='d1', event_type='pull_request', payload=None, **payload_overrides):
-    return WebhookEvent.objects.create(
-        event_type=event_type, delivery_id=delivery_id,
-        payload=payload or pull_request_webhook_payload(**payload_overrides),
-    )
+    if payload is None:
+        payload = push_webhook_payload(**payload_overrides) if event_type == 'push' \
+            else pull_request_webhook_payload(**payload_overrides)
+    return WebhookEvent.objects.create(event_type=event_type, delivery_id=delivery_id, payload=payload)

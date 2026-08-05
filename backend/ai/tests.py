@@ -1,10 +1,12 @@
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.test import SimpleTestCase
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from ai.client import generate_text
 from analyses.models import Analysis
 
 User = get_user_model()
@@ -74,3 +76,42 @@ class ChatViewTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         system_instruction = mock_generate.call_args.args[2]
         self.assertIn('a.py', system_instruction)
+
+
+class AIProviderFallbackTests(SimpleTestCase):
+    """ai.client tries Groq, then Gemini, then OpenRouter, in order - moving
+    on to the next provider on any failure, not just a rate limit."""
+
+    @patch('ai.client._call_openrouter')
+    @patch('ai.client._call_gemini')
+    @patch('ai.client._call_groq', return_value='groq reply')
+    def test_uses_groq_when_it_succeeds(self, mock_groq, mock_gemini, mock_openrouter):
+        self.assertEqual(generate_text('hi'), 'groq reply')
+        mock_groq.assert_called_once()
+        mock_gemini.assert_not_called()
+        mock_openrouter.assert_not_called()
+
+    @patch('ai.client._call_openrouter')
+    @patch('ai.client._call_gemini', return_value='gemini reply')
+    @patch('ai.client._call_groq', side_effect=RuntimeError('groq rate limit reached'))
+    def test_falls_back_to_gemini_when_groq_fails(self, mock_groq, mock_gemini, mock_openrouter):
+        self.assertEqual(generate_text('hi'), 'gemini reply')
+        mock_groq.assert_called_once()
+        mock_gemini.assert_called_once()
+        mock_openrouter.assert_not_called()
+
+    @patch('ai.client._call_openrouter', return_value='openrouter reply')
+    @patch('ai.client._call_gemini', side_effect=RuntimeError('gemini rate limit reached'))
+    @patch('ai.client._call_groq', side_effect=RuntimeError('groq rate limit reached'))
+    def test_falls_back_to_openrouter_when_groq_and_gemini_fail(self, mock_groq, mock_gemini, mock_openrouter):
+        self.assertEqual(generate_text('hi'), 'openrouter reply')
+        mock_groq.assert_called_once()
+        mock_gemini.assert_called_once()
+        mock_openrouter.assert_called_once()
+
+    @patch('ai.client._call_openrouter', side_effect=RuntimeError('openrouter down'))
+    @patch('ai.client._call_gemini', side_effect=RuntimeError('gemini down'))
+    @patch('ai.client._call_groq', side_effect=RuntimeError('groq down'))
+    def test_raises_when_all_providers_fail(self, mock_groq, mock_gemini, mock_openrouter):
+        with self.assertRaisesMessage(RuntimeError, 'openrouter down'):
+            generate_text('hi')

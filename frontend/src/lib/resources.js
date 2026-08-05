@@ -147,10 +147,38 @@ export const getGitHubQualityTrends = ({ repositoryId, days } = {}) => {
 // per page load); analyzing a file costs the daily quota below.
 export const getGitHubRepositoryTree = (pk) => apiFetch(`/github/repositories/${pk}/tree/`)
 
+// Fetching a single file's raw source is also free - lets the file browser
+// show code the moment it's clicked, before the user opts into spending
+// today's quota on the "Analyze" button (analyzeGitHubFile, below).
+export const getGitHubFileContent = (pk, path) =>
+  apiFetch(`/github/repositories/${pk}/file/?path=${encodeURIComponent(path)}`)
+
+// Status of the dependency-graph build that runs automatically after a repo
+// is selected (see backend RepositoryIndexStatusView) - lets the file browser
+// show "Understanding repository..." while it's running.
+export const getGitHubRepositoryIndexStatus = (pk) => apiFetch(`/github/repositories/${pk}/index/`)
+// There's no push webhook to keep the graph fresh automatically, so this is
+// the way to refresh it after pushing new commits.
+export const rebuildGitHubRepositoryIndex = (pk) => apiFetch(`/github/repositories/${pk}/reindex/`, { method: 'POST' })
+
 export const getFileCheckQuota = () => apiFetch(`/github/file-checks/quota/?tz_offset_minutes=${getTzOffsetMinutes()}`)
 
 export const analyzeGitHubFile = (pk, path) =>
   apiFetch(`/github/repositories/${pk}/analyze-file/`, {
+    method: 'POST',
+    body: { path, tz_offset_minutes: getTzOffsetMinutes() },
+  })
+
+// "Analyze with repo context" - like analyzeGitHubFile above, but also
+// analyzes the file's direct dependency-graph neighbors (what it imports,
+// what imports it), so the result shows a change's impact across files
+// instead of just the one file in isolation. Costs more (several GitHub
+// fetches, possibly several Groq calls), so it's tracked under its own
+// separate daily quota - see getContextCheckQuota.
+export const getContextCheckQuota = () => apiFetch(`/github/context-checks/quota/?tz_offset_minutes=${getTzOffsetMinutes()}`)
+
+export const analyzeGitHubFileWithContext = (pk, path) =>
+  apiFetch(`/github/repositories/${pk}/analyze-file-context/`, {
     method: 'POST',
     body: { path, tz_offset_minutes: getTzOffsetMinutes() },
   })

@@ -10,7 +10,10 @@ from rest_framework.test import APIClient
 
 from ..models import WebhookEvent
 from ..services.webhook_service import WebhookService, WebhookVerificationError
-from .factories import make_integration, make_repository, make_user, pull_request_webhook_payload as _pr_payload
+from .factories import (
+    make_integration, make_repository, make_user,
+    pull_request_webhook_payload as _pr_payload, push_webhook_payload as _push_payload,
+)
 
 WEBHOOK_SECRET = 'test-webhook-secret'
 
@@ -116,6 +119,63 @@ class WebhookServiceTests(TestCase):
         )
         self.assertFalse(should_process)
 
+    def test_push_to_default_branch_of_monitored_repository_should_process(self):
+        integration = make_integration(make_user())
+        make_repository(integration, repository_id=2001, is_active=True)
+        body, signature = _signed_body(_push_payload(ref='refs/heads/main', repository_id=2001, default_branch='main'))
+
+        _event, should_process = WebhookService().receive(
+            payload_body=body, signature_header=signature, event_type='push',
+            delivery_id='d1', secret=WEBHOOK_SECRET,
+        )
+        self.assertTrue(should_process)
+
+    def test_push_to_non_default_branch_should_not_process(self):
+        integration = make_integration(make_user())
+        make_repository(integration, repository_id=2001, is_active=True)
+        body, signature = _signed_body(
+            _push_payload(ref='refs/heads/feature-x', repository_id=2001, default_branch='main'),
+        )
+
+        _event, should_process = WebhookService().receive(
+            payload_body=body, signature_header=signature, event_type='push',
+            delivery_id='d1', secret=WEBHOOK_SECRET,
+        )
+        self.assertFalse(should_process)
+
+    def test_branch_deletion_push_should_not_process(self):
+        integration = make_integration(make_user())
+        make_repository(integration, repository_id=2001, is_active=True)
+        body, signature = _signed_body(
+            _push_payload(ref='refs/heads/main', deleted=True, repository_id=2001, default_branch='main'),
+        )
+
+        _event, should_process = WebhookService().receive(
+            payload_body=body, signature_header=signature, event_type='push',
+            delivery_id='d1', secret=WEBHOOK_SECRET,
+        )
+        self.assertFalse(should_process)
+
+    def test_push_for_unmonitored_repository_should_not_process(self):
+        body, signature = _signed_body(_push_payload(repository_id=999999))
+
+        _event, should_process = WebhookService().receive(
+            payload_body=body, signature_header=signature, event_type='push',
+            delivery_id='d1', secret=WEBHOOK_SECRET,
+        )
+        self.assertFalse(should_process)
+
+    def test_push_for_inactive_repository_should_not_process(self):
+        integration = make_integration(make_user())
+        make_repository(integration, repository_id=2001, is_active=False)
+        body, signature = _signed_body(_push_payload(ref='refs/heads/main', repository_id=2001, default_branch='main'))
+
+        _event, should_process = WebhookService().receive(
+            payload_body=body, signature_header=signature, event_type='push',
+            delivery_id='d1', secret=WEBHOOK_SECRET,
+        )
+        self.assertFalse(should_process)
+
 
 @override_settings(GITHUB_WEBHOOK_SECRET=WEBHOOK_SECRET)
 class GitHubWebhookViewTests(TestCase):
@@ -164,3 +224,29 @@ class GitHubWebhookViewTests(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
         mock_task.delay.assert_called_once()
+
+    @patch('github_integration.webhook_views.process_push_webhook')
+    def test_push_to_default_branch_queues_push_task_not_pr_task(self, mock_push_task):
+        integration = make_integration(make_user())
+        make_repository(integration, repository_id=2001, is_active=True)
+
+        response = self._post(
+            _push_payload(ref='refs/heads/main', repository_id=2001, default_branch='main'), event_type='push',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        mock_push_task.delay.assert_called_once()
+        event_id_arg = mock_push_task.delay.call_args.args[0]
+        self.assertEqual(WebhookEvent.objects.get(pk=event_id_arg).event_type, 'push')
+
+    @patch('github_integration.webhook_views.process_push_webhook')
+    def test_push_to_non_default_branch_does_not_queue_task(self, mock_push_task):
+        integration = make_integration(make_user())
+        make_repository(integration, repository_id=2001, is_active=True)
+
+        response = self._post(
+            _push_payload(ref='refs/heads/feature-x', repository_id=2001, default_branch='main'), event_type='push',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        mock_push_task.delay.assert_not_called()

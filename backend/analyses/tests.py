@@ -599,3 +599,28 @@ class SuggestionsViewTests(APITestCase):
     def test_ai_failure_returns_503(self, _mock_generate):
         response = self.client.get(reverse('analysis-suggestions', args=[self.analysis.id]))
         self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    @patch('analyses.ai_views.generate_text', return_value='[]')
+    def test_repo_context_included_in_prompt_when_present(self, mock_generate):
+        # Only set for analyses backed by a monitored GitHub repository file
+        # (see github_integration.repository_views._create_analysis_for_file_check) -
+        # here simulated directly, since that's the thing under test.
+        self.analysis.repo_context = (
+            'Repository context - other files related to this one:\n\n'
+            'Files this file imports:\n--- utils.py ---\ndef helper(): ...'
+        )
+        self.analysis.save(update_fields=['repo_context'])
+
+        self.client.get(reverse('analysis-suggestions', args=[self.analysis.id]))
+
+        prompt = mock_generate.call_args.args[0]
+        self.assertIn('Repository context', prompt)
+        self.assertIn('utils.py', prompt)
+
+    @patch('analyses.ai_views.generate_text', return_value='[]')
+    def test_repo_context_absent_from_prompt_when_blank(self, mock_generate):
+        # self.analysis.repo_context is '' by default (pasted-code analysis) -
+        # must not add a dangling "Repository context" section with nothing in it.
+        self.client.get(reverse('analysis-suggestions', args=[self.analysis.id]))
+        prompt = mock_generate.call_args.args[0]
+        self.assertNotIn('Repository context', prompt)

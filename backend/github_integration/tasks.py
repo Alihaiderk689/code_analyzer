@@ -9,10 +9,11 @@ import logging
 from celery import shared_task
 from django.utils import timezone
 
-from .models import GitHubRepository, PullRequestAnalysis, WebhookEvent
+from .models import GitHubRepository, PullRequestAnalysis, RepositoryIndex, WebhookEvent
 from .services.comment_service import CommentService
 from .services.github_client import GitHubAPIError, GitHubAuthError, GitHubRateLimitError
 from .services.pr_analysis_service import PRAnalysisService
+from .services.repo_index_service import RepositoryIndexService
 
 logger = logging.getLogger(__name__)
 
@@ -116,5 +117,98 @@ def process_pull_request_webhook(self, webhook_event_id: int) -> None:
         _mark_permanently_failed(pr_analysis, webhook_event, str(exc))
         return
 
+    webhook_event.processed = True
+    webhook_event.save(update_fields=['processed'])
+
+
+def _mark_index_failed(index: RepositoryIndex, message: str) -> None:
+    index.status = RepositoryIndex.Status.FAILED
+    index.error = message[:4000]
+    index.save(update_fields=['status', 'error', 'updated_at'])
+
+
+@shared_task(bind=True, max_retries=MAX_RETRIES)
+def build_repository_index(self, repository_id: int) -> None:
+    """Triggered by RepositoryService.select_repository right after a repo is
+    selected (fire-and-forget, same as the webhook->task handoff above), and
+    by the manual reindex endpoint. Building the dependency graph touches one
+    GitHub API call per candidate file (see RepositoryIndexService), so this
+    runs off the request path the same way PR review does."""
+    try:
+        repository = GitHubRepository.objects.select_related('integration').get(
+            pk=repository_id, is_active=True,
+        )
+    except GitHubRepository.DoesNotExist:
+        # Deselected (or replaced by selecting a different repo) before this
+        # task ran - nothing to index anymore.
+        logger.info('github_task.repository_not_monitored_for_indexing', extra={'repository_id': repository_id})
+        return
+
+    index, _created = RepositoryIndex.objects.get_or_create(repository=repository)
+
+    try:
+        RepositoryIndexService().build(repository)
+
+    except GitHubAuthError:
+        repository.integration.token_invalid = True
+        repository.integration.save(update_fields=['token_invalid'])
+        logger.error('github_task.index_auth_failed', extra={'repository': repository.full_name})
+        _mark_index_failed(index, 'GitHub access token is invalid or was revoked.')
+        return
+
+    except GitHubRateLimitError as exc:
+        if self.request.retries >= self.max_retries:
+            logger.warning('github_task.index_rate_limit_retries_exhausted', extra={'repository': repository.full_name})
+            _mark_index_failed(index, 'GitHub API rate limit exceeded repeatedly.')
+            return
+        countdown = (
+            max(1, exc.reset_at - int(timezone.now().timestamp())) if exc.reset_at else DEFAULT_RETRY_COUNTDOWN_SECONDS
+        )
+        logger.warning(
+            'github_task.index_rate_limited', extra={'repository': repository.full_name, 'retry_in_seconds': countdown},
+        )
+        raise self.retry(exc=exc, countdown=countdown)
+
+    except GitHubAPIError as exc:
+        logger.error('github_task.index_github_api_error', exc_info=True, extra={'repository': repository.full_name})
+        if self.request.retries >= self.max_retries:
+            _mark_index_failed(index, str(exc))
+            return
+        raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
+
+    except Exception as exc:  # noqa: BLE001 - see process_pull_request_webhook's identical rationale above
+        logger.exception('github_task.index_unexpected_error', extra={'repository': repository.full_name})
+        _mark_index_failed(index, str(exc))
+        return
+
+
+@shared_task
+def process_push_webhook(webhook_event_id: int) -> None:
+    """Triggered by a push to a monitored repository's default branch (see
+    WebhookService._should_process) - keeps the dependency-graph index from
+    going stale between PRs, since GitHub only sends pull_request events for
+    PR activity, not plain pushes. Just re-queues build_repository_index,
+    which already owns all the retry/error handling for the actual rebuild -
+    this task's only job is resolving the webhook payload to a monitored
+    GitHubRepository and marking the delivery processed."""
+    try:
+        webhook_event = WebhookEvent.objects.get(pk=webhook_event_id)
+    except WebhookEvent.DoesNotExist:
+        logger.error('github_task.webhook_event_missing', extra={'webhook_event_id': webhook_event_id})
+        return
+
+    repository_payload = webhook_event.payload['repository']
+
+    try:
+        repository = GitHubRepository.objects.get(repository_id=repository_payload['id'], is_active=True)
+    except GitHubRepository.DoesNotExist:
+        # Deselected (or replaced by selecting a different repo) before this
+        # task ran - nothing to index anymore.
+        logger.info('github_task.repository_not_monitored_for_push', extra={'repository_id': repository_payload['id']})
+        webhook_event.processed = True
+        webhook_event.save(update_fields=['processed'])
+        return
+
+    build_repository_index.delay(repository.id)
     webhook_event.processed = True
     webhook_event.save(update_fields=['processed'])

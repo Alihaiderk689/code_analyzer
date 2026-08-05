@@ -132,8 +132,20 @@ class GitHubClientWebhookAndReviewTests(SimpleTestCase):
         )
         self.assertEqual(result, {'id': 555})
         _args, kwargs = mock_request.call_args
-        self.assertEqual(kwargs['json']['events'], ['pull_request'])
+        self.assertEqual(kwargs['json']['events'], ['pull_request', 'push'])
         self.assertEqual(kwargs['json']['config']['secret'], 'shared-secret')
+
+    @patch('github_integration.services.github_client.requests.request')
+    def test_update_webhook_events_patches_events_only(self, mock_request):
+        mock_request.return_value = _mock_response(200, json_data={'id': 555, 'events': ['pull_request', 'push']})
+        result = GitHubClient(access_token='tok').update_webhook_events(
+            'octocat', 'hello-world', 555, ['pull_request', 'push'],
+        )
+        self.assertEqual(result['events'], ['pull_request', 'push'])
+        args, kwargs = mock_request.call_args
+        self.assertEqual(args[0], 'PATCH')
+        self.assertTrue(args[1].endswith('/repos/octocat/hello-world/hooks/555'))
+        self.assertEqual(kwargs['json'], {'events': ['pull_request', 'push']})
 
     @patch('github_integration.services.github_client.requests.request')
     def test_create_review_posts_comments_and_body(self, mock_request):

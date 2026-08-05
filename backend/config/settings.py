@@ -192,9 +192,21 @@ DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER or 'no
 # Base URL of the frontend app, used to build links inside verification/reset emails.
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
 
-# Groq (https://console.groq.com) - powers the AI suggestions/explanation/refactor/chat endpoints.
+# AI provider chain (ai/client.py) - powers the AI suggestions/explanation/
+# refactor/chat endpoints. Groq is tried first; on any failure (rate limit,
+# outage, missing key) it falls back to Gemini, then to OpenRouter. All three
+# are optional - a provider with no key configured is just skipped.
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 GROQ_MODEL = os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile')
+
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+# "gemini-flash-latest" is a Google-maintained alias, not a snapshot - pinning
+# a dated model (e.g. "gemini-2.5-flash") risks 404s as older snapshots get
+# retired from new-user/free-tier access.
+GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-flash-latest')
+
+OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
+OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'openrouter/auto')
 
 # Celery - runs the GitHub PR analysis pipeline off the request path (a webhook
 # must be acknowledged in seconds or GitHub retries the delivery). Redis is
@@ -238,6 +250,12 @@ GITHUB_WEBHOOK_BASE_URL = os.environ.get('GITHUB_WEBHOOK_BASE_URL', 'http://loca
 # single huge changed file (e.g. an accidentally-committed data dump) from
 # blowing up analysis time/cost.
 GITHUB_MAX_FILE_SIZE_BYTES = int(os.environ.get('GITHUB_MAX_FILE_SIZE_BYTES', 500_000))
+# Caps how many files a single repository-index build (see
+# github_integration/services/repo_index_service.py) will fetch content for -
+# indexing costs one GitHub API call per file, so an uncapped build on a huge
+# repo could exhaust the rate limit. Repos with more indexable files than this
+# get a partial graph (RepositoryIndex.truncated=True) rather than failing outright.
+GITHUB_MAX_INDEXED_FILES = int(os.environ.get('GITHUB_MAX_INDEXED_FILES', 300))
 
 ROOT_URLCONF = 'config.urls'
 
