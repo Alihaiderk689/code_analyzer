@@ -141,6 +141,102 @@ class RepositoryFileCheck(models.Model):
         return f'{self.repository.full_name}:{self.path}'
 
 
+class RepositoryContextCheck(models.Model):
+    """One row per on-demand 'analyze with repo context' check (see
+    PRAnalysisService.analyze_file_with_context) - the file plus its direct
+    dependency-graph neighbors (what it imports, what imports it), each
+    analyzed through the same quality/security/performance pipeline as a
+    plain RepositoryFileCheck, so a change's impact on related files is
+    visible instead of just the one file in isolation. Tracked separately
+    from RepositoryFileCheck/file_check_rate_limit.py: it costs several
+    GitHub fetches and up to one Groq call per related file, so it gets its
+    own (smaller) daily quota rather than sharing the single-file check's
+    counter - see context_check_rate_limit.py."""
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='github_context_checks')
+    repository = models.ForeignKey(GitHubRepository, on_delete=models.CASCADE, related_name='context_checks')
+    path = models.CharField(max_length=1000)
+    language = models.CharField(max_length=50, blank=True)
+    issues = models.JSONField(default=list, blank=True)
+    score = models.FloatField(null=True, blank=True)
+    # [{path, language, relation: 'imports'|'imported_by', issues, score}, ...]
+    # - one entry per successfully-fetched-and-analyzed neighbor; neighbors
+    # that failed to fetch or aren't analyzable (see classify_path) are left
+    # out rather than recorded with an error, same as the primary file's own
+    # skip handling one level up.
+    related = models.JSONField(default=list, blank=True)
+    # Backs "chat about this file" for the primary file only, exactly like
+    # RepositoryFileCheck.analysis - related files don't get their own
+    # Analysis row/chat, only a lightweight issues/score summary.
+    analysis = models.ForeignKey(Analysis, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.repository.full_name}:{self.path} (+{len(self.related)} related)'
+
+
+class RepositoryIndex(models.Model):
+    """One per monitored GitHubRepository - a lightweight, best-effort map of
+    which files import which, built by services/repo_index_service.py and
+    kept fresh by the build_repository_index Celery task (triggered on
+    select_repository, and manually via the reindex endpoint - there's no
+    push webhook to invalidate it automatically). Exists so on-demand
+    single-file analysis (RepositoryFileAnalyzeView) can hand the AI a file's
+    immediate neighbors instead of judging it in total isolation - see
+    pr_analysis_service._build_repo_context."""
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        RUNNING = 'running', 'Running'
+        COMPLETED = 'completed', 'Completed'
+        FAILED = 'failed', 'Failed'
+
+    repository = models.OneToOneField(GitHubRepository, on_delete=models.CASCADE, related_name='index')
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING)
+    files_total = models.PositiveIntegerField(default=0)  # every blob in the tree, before filtering
+    files_indexed = models.PositiveIntegerField(default=0)  # how many actually got a RepositoryFileNode
+    # True if either GitHub's tree API itself reported truncation (very large
+    # repos) or our own GITHUB_MAX_INDEXED_FILES cap cut the file list short -
+    # either way, the graph is a partial picture of the real repo.
+    truncated = models.BooleanField(default=False)
+    error = models.TextField(blank=True)
+    indexed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'RepositoryIndex({self.repository.full_name}, {self.status})'
+
+
+class RepositoryFileNode(models.Model):
+    """One row per source file included in a RepositoryIndex build. `imports`/
+    `imported_by` are lists of repo-relative paths (only edges that resolved
+    to an actual file in this repo are kept - a bare `import requests` or
+    `import react` isn't a repo file, so it's dropped rather than stored as a
+    dangling reference). `summary` is a short, truncated excerpt (not the
+    full file) - just enough structural signal for a prompt without blowing
+    up token budget across several related files at once."""
+
+    index = models.ForeignKey(RepositoryIndex, on_delete=models.CASCADE, related_name='files')
+    path = models.CharField(max_length=1000)
+    language = models.CharField(max_length=50, blank=True)
+    summary = models.TextField(blank=True)
+    imports = models.JSONField(default=list, blank=True)
+    imported_by = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['index', 'path'], name='unique_file_node_per_index'),
+        ]
+        ordering = ['path']
+
+    def __str__(self):
+        return self.path
+
+
 class WebhookEvent(models.Model):
     """Raw log of every webhook delivery received, independent of whether we
     acted on it - `delivery_id` is GitHub's own per-delivery GUID

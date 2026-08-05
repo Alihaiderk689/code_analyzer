@@ -7,7 +7,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .services.webhook_service import WebhookService, WebhookVerificationError
-from .tasks import process_pull_request_webhook
+from .tasks import process_pull_request_webhook, process_push_webhook
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +49,10 @@ class GitHubWebhookView(APIView):
             return Response({'detail': 'Invalid signature.'}, status=status.HTTP_401_UNAUTHORIZED)
 
         if should_process:
-            process_pull_request_webhook.delay(event.id)
+            if event_type == 'pull_request':
+                process_pull_request_webhook.delay(event.id)
+            elif event_type == 'push':
+                process_push_webhook.delay(event.id)
 
         # 202: the delivery is accepted; GitHub doesn't wait for (and will
         # time out and retry if we make it wait for) the actual analysis to

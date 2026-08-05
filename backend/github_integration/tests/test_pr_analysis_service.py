@@ -2,9 +2,9 @@ from unittest.mock import patch
 
 from django.test import TestCase, override_settings
 
-from ..models import PullRequestAnalysis
+from ..models import PullRequestAnalysis, RepositoryFileNode, RepositoryIndex
 from ..services.github_client import GitHubAPIError
-from ..services.pr_analysis_service import FileSkipReason, PRAnalysisService, _classify_file
+from ..services.pr_analysis_service import MAX_CONTEXT_RELATED_FILES, FileSkipReason, PRAnalysisService, _classify_file
 from .factories import make_integration, make_pr_analysis, make_repository, make_user
 
 
@@ -194,3 +194,99 @@ class PRAnalysisServiceTests(TestCase):
         self.pr_analysis.refresh_from_db()
         self.assertEqual(self.pr_analysis.overall_score, None)
         self.assertIn('No supported files', self.pr_analysis.summary)
+
+
+@override_settings(GITHUB_MAX_FILE_SIZE_BYTES=500_000)
+class AnalyzeFileWithContextTests(TestCase):
+    """analyze_file_with_context - like analyze_file_by_path, plus the file's
+    direct dependency-graph neighbors. Uses non-Python paths throughout so the
+    Python-only settings.py lookup (_find_settings_source) never kicks in and
+    doesn't need its own GitHubClient mocking here."""
+
+    def setUp(self):
+        self.repository = make_repository(make_integration(make_user()))
+
+    @patch('github_integration.services.pr_analysis_service.GitHubClient')
+    def test_no_index_falls_back_to_primary_file_only(self, mock_client_cls):
+        mock_client_cls.return_value.get_file_content.return_value = 'const x = 1;\n'
+
+        result = PRAnalysisService().analyze_file_with_context(self.repository, 'app.js', 'token')
+
+        self.assertFalse(result['skipped'])
+        self.assertEqual(result['related'], [])
+        mock_client_cls.return_value.get_file_content.assert_called_once()
+
+    @patch('github_integration.services.pr_analysis_service.GitHubClient')
+    def test_index_not_completed_falls_back_to_primary_file_only(self, mock_client_cls):
+        RepositoryIndex.objects.create(repository=self.repository, status=RepositoryIndex.Status.RUNNING)
+        mock_client_cls.return_value.get_file_content.return_value = 'const x = 1;\n'
+
+        result = PRAnalysisService().analyze_file_with_context(self.repository, 'app.js', 'token')
+
+        self.assertEqual(result['related'], [])
+
+    @patch('github_integration.services.pr_analysis_service.GitHubClient')
+    def test_analyzes_direct_import_and_importer_neighbors(self, mock_client_cls):
+        index = RepositoryIndex.objects.create(repository=self.repository, status=RepositoryIndex.Status.COMPLETED)
+        RepositoryFileNode.objects.create(
+            index=index, path='app.js', language='JavaScript', imports=['utils.js'], imported_by=['main.js'],
+        )
+        mock_client_cls.return_value.get_file_content.side_effect = [
+            'const x = 1;\n',              # primary: app.js
+            'export const y = 2;\n',       # related: utils.js (imports)
+            'import app from "./app";\n',  # related: main.js (imported_by)
+        ]
+
+        result = PRAnalysisService().analyze_file_with_context(self.repository, 'app.js', 'token')
+
+        self.assertEqual(len(result['related']), 2)
+        by_path = {r['path']: r for r in result['related']}
+        self.assertEqual(by_path['utils.js']['relation'], 'imports')
+        self.assertEqual(by_path['main.js']['relation'], 'imported_by')
+        self.assertEqual(mock_client_cls.return_value.get_file_content.call_count, 3)
+
+    @patch('github_integration.services.pr_analysis_service.GitHubClient')
+    def test_skip_eligible_neighbor_is_left_out(self, mock_client_cls):
+        index = RepositoryIndex.objects.create(repository=self.repository, status=RepositoryIndex.Status.COMPLETED)
+        RepositoryFileNode.objects.create(
+            index=index, path='app.js', language='JavaScript', imports=['package-lock.json'], imported_by=[],
+        )
+        mock_client_cls.return_value.get_file_content.return_value = 'const x = 1;\n'
+
+        result = PRAnalysisService().analyze_file_with_context(self.repository, 'app.js', 'token')
+
+        self.assertEqual(result['related'], [])
+        mock_client_cls.return_value.get_file_content.assert_called_once()  # only the primary file
+
+    @patch('github_integration.services.pr_analysis_service.GitHubClient')
+    def test_neighbor_fetch_failure_is_skipped_not_fatal(self, mock_client_cls):
+        index = RepositoryIndex.objects.create(repository=self.repository, status=RepositoryIndex.Status.COMPLETED)
+        RepositoryFileNode.objects.create(
+            index=index, path='app.js', language='JavaScript', imports=['utils.js'], imported_by=[],
+        )
+        mock_client_cls.return_value.get_file_content.side_effect = ['const x = 1;\n', GitHubAPIError('not found')]
+
+        result = PRAnalysisService().analyze_file_with_context(self.repository, 'app.js', 'token')
+
+        self.assertEqual(result['related'], [])
+
+    @patch('github_integration.services.pr_analysis_service.GitHubClient')
+    def test_neighbors_capped_per_relation(self, mock_client_cls):
+        index = RepositoryIndex.objects.create(repository=self.repository, status=RepositoryIndex.Status.COMPLETED)
+        RepositoryFileNode.objects.create(
+            index=index, path='app.js', language='JavaScript',
+            imports=[f'mod{i}.js' for i in range(5)], imported_by=[],
+        )
+        mock_client_cls.return_value.get_file_content.return_value = 'const x = 1;\n'
+
+        result = PRAnalysisService().analyze_file_with_context(self.repository, 'app.js', 'token')
+
+        self.assertEqual(len(result['related']), MAX_CONTEXT_RELATED_FILES)
+
+    @patch('github_integration.services.pr_analysis_service.GitHubClient')
+    def test_skipped_primary_file_returns_no_related_and_no_fetch(self, mock_client_cls):
+        result = PRAnalysisService().analyze_file_with_context(self.repository, 'yarn.lock', 'token')
+
+        self.assertTrue(result['skipped'])
+        self.assertEqual(result['related'], [])
+        mock_client_cls.return_value.get_file_content.assert_not_called()

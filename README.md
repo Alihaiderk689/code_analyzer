@@ -93,7 +93,7 @@ Copy `backend/.env.example` to `backend/.env` and fill in real values. Key group
 - **`ENVIRONMENT`** — `development` or `production`; picks `DATABASE_URL_DEV` vs `DATABASE_URL_PROD` and derives `DEBUG` automatically.
 - **Django** — `SECRET_KEY`, `ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`, `FRONTEND_URL`.
 - **Email** — SMTP creds for auth emails; leave blank to print emails to the console instead.
-- **`GROQ_API_KEY`** — powers AI suggestions/explanation/refactor and chat. Get one at [console.groq.com/keys](https://console.groq.com/keys).
+- **AI provider chain** — powers AI suggestions/explanation/refactor and chat. `GROQ_API_KEY` ([console.groq.com/keys](https://console.groq.com/keys)) is tried first; on any failure (rate limit, outage, missing key) it automatically falls back to `GEMINI_API_KEY` ([aistudio.google.com/apikey](https://aistudio.google.com/apikey)), then to `OPENROUTER_API_KEY` ([openrouter.ai/keys](https://openrouter.ai/keys)). All three are optional and independently skippable.
 - **Celery/Redis** — only required for the GitHub PR-review pipeline (webhook → queue → analyze → comment).
 - **GitHub OAuth** — `GITHUB_CLIENT_ID`/`GITHUB_CLIENT_SECRET` from a [GitHub OAuth App](https://github.com/settings/developers), plus a webhook secret and a Fernet key (`GITHUB_TOKEN_ENCRYPTION_KEY`) to encrypt stored access tokens at rest. In local dev, `GITHUB_WEBHOOK_BASE_URL` needs to be a publicly reachable URL (e.g. ngrok).
 

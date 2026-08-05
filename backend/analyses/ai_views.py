@@ -37,6 +37,15 @@ def _wants_regenerate(request):
     return request.query_params.get('regenerate', '').lower() == 'true'
 
 
+def _repo_context_block(analysis):
+    """'' for pasted/uploaded code; for a GitHub-repo-file-backed Analysis
+    (see github_integration.repository_views._create_analysis_for_file_check),
+    a block describing related files so suggestions/explanation/refactor
+    account for how the file is actually used elsewhere, not just its own
+    contents in isolation."""
+    return f'\n\n{analysis.repo_context}\n' if analysis.repo_context else ''
+
+
 def _call_ai(prompt, system_instruction):
     try:
         return generate_text(prompt, system_instruction), None
@@ -93,14 +102,18 @@ class SuggestionsView(APIView):
             f'Language: {analysis.language}\n\n'
             f'Static analysis found {analysis.issues_count} issue(s):\n{json.dumps(analysis.issues, indent=2)}\n\n'
             f'Source code:\n{analysis.source_code}'
+            f'{_repo_context_block(analysis)}'
         )
         system_instruction = (
             'You are a senior software engineer performing a code review. Given source code and a list of '
             'static-analysis issues, produce concise, concrete, actionable suggestions to improve code quality. '
             'Tag each suggestion with a category: "security" if it relates to a security concern (injection, '
             'secrets, authentication, unsafe input handling, etc.), or "general" for anything else (style, '
-            'performance, readability, correctness). Respond with ONLY a JSON array of the shape '
-            '[{"category": "security"|"general", "text": "<the suggestion>"}, ...], no other text, no markdown fences.'
+            'performance, readability, correctness). If related files from the rest of the repository are '
+            'provided below, use them to judge how this file is actually used elsewhere (e.g. how a function '
+            'is called, what a caller expects back) rather than judging the file in isolation. Respond with '
+            'ONLY a JSON array of the shape [{"category": "security"|"general", "text": "<the suggestion>"}, ...], '
+            'no other text, no markdown fences.'
         )
         text, error = _call_ai(prompt, system_instruction)
         if error:
@@ -124,10 +137,16 @@ class ExplanationView(APIView):
         if analysis.ai_explanation and not _wants_regenerate(request):
             return Response({'explanation': analysis.ai_explanation, 'cached': True})
 
-        prompt = f'Language: {analysis.language}\n\nSource code:\n{analysis.source_code}'
+        prompt = (
+            f'Language: {analysis.language}\n\nSource code:\n{analysis.source_code}'
+            f'{_repo_context_block(analysis)}'
+        )
         system_instruction = (
             'You are a senior software engineer. Explain in plain, clear language what the following code does, '
-            'in 2-4 short paragraphs aimed at a developer unfamiliar with this code. Respond with plain text only.'
+            'in 2-4 short paragraphs aimed at a developer unfamiliar with this code. If related files from the '
+            'rest of the repository are provided below, use them to explain how this file fits into the wider '
+            'codebase (what depends on it, what it depends on), not just what it does on its own. Respond with '
+            'plain text only.'
         )
         text, error = _call_ai(prompt, system_instruction)
         if error:
@@ -162,10 +181,14 @@ class RefactorView(APIView):
             f'Language: {analysis.language}\n\n'
             f'Known issues:\n{json.dumps(analysis.issues, indent=2)}\n\n'
             f'Source code:\n{analysis.source_code}'
+            f'{_repo_context_block(analysis)}'
         )
         system_instruction = (
             'You are a senior software engineer. Rewrite the following code applying best practices and fixing '
-            'the listed issues, while preserving behavior. Respond with ONLY a JSON object of the shape '
+            'the listed issues, while preserving behavior. If related files from the rest of the repository are '
+            'provided below, make sure the rewrite still satisfies how callers actually use this file (function '
+            'signatures/return shapes other files depend on must keep working) - do not break callers just to '
+            'improve style. Respond with ONLY a JSON object of the shape '
             '{"code": "<the refactored code, no markdown fences>", "changes": [{"summary": "<what changed, one '
             'sentence>", "benefit": "<why it\'s better, one sentence>"}, ...]}, one entry per distinct change you '
             'made, no other text.'

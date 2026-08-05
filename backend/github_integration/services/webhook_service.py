@@ -57,9 +57,26 @@ class WebhookService:
 
     @staticmethod
     def _should_process(event_type: str, payload: dict) -> bool:
-        if event_type != 'pull_request':
+        if event_type == 'pull_request':
+            if payload.get('action') not in HANDLED_PR_ACTIONS:
+                return False
+            repository_id = payload.get('repository', {}).get('id')
+
+        elif event_type == 'push':
+            # Branch/tag deletion pushes ({"deleted": true}) have nothing to
+            # index. Only the default branch matters here - a push to a
+            # feature branch doesn't change what HEAD-of-default-branch
+            # analysis (on-demand file checks, "Analyze with repo context")
+            # sees, so re-indexing for it would just waste GitHub API calls.
+            if payload.get('deleted'):
+                return False
+            repository_payload = payload.get('repository', {})
+            default_branch = repository_payload.get('default_branch')
+            if not default_branch or payload.get('ref') != f'refs/heads/{default_branch}':
+                return False
+            repository_id = repository_payload.get('id')
+
+        else:
             return False
-        if payload.get('action') not in HANDLED_PR_ACTIONS:
-            return False
-        repository_id = payload.get('repository', {}).get('id')
+
         return GitHubRepository.objects.filter(repository_id=repository_id, is_active=True).exists()
