@@ -23,6 +23,7 @@ django-cors-headers==4.9.0
 djangorestframework==3.16.1
 djangorestframework_simplejwt==5.5.1
 groq==1.0.0
+gunicorn==23.0.0
 h11==0.16.0
 html5lib==1.1
 httpcore==1.0.9
@@ -70,4 +71,5 @@ urllib3==2.7.0
 vine==5.1.0
 wcwidth==0.8.2
 webencodings==0.5.1
+whitenoise==6.11.0
 xhtml2pdf==0.2.17

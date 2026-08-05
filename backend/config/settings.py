@@ -109,6 +109,11 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # Serves collected static files (admin CSS/JS) directly from gunicorn -
+    # django.contrib.staticfiles only auto-serves under `runserver`/DEBUG, and
+    # this app has no separate static-file server/CDN in front of it. Must sit
+    # directly after SecurityMiddleware per whitenoise's own setup docs.
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -331,6 +336,14 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/4.2/howto/static-files/
 
 STATIC_URL = 'static/'
+# Where `collectstatic` gathers files for WhiteNoise (see MIDDLEWARE above) to
+# serve - required for collectstatic to run at all; without it the command
+# fails with "you're using the staticfiles app without STATIC_ROOT set".
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+# Adds a content hash to filenames and lets WhiteNoise set far-future cache
+# headers safely (a new deploy produces new hashed filenames, so browsers
+# never serve a stale cached asset under an old one's URL).
+STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 # Media files (user uploads, e.g. avatars)
 MEDIA_URL = '/media/'

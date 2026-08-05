@@ -1,0 +1,114 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-code_analyzer}
+      POSTGRES_USER: ${POSTGRES_USER:-code_analyzer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-code_analyzer} -d ${POSTGRES_DB:-code_analyzer}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    # Also the published Docker Hub image (linux/amd64 + linux/arm64) - lets
+    # another machine run this stack via `docker compose pull` with just this
+    # file + .env, no source checkout needed. `docker compose up --build`
+    # here still rebuilds from ./backend and retags it under this same name.
+    image: alihaider310/code-analyzer-backend:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Point at Compose's own service names/network, overriding whatever a
+      # developer's .env has for these keys (their non-Docker local dev might
+      # legitimately use localhost, which means "this container" here, not
+      # another service - see CLAUDE.md's ENVIRONMENT/settings.py notes).
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DATABASE_URL_DEV: postgresql://${POSTGRES_USER:-code_analyzer}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-code_analyzer}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1,backend}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:${FRONTEND_PORT:-80}}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:${FRONTEND_PORT:-80}}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - media_data:/app/media
+    # Not published to the host on purpose: nginx (frontend service) already
+    # proxies everything this app exposes (/api/, /admin/, /static/) on port
+    # 80, including the GitHub OAuth callback - publishing 8000 too would let
+    # anyone who reaches it hit gunicorn directly, bypassing nginx entirely.
+    # Uncomment below only for local direct-API debugging:
+    # ports:
+    #   - "${BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  celery_worker:
+    build: ./backend
+    # Also the published Docker Hub image (linux/amd64 + linux/arm64) - lets
+    # another machine run this stack via `docker compose pull` with just this
+    # file + .env, no source checkout needed. `docker compose up --build`
+    # here still rebuilds from ./backend and retags it under this same name.
+    image: alihaider310/code-analyzer-backend:latest
+    restart: unless-stopped
+    command: celery -A config worker --loglevel=info
+    env_file: .env
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DATABASE_URL_DEV: postgresql://${POSTGRES_USER:-code_analyzer}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-code_analyzer}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - media_data:/app/media
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Relative path - nginx.conf reverse-proxies /api/ to the backend
+        # service, so the built JS never needs to know a real backend host.
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+    # Also the published Docker Hub image (linux/amd64 + linux/arm64) - see
+    # the backend service's identical comment above.
+    image: alihaider310/code-analyzer-frontend:latest
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      # Shared with backend/celery_worker (see their /app/media mount) so
+      # nginx can serve uploaded avatars directly from disk - see
+      # nginx.conf's /media/ location - instead of proxying to Django's
+      # dev-oriented file-serving view for every request.
+      - media_data:/usr/share/nginx/media:ro
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+
+volumes:
+  postgres_data:
+  media_data:
