@@ -8,12 +8,17 @@ backend/.env
 backend/.env.*
 !backend/.env.example
 backend/media/
+backend/staticfiles/
 
 # Frontend (Node/Vite)
 frontend/node_modules/
 frontend/dist/
 frontend/.env
 frontend/*.local
+
+# Docker
+.env
+!.env.example
 
 # OS
 .DS_Store

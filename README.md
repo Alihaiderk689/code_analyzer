@@ -54,13 +54,49 @@ frontend/
 
 ## Getting started
 
-### Prerequisites
+### Docker (recommended for a quick local run)
+
+Runs the whole stack - Postgres, Redis, backend, Celery worker, and frontend (nginx) - with one command. No local Python/Node/Postgres/Redis install needed.
+
+```bash
+cp .env.example .env   # fill in SECRET_KEY at minimum - see the file for how to generate one
+docker compose up --build
+```
+
+Then open **http://localhost**. The frontend (nginx) serves the built SPA, reverse-proxies `/api/` and `/admin/`/`/static/` to the backend container, and serves `/media/` (uploaded avatars) directly from a volume shared with backend - so frontend and backend end up on one origin, no CORS/CSRF cross-origin complications unlike running them separately in local dev. The backend container has **no port published to the host** - nginx is the only way in, including the GitHub OAuth callback.
+
+- `docker compose logs -f backend` / `celery_worker` / `frontend` - tail a service's logs.
+- `docker compose exec backend python manage.py <command>` - run any management command (e.g. `createsuperuser`) inside the running container.
+- `docker compose down` - stop everything (add `-v` to also drop the Postgres/media volumes).
+- `FRONTEND_PORT` in `.env` - change if 80 is already taken on your machine.
+
+There's no `celery_beat` service - this app has no scheduled/periodic tasks, only the on-demand PR-review and repo-indexing pipeline, so a beat process would just sit idle.
+
+This is a separate `.env` from `backend/.env.example` below, which is for running the backend directly on your host rather than in Docker.
+
+#### Running on another machine, without copying the source
+
+The backend/frontend images are published on Docker Hub (`alihaider310/code-analyzer-backend`, `alihaider310/code-analyzer-frontend` — multi-platform: `linux/amd64` + `linux/arm64`). On another machine you only need two files, not the repo:
+
+```bash
+mkdir code-analyzer && cd code-analyzer
+# copy over just docker-compose.yml and .env.example (e.g. scp, or paste them)
+cp .env.example .env   # fill in SECRET_KEY, POSTGRES_PASSWORD at minimum
+docker compose pull
+docker compose up -d
+```
+
+`docker compose up --build` (used above) rebuilds from source and retags under the same image names; plain `docker compose up`/`pull` (no `--build`) uses the published images instead - both are the same `docker-compose.yml`.
+
+### Manual setup
+
+#### Prerequisites
 - Python 3.11+, Node 18+
 - PostgreSQL (local dev) — or a Supabase/Postgres URL for production
 - Redis (only needed for GitHub PR review's async pipeline)
 - macOS, if you want sandboxed runtime-error detection (`sandbox-exec`) — it degrades gracefully to static-only analysis elsewhere
 
-### Backend
+#### Backend
 
 ```bash
 cd backend
@@ -78,7 +114,7 @@ To use the GitHub integration locally, also run a Celery worker and point Redis/
 celery -A config worker --loglevel=info
 ```
 
-### Frontend
+#### Frontend
 
 ```bash
 cd frontend

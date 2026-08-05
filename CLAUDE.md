@@ -8,6 +8,9 @@ A full-stack code analysis platform (Django REST Framework backend + React/Vite 
 
 ## Commands
 
+### Docker
+`docker compose up --build` (repo root, after `cp .env.example .env` + filling in `SECRET_KEY`) runs the whole stack — Postgres, Redis, backend (gunicorn), a Celery worker, and the frontend (nginx, serving the built SPA and reverse-proxying `/api/`, `/admin/`, `/static/` to the backend, and `/media/` directly from a volume shared with backend) — at http://localhost. The backend container has **no port published to the host at all** — nginx is the only way in, including the GitHub OAuth callback (`GITHUB_OAUTH_REDIRECT_URI` goes through nginx, not a direct backend port). No `celery_beat` service: this app has no scheduled/periodic tasks. `backend/Dockerfile`'s `entrypoint.sh` only runs `migrate`/`collectstatic` for the gunicorn command (not the Celery worker, which reuses the same image), so two containers starting together can't race the same migration. See root `.env.example` for the Docker-specific env vars (`POSTGRES_*`, `FRONTEND_PORT`) — distinct from `backend/.env.example`, which is for running the backend directly on the host.
+
 ### Backend (`backend/`)
 ```bash
 python -m venv venv && source venv/bin/activate && pip install -r requirements.txt
@@ -53,6 +56,9 @@ JWT access/refresh tokens live in httpOnly cookies (`accounts/cookies.py`), not 
 
 ### Settings: one `.env`, `ENVIRONMENT` drives everything
 `config/settings.py` reads a single `.env` file; `ENVIRONMENT` (`development` or `production`, validated against a fixed set) derives `DEBUG`, which `DATABASE_URL_*` is used, cookie `Secure`/`SameSite` flags, and whether HSTS/secure-cookie production hardening is applied. `_RUNNING_TESTS` (`'test' in sys.argv`) separately relaxes throttle rates and log verbosity during `manage.py test` — real rates would make unrelated tests trip shared IP-keyed throttle buckets, since Django's test client reuses one `REMOTE_ADDR` and `LocMemCache` persists for the whole test run.
+
+### Static files: WhiteNoise; media: nginx, not Django
+`django.contrib.staticfiles` only auto-serves under `runserver`/`DEBUG=True`, and this app has no cloud storage (S3/Cloudinary/etc.) or separate static-file server in front of it — so `STATIC_ROOT` + WhiteNoise (`whitenoise.middleware.WhiteNoiseMiddleware`, right after `SecurityMiddleware`) serve collected static files (admin CSS/JS) directly from gunicorn in every environment; nginx just proxies `/static/` to it. Media (user-uploaded avatars) is different: `config/urls.py`'s media route *is* `DEBUG`-gated, same as Django's default, since it's dev-only/inefficient by Django's own docs — in Docker Compose, nginx serves `/media/` directly from a `media_data` volume shared with the backend container instead (see `frontend/nginx.conf`), never through Django at all.
 
 ### AI: one client, three call sites
 `ai/client.py` wraps the Groq SDK (`generate_text`, `generate_chat_reply`) and is the only place that talks to Groq. It's shared by three otherwise-unrelated call sites, all of which catch AI-call exceptions the same way (503 "AI service is currently unavailable"): the floating chat (`ai/views.py`), per-analysis suggestions/explanation/refactor (`analyses/ai_views.py`), and per-analysis persisted chat (`chat/views.py`). Prompt-building for the chat surfaces is centralized in `ai/prompts.py` so the floating and per-analysis chats describe an `Analysis` identically.
