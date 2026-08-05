@@ -1,5 +1,6 @@
 import logging
 
+from django.conf import settings
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.response import Response
@@ -7,12 +8,14 @@ from rest_framework.views import APIView
 
 from analyses.models import Analysis
 
-from .models import GitHubIntegration, GitHubRepository, RepositoryFileCheck
+from .models import GitHubIntegration, GitHubRepository, RepositoryContextCheck, RepositoryFileCheck, RepositoryIndex
 from .serializers import GitHubRepositorySerializer, RepositorySelectSerializer
+from .services.context_check_rate_limit import get_context_check_status
 from .services.file_check_rate_limit import get_file_check_status
 from .services.github_client import GitHubAPIError, GitHubAuthError, GitHubClient, GitHubRateLimitError
-from .services.pr_analysis_service import PRAnalysisService, classify_path
+from .services.pr_analysis_service import FileSkipReason, PRAnalysisService, classify_path
 from .services.repository_service import RepositoryService
+from .tasks import build_repository_index
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +148,87 @@ class RepositoryTreeView(APIView):
         except GitHubAPIError as exc:
             return _handle_github_error(exc, integration)
 
-        return Response({'repository': repository.full_name, 'default_branch': repository.default_branch, 'results': tree})
+        return Response({
+            'repository': repository.full_name, 'default_branch': repository.default_branch,
+            'results': tree['entries'], 'truncated': tree['truncated'],
+        })
+
+
+class RepositoryFileContentView(APIView):
+    """GET /api/github/repositories/<pk>/file/?path=... - just the raw source
+    of a file at the HEAD of the repo's default branch, free like the tree
+    browse above (no quota, no quality/security/AI pipeline). Lets the file
+    browser show code the moment a file is clicked; analyzing it is a
+    separate, explicit action (RepositoryFileAnalyzeView) the user opts into."""
+
+    def get(self, request, pk):
+        integration, error = _get_integration_or_error(request)
+        if error:
+            return error
+        repository = get_object_or_404(GitHubRepository, pk=pk, integration=integration)
+
+        path = (request.query_params.get('path') or '').strip()
+        if not path:
+            return Response({'detail': 'path is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        language, skip_reason = classify_path(path)
+        if skip_reason:
+            return Response({'path': path, 'language': language, 'skipped': True, 'skip_reason': skip_reason, 'content': None})
+
+        owner, _, repo = repository.full_name.partition('/')
+        try:
+            content = GitHubClient(integration.get_access_token()).get_file_content(owner, repo, path, repository.default_branch)
+        except GitHubAPIError as exc:
+            return _handle_github_error(exc, integration)
+
+        if len(content.encode('utf-8')) > settings.GITHUB_MAX_FILE_SIZE_BYTES:
+            return Response({
+                'path': path, 'language': language, 'skipped': True,
+                'skip_reason': FileSkipReason.TOO_LARGE, 'content': None,
+            })
+
+        return Response({'path': path, 'language': language, 'skipped': False, 'skip_reason': None, 'content': content})
+
+
+class RepositoryIndexStatusView(APIView):
+    """GET /api/github/repositories/<pk>/index/ - status of the dependency-
+    graph build (see repo_index_service.py) so the frontend can show
+    "Understanding repository..." while it's running, without spending any
+    quota or triggering GitHub calls itself."""
+
+    def get(self, request, pk):
+        integration, error = _get_integration_or_error(request)
+        if error:
+            return error
+        repository = get_object_or_404(GitHubRepository, pk=pk, integration=integration)
+
+        index = RepositoryIndex.objects.filter(repository=repository).first()
+        if index is None:
+            return Response({'status': 'not_started'})
+        return Response({
+            'status': index.status,
+            'files_total': index.files_total,
+            'files_indexed': index.files_indexed,
+            'truncated': index.truncated,
+            'error': index.error or None,
+            'indexed_at': index.indexed_at,
+        })
+
+
+class RepositoryReindexView(APIView):
+    """POST /api/github/repositories/<pk>/reindex/ - manually rebuilds the
+    dependency graph. There's no push webhook to invalidate it automatically
+    (only pull_request events are subscribed to - see
+    GitHubClient.create_webhook), so this is the way to refresh it after
+    pushing new commits."""
+
+    def post(self, request, pk):
+        integration, error = _get_integration_or_error(request)
+        if error:
+            return error
+        repository = get_object_or_404(GitHubRepository, pk=pk, integration=integration)
+        build_repository_index.delay(repository.id)
+        return Response(status=status.HTTP_202_ACCEPTED)
 
 
 class FileCheckQuotaView(APIView):
@@ -159,6 +242,18 @@ class FileCheckQuotaView(APIView):
         limit_status = get_file_check_status(request.user, tz_offset_minutes)
         today_check = limit_status.pop('today_check')
         return Response({**limit_status, 'today_check': _serialize_file_check(today_check) if today_check else None})
+
+
+class ContextCheckQuotaView(APIView):
+    """GET /api/github/context-checks/quota/ - the ContextCheckQuotaView
+    counterpart of FileCheckQuotaView above, for the separate 'analyze with
+    repo context' quota (see context_check_rate_limit.py)."""
+
+    def get(self, request):
+        tz_offset_minutes = request.query_params.get('tz_offset_minutes', 0)
+        limit_status = get_context_check_status(request.user, tz_offset_minutes)
+        today_check = limit_status.pop('today_check')
+        return Response({**limit_status, 'today_check': _serialize_context_check(today_check) if today_check else None})
 
 
 class RepositoryFileAnalyzeView(APIView):
@@ -220,6 +315,66 @@ class RepositoryFileAnalyzeView(APIView):
         return Response({**_serialize_file_check(check), 'cached': False}, status=status.HTTP_201_CREATED)
 
 
+class RepositoryFileContextAnalyzeView(APIView):
+    """POST /api/github/repositories/<pk>/analyze-file-context/ - body {path}.
+    Like RepositoryFileAnalyzeView, but also fetches and analyzes the file's
+    direct dependency-graph neighbors (see PRAnalysisService
+    .analyze_file_with_context), so the result shows a change's impact on
+    related files instead of just the one file in isolation. Costs several
+    GitHub content fetches and up to one Groq call per related file - gated
+    to once per user per day under its own quota (see
+    context_check_rate_limit.py), separate from the plain single-file check's
+    quota above. Re-requesting the *same* path you already checked today is
+    free, exactly like RepositoryFileAnalyzeView."""
+
+    def post(self, request, pk):
+        integration, error = _get_integration_or_error(request)
+        if error:
+            return error
+        repository = get_object_or_404(GitHubRepository, pk=pk, integration=integration)
+
+        path = (request.data.get('path') or '').strip()
+        if not path:
+            return Response({'detail': 'path is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        language, skip_reason = classify_path(path)
+        if skip_reason:
+            return Response({
+                'path': path, 'language': language, 'skipped': True,
+                'skip_reason': skip_reason, 'issues': [], 'score': None, 'related': [], 'cached': False,
+            })
+
+        tz_offset_minutes = request.data.get('tz_offset_minutes', 0)
+        limit_status = get_context_check_status(request.user, tz_offset_minutes)
+        today_check = limit_status.pop('today_check')
+
+        if today_check is not None:
+            if today_check.repository_id == repository.id and today_check.path == path:
+                return Response({**_serialize_context_check(today_check), 'cached': True})
+            return Response(
+                {'detail': "You've used today's context check. Try again after the reset.", **limit_status},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        try:
+            result = PRAnalysisService().analyze_file_with_context(repository, path, integration.get_access_token())
+        except GitHubAPIError as exc:
+            return _handle_github_error(exc, integration)
+
+        if result['skipped']:
+            # Doesn't count against the daily quota - a misclick on a binary/
+            # lock/generated file shouldn't burn the user's one check for the day.
+            return Response({**result, 'cached': False})
+
+        analysis = _create_analysis_for_file_check(request.user, repository, path, result)
+        check = RepositoryContextCheck.objects.create(
+            user=request.user, repository=repository, path=path,
+            language=result['language'] or '', issues=result['issues'], score=result['score'],
+            related=result['related'], analysis=analysis,
+        )
+        return Response({**_serialize_context_check(check), 'cached': False}, status=status.HTTP_201_CREATED)
+
+
 def _create_analysis_for_file_check(user, repository: GitHubRepository, path: str, result: dict) -> Analysis:
     """Backs the "chat about this file" feature: a real Analysis row so the
     existing chat.Conversation/ChatMessage machinery - same UI component, same
@@ -236,6 +391,10 @@ def _create_analysis_for_file_check(user, repository: GitHubRepository, path: st
         issues_count=len(result['issues']),
         quality_score=result['score'],
         status=Analysis.Status.COMPLETED,
+        # '' when there's no repo index yet (or this file wasn't indexed) -
+        # every AI prompt about this Analysis (suggestions/explanation/
+        # refactor/chat) includes it when present, see ai_views.py/ai/prompts.py.
+        repo_context=result.get('repo_context', ''),
     )
 
 
@@ -257,6 +416,22 @@ def _serialize_file_check(check: RepositoryFileCheck) -> dict:
         # file_check_rate_limit.py), so the frontend needs this to tell
         # whether today's check belongs to whichever repo it has open right
         # now versus a different (possibly no-longer-monitored) one.
+        'repository_id': check.repository_id,
+        'created_at': check.created_at,
+    }
+
+
+def _serialize_context_check(check: RepositoryContextCheck) -> dict:
+    return {
+        'path': check.path,
+        'language': check.language or None,
+        'skipped': False,
+        'skip_reason': None,
+        'issues': check.issues,
+        'score': check.score,
+        'related': check.related,
+        'analysis_id': check.analysis_id,
+        'content': check.analysis.source_code if check.analysis_id else None,
         'repository_id': check.repository_id,
         'created_at': check.created_at,
     }

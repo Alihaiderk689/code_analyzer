@@ -33,6 +33,14 @@ class OAuthStateError(Exception):
     """The `state` round-tripped from GitHub is missing, tampered with, or expired."""
 
 
+class GitHubAccountAlreadyLinkedError(Exception):
+    """The GitHub account being authorized is already connected to a
+    *different* platform user - `github_user_id` is globally unique (one
+    GitHub identity maps to at most one platform user), so this must be
+    caught and reported before `update_or_create` hits that constraint as a
+    raw IntegrityError."""
+
+
 def _require_oauth_configured() -> None:
     if not settings.GITHUB_CLIENT_ID or not settings.GITHUB_CLIENT_SECRET:
         raise ImproperlyConfigured(

@@ -9,6 +9,7 @@ import logging
 from django.conf import settings
 
 from ..models import GitHubIntegration, GitHubRepository
+from ..tasks import build_repository_index
 from .github_client import GitHubAPIError, GitHubClient
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,14 @@ class RepositoryService:
             # timestamp) attribute - passing it via extra= raises KeyError.
             extra={'repository': repository_name, 'webhook_id': webhook['id'], 'newly_created': created},
         )
+
+        # Fire-and-forget: builds the file/import graph off the request path
+        # (one GitHub call per candidate file - too slow/rate-limit-hungry to
+        # do inline). Also re-runs on every select (including re-selecting the
+        # same repo) so it's never left stale between here and the first push
+        # webhook - see RepositoryReindexView for the manual equivalent, and
+        # tasks.process_push_webhook for what keeps it fresh afterward.
+        build_repository_index.delay(repository.id)
         return repository
 
     def deselect_repository(self, integration: GitHubIntegration, repository: GitHubRepository) -> None:

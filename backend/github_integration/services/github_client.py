@@ -24,6 +24,12 @@ GITHUB_OAUTH_AUTHORIZE_URL = 'https://github.com/login/oauth/authorize'
 GITHUB_OAUTH_TOKEN_URL = 'https://github.com/login/oauth/access_token'
 REQUEST_TIMEOUT_SECONDS = 15
 
+# 'pull_request' drives PR review; 'push' drives keeping the dependency-graph
+# index fresh after a direct push to the default branch (see
+# webhook_service.py/tasks.process_push_webhook) - there's no other trigger
+# for that, since GitHub doesn't fire pull_request events for plain pushes.
+WEBHOOK_EVENTS = ['pull_request', 'push']
+
 
 class GitHubAPIError(Exception):
     def __init__(self, message: str, status_code: Optional[int] = None, response_body: Any = None):
@@ -175,10 +181,17 @@ class GitHubClient:
             json={
                 'name': 'web',
                 'active': True,
-                'events': ['pull_request'],
+                'events': WEBHOOK_EVENTS,
                 'config': {'url': webhook_url, 'content_type': 'json', 'secret': secret, 'insecure_ssl': '0'},
             },
         ).json()
+
+    def update_webhook_events(self, owner: str, repo: str, hook_id: int, events: list[str]) -> dict:
+        """Changes which events an *existing* webhook (already on GitHub) is
+        subscribed to, without touching its URL/secret/config - used to
+        backfill repos that were selected before WEBHOOK_EVENTS grew a new
+        entry, see management command backfill_webhook_push_events."""
+        return self._request('PATCH', f'/repos/{owner}/{repo}/hooks/{hook_id}', json={'events': events}).json()
 
     def delete_webhook(self, owner: str, repo: str, hook_id: int) -> None:
         self._request('DELETE', f'/repos/{owner}/{repo}/hooks/{hook_id}')
@@ -195,20 +208,28 @@ class GitHubClient:
             raise GitHubAPIError(f'Unexpected content encoding for {path}: {data.get("encoding")}')
         return base64.b64decode(data['content']).decode('utf-8', errors='replace')
 
-    def get_repository_tree(self, owner: str, repo: str, ref: str) -> list[dict]:
+    def get_repository_tree(self, owner: str, repo: str, ref: str) -> dict:
         """One request for the *entire* file tree (recursive=1), not one call
         per folder - browsing a repo must not cost more than a couple of API
-        calls total, regardless of how many files/directories it has."""
+        calls total, regardless of how many files/directories it has.
+
+        Returns {'entries': [...], 'truncated': bool} - `truncated` is GitHub's
+        own signal that a repo is too large for one recursive call to return
+        in full (very large monorepos). Callers that only display/browse the
+        tree can ignore it; anything that needs to reason about "did I see
+        every file" (e.g. the repo indexer) must check it."""
         data = self._request(
             'GET', f'/repos/{owner}/{repo}/git/trees/{ref}', params={'recursive': '1'},
         ).json()
-        if data.get('truncated'):
+        truncated = bool(data.get('truncated'))
+        if truncated:
             logger.warning('github_client.tree_truncated', extra={'repo': f'{owner}/{repo}'})
-        return [
+        entries = [
             {'path': item['path'], 'type': 'dir' if item['type'] == 'tree' else 'file', 'size': item.get('size')}
             for item in data.get('tree', [])
             if item['type'] in ('blob', 'tree')
         ]
+        return {'entries': entries, 'truncated': truncated}
 
     def create_review(
         self, owner: str, repo: str, pr_number: int, commit_id: str, body: str,

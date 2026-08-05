@@ -22,6 +22,11 @@ def build_analysis_context(analysis):
     else:
         issues_text = 'None.'
 
+    # Only set for analyses backed by a monitored GitHub repository file (see
+    # github_integration.repository_views._create_analysis_for_file_check) -
+    # blank, and so a no-op here, for pasted/uploaded code.
+    repo_context_block = f'\n\n{analysis.repo_context}' if analysis.repo_context else ''
+
     return (
         f'\n\nThe user is asking about this analysis:\n'
         f'Name: {analysis.name}\n'
@@ -30,4 +35,5 @@ def build_analysis_context(analysis):
         f'Lines of code: {analysis.lines_of_code}\n'
         f'Issues found (numbered to match what the user sees in the UI):\n{issues_text}\n\n'
         f'Source code:\n{analysis.source_code}'
+        f'{repo_context_block}'
     )

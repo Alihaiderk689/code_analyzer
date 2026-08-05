@@ -24,6 +24,14 @@ class Analysis(models.Model):
     ai_refactored_code = models.TextField(blank=True)
     ai_refactor_explanation = models.TextField(blank=True)
     security_report = models.JSONField(default=dict, blank=True)
+    # Populated only for analyses backed by a monitored GitHub repository file
+    # (see github_integration.repository_views._create_analysis_for_file_check) -
+    # a pre-rendered block describing related files (what this file imports,
+    # what imports it), threaded into every AI prompt about this analysis
+    # (suggestions/explanation/refactor/chat) so recommendations account for
+    # how the file is actually used elsewhere, not just its own contents.
+    # Blank for pasted/uploaded code, which has no repo to draw context from.
+    repo_context = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

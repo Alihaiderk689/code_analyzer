@@ -36,5 +36,11 @@ urlpatterns = [
     path('api/webhooks/', include('github_integration.webhook_urls')),
 ]
 
+# DEBUG-only, same as Django's default: this view exists for local `runserver`
+# convenience, not production use (no caching, does its own path resolution
+# per request). In Docker Compose, media isn't served by Django at all - nginx
+# serves it directly from a volume shared with this container (see
+# frontend/nginx.conf's /media/ location + docker-compose.yml's media_data
+# volume), which is what actually serves it in every non-DEBUG deployment.
 if settings.DEBUG:
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

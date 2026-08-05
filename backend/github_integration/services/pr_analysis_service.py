@@ -22,11 +22,22 @@ from analyses.engine import analyze_code
 from analyses.services.report_generator import SEVERITY_PENALTIES, STARTING_SCORE
 from analyses.services.security_service import SecurityAnalysisService
 
-from ..models import FileAnalysis, PullRequestAnalysis
+from ..models import FileAnalysis, PullRequestAnalysis, RepositoryIndex
 from .github_client import GitHubAPIError, GitHubClient
 from .performance_service import find_performance_issues
 
 logger = logging.getLogger(__name__)
+
+# How many of a file's imports/importers get pulled into repo_context - bounds
+# prompt size regardless of how connected a file is in a large repo.
+MAX_RELATED_FILES = 5
+
+# How many of a file's imports/importers get actually fetched-and-analyzed by
+# analyze_file_with_context, per relation (imports / imported_by) - smaller
+# than MAX_RELATED_FILES above since each one costs a real GitHub fetch and
+# potentially a Groq call (security enrichment), not just a few lines of
+# prompt text.
+MAX_CONTEXT_RELATED_FILES = 3
 
 # Matches the languages this feature is required to support. Deliberately its
 # own map rather than reusing analyses.engine.LANGUAGE_BY_EXTENSION - that one
@@ -112,7 +123,7 @@ def _find_settings_source(client: GitHubClient, owner: str, repo: str, ref: str)
     '' (same as "unknown") on any failure - this only ever refines the
     existing heuristic, never gates it."""
     try:
-        tree = client.get_repository_tree(owner, repo, ref)
+        tree = client.get_repository_tree(owner, repo, ref)['entries']
     except GitHubAPIError:
         return ''
     candidates = sorted(
@@ -125,6 +136,77 @@ def _find_settings_source(client: GitHubClient, owner: str, repo: str, ref: str)
         return client.get_file_content(owner, repo, candidates[0], ref)
     except GitHubAPIError:
         return ''
+
+
+def _build_repo_context(repository: 'GitHubRepository', path: str) -> str:
+    """Best-effort: hands the AI a file's immediate neighbors (what it
+    imports, what imports it) from the repo's dependency graph (see
+    repo_index_service.py), if one exists. Silently returns '' if there's no
+    index yet, it's still building/failed, or this file wasn't indexed (e.g.
+    an unsupported language or over GITHUB_MAX_INDEXED_FILES) - this only
+    ever enriches an analysis, never gates it."""
+    try:
+        index = repository.index
+    except RepositoryIndex.DoesNotExist:
+        return ''
+    if index.status != RepositoryIndex.Status.COMPLETED:
+        return ''
+
+    node = index.files.filter(path=path).first()
+    if node is None:
+        return ''
+
+    related_paths = [*node.imports[:MAX_RELATED_FILES], *node.imported_by[:MAX_RELATED_FILES]]
+    summaries_by_path = dict(index.files.filter(path__in=related_paths).values_list('path', 'summary'))
+
+    sections = []
+    if node.imports:
+        lines = [
+            f'--- {p} ---\n{summaries_by_path[p]}' if p in summaries_by_path else f'--- {p} --- (not indexed)'
+            for p in node.imports[:MAX_RELATED_FILES]
+        ]
+        sections.append('Files this file imports:\n' + '\n\n'.join(lines))
+    if node.imported_by:
+        lines = [
+            f'--- {p} ---\n{summaries_by_path[p]}' if p in summaries_by_path else f'--- {p} --- (not indexed)'
+            for p in node.imported_by[:MAX_RELATED_FILES]
+        ]
+        sections.append('Files that import this file:\n' + '\n\n'.join(lines))
+
+    if not sections:
+        return ''
+    return 'Repository context - other files related to this one:\n\n' + '\n\n'.join(sections)
+
+
+def _related_paths(repository: 'GitHubRepository', path: str) -> list[tuple[str, str]]:
+    """[(related_path, 'imports'|'imported_by'), ...] for a file's direct
+    dependency-graph neighbors, deduplicated and capped at
+    MAX_CONTEXT_RELATED_FILES per relation - the set analyze_file_with_context
+    actually fetches and analyzes. Returns [] the same way _build_repo_context
+    does (no index yet, still building/failed, or this file wasn't indexed) -
+    this only ever adds to a context check, never blocks it."""
+    try:
+        index = repository.index
+    except RepositoryIndex.DoesNotExist:
+        return []
+    if index.status != RepositoryIndex.Status.COMPLETED:
+        return []
+
+    node = index.files.filter(path=path).first()
+    if node is None:
+        return []
+
+    seen = {path}
+    related: list[tuple[str, str]] = []
+    for p in node.imports[:MAX_CONTEXT_RELATED_FILES]:
+        if p not in seen:
+            seen.add(p)
+            related.append((p, 'imports'))
+    for p in node.imported_by[:MAX_CONTEXT_RELATED_FILES]:
+        if p not in seen:
+            seen.add(p)
+            related.append((p, 'imported_by'))
+    return related
 
 
 def _analyze_file_content(content: str, language: str, settings_source: str = '') -> list[dict]:
@@ -267,7 +349,53 @@ class PRAnalysisService:
         return {
             'path': path, 'language': language, 'skipped': False, 'content': content,
             'skip_reason': None, 'issues': issues, 'score': _score_for_issues(issues),
+            'repo_context': _build_repo_context(repository, path),
         }
+
+    def analyze_file_with_context(self, repository: 'GitHubRepository', path: str, access_token: str) -> dict:
+        """Like analyze_file_by_path, plus the file's direct dependency-graph
+        neighbors (what it imports, what imports it - see _related_paths),
+        each run through the same quality/security/performance pipeline, so a
+        change's impact on related files is visible instead of just the one
+        file in isolation. Falls back to the primary file alone if there's no
+        completed index yet or it has no recorded neighbors. Caller is
+        responsible for the daily quota check (see RepositoryContextCheck) -
+        this method always does the real work when called."""
+        primary = self.analyze_file_by_path(repository, path, access_token)
+        if primary['skipped']:
+            return {**primary, 'related': []}
+
+        owner, _, repo = repository.full_name.partition('/')
+        client = GitHubClient(access_token)
+        settings_source = None  # lazy, only fetched if a related Python file actually needs it
+
+        related = []
+        for related_path, relation in _related_paths(repository, path):
+            related_language, skip_reason = classify_path(related_path)
+            if skip_reason:
+                continue
+
+            try:
+                content = client.get_file_content(owner, repo, related_path, repository.default_branch)
+            except GitHubAPIError:
+                logger.warning(
+                    'github_context_check.related_fetch_failed', exc_info=True, extra={'path': related_path},
+                )
+                continue
+
+            if len(content.encode('utf-8')) > settings.GITHUB_MAX_FILE_SIZE_BYTES:
+                continue
+
+            if related_language == 'Python' and settings_source is None:
+                settings_source = _find_settings_source(client, owner, repo, repository.default_branch)
+
+            issues = _analyze_file_content(content, related_language, settings_source or '')
+            related.append({
+                'path': related_path, 'language': related_language, 'relation': relation,
+                'issues': issues, 'score': _score_for_issues(issues),
+            })
+
+        return {**primary, 'related': related}
 
     @staticmethod
     def _overall_score(results: list[tuple[FileAnalysis, str]]) -> Optional[float]:

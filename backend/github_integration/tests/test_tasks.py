@@ -10,13 +10,14 @@ from unittest.mock import patch
 
 from django.test import TestCase, override_settings
 
-from ..models import GitHubRepository, PullRequestAnalysis
+from ..models import GitHubRepository, PullRequestAnalysis, RepositoryIndex
 from ..services.github_client import GitHubAPIError, GitHubAuthError, GitHubRateLimitError
-from ..tasks import MAX_RETRIES, process_pull_request_webhook
+from ..tasks import MAX_RETRIES, build_repository_index, process_pull_request_webhook, process_push_webhook
 from .factories import make_integration, make_pr_analysis, make_repository, make_user, make_webhook_event
 
 _PATCHED_SERVICE = 'github_integration.tasks.PRAnalysisService'
 _PATCHED_COMMENTS = 'github_integration.tasks.CommentService'
+_PATCHED_INDEX_SERVICE = 'github_integration.tasks.RepositoryIndexService'
 
 # Task.apply()'s automatic retry-recursion (retval.sig.apply(retries=retries+1)
 # in celery/app/task.py) only kicks in when the Retry exception is captured
@@ -202,3 +203,131 @@ class UnexpectedErrorTests(_TaskTestCase):
         pr_analysis = PullRequestAnalysis.objects.get(repository__repository_id=2001)
         self.assertEqual(pr_analysis.status, PullRequestAnalysis.Status.FAILED)
         self.assertIn('completely unexpected', pr_analysis.error)
+
+
+class BuildRepositoryIndexMissingRepositoryTests(_TaskTestCase):
+    def test_missing_repository_id_returns_without_raising(self):
+        result = build_repository_index.apply(args=[999999], throw=False)
+        self.assertFalse(result.failed())
+
+    def test_deselected_repository_is_a_noop(self):
+        integration = make_integration(make_user())
+        repository = make_repository(integration, repository_id=2001, is_active=False)
+
+        result = build_repository_index.apply(args=[repository.id], throw=False)
+
+        self.assertFalse(result.failed())
+        self.assertEqual(RepositoryIndex.objects.count(), 0)
+
+
+class BuildRepositoryIndexHappyPathTests(_TaskTestCase):
+    @patch(_PATCHED_INDEX_SERVICE)
+    def test_calls_build_once_with_the_repository(self, mock_service_cls):
+        integration = make_integration(make_user())
+        repository = make_repository(integration, repository_id=2001, is_active=True)
+
+        build_repository_index.apply(args=[repository.id], throw=False)
+
+        mock_service_cls.return_value.build.assert_called_once_with(repository)
+
+
+class BuildRepositoryIndexAuthErrorTests(_TaskTestCase):
+    @patch(_PATCHED_INDEX_SERVICE)
+    def test_auth_error_marks_integration_invalid_and_index_failed_without_retry(self, mock_service_cls):
+        integration = make_integration(make_user())
+        repository = make_repository(integration, repository_id=2001, is_active=True)
+        mock_service_cls.return_value.build.side_effect = GitHubAuthError('revoked', 401)
+
+        build_repository_index.apply(args=[repository.id], throw=False)
+
+        self.assertEqual(mock_service_cls.return_value.build.call_count, 1)
+        integration.refresh_from_db()
+        self.assertTrue(integration.token_invalid)
+        index = RepositoryIndex.objects.get(repository=repository)
+        self.assertEqual(index.status, RepositoryIndex.Status.FAILED)
+
+
+class BuildRepositoryIndexRateLimitRetryTests(_TaskTestCase):
+    @patch(_PATCHED_INDEX_SERVICE)
+    def test_retries_then_permanently_fails_after_max_retries(self, mock_service_cls):
+        integration = make_integration(make_user())
+        repository = make_repository(integration, repository_id=2001, is_active=True)
+        mock_service_cls.return_value.build.side_effect = GitHubRateLimitError('limited', reset_at=None)
+
+        build_repository_index.apply(args=[repository.id], throw=False)
+
+        self.assertEqual(mock_service_cls.return_value.build.call_count, MAX_RETRIES + 1)
+        index = RepositoryIndex.objects.get(repository=repository)
+        self.assertEqual(index.status, RepositoryIndex.Status.FAILED)
+
+
+class BuildRepositoryIndexGenericAPIErrorTests(_TaskTestCase):
+    @patch(_PATCHED_INDEX_SERVICE)
+    def test_retries_with_backoff_then_permanently_fails(self, mock_service_cls):
+        integration = make_integration(make_user())
+        repository = make_repository(integration, repository_id=2001, is_active=True)
+        mock_service_cls.return_value.build.side_effect = GitHubAPIError('down', 500)
+
+        build_repository_index.apply(args=[repository.id], throw=False)
+
+        self.assertEqual(mock_service_cls.return_value.build.call_count, MAX_RETRIES + 1)
+        index = RepositoryIndex.objects.get(repository=repository)
+        self.assertEqual(index.status, RepositoryIndex.Status.FAILED)
+
+
+class BuildRepositoryIndexUnexpectedErrorTests(_TaskTestCase):
+    @patch(_PATCHED_INDEX_SERVICE)
+    def test_unexpected_exception_fails_immediately_without_retry(self, mock_service_cls):
+        integration = make_integration(make_user())
+        repository = make_repository(integration, repository_id=2001, is_active=True)
+        mock_service_cls.return_value.build.side_effect = ValueError('completely unexpected')
+
+        build_repository_index.apply(args=[repository.id], throw=False)
+
+        self.assertEqual(mock_service_cls.return_value.build.call_count, 1)
+        index = RepositoryIndex.objects.get(repository=repository)
+        self.assertEqual(index.status, RepositoryIndex.Status.FAILED)
+        self.assertIn('completely unexpected', index.error)
+
+
+_PATCHED_BUILD_INDEX = 'github_integration.tasks.build_repository_index'
+
+
+class ProcessPushWebhookMissingEventTests(_TaskTestCase):
+    def test_missing_webhook_event_id_returns_without_raising(self):
+        result = process_push_webhook.apply(args=[999999], throw=False)
+        self.assertFalse(result.failed())
+
+
+class ProcessPushWebhookUnmonitoredRepositoryTests(_TaskTestCase):
+    @patch(_PATCHED_BUILD_INDEX)
+    def test_repository_not_found_marks_event_processed_without_queuing_index_build(self, mock_build_index):
+        event = make_webhook_event(event_type='push', repository_id=404404)
+        process_push_webhook.apply(args=[event.id], throw=False)
+        event.refresh_from_db()
+        self.assertTrue(event.processed)
+        mock_build_index.delay.assert_not_called()
+
+    @patch(_PATCHED_BUILD_INDEX)
+    def test_deselected_repository_is_treated_as_unmonitored(self, mock_build_index):
+        integration = make_integration(make_user())
+        make_repository(integration, repository_id=2001, is_active=False)
+        event = make_webhook_event(event_type='push', repository_id=2001)
+        process_push_webhook.apply(args=[event.id], throw=False)
+        event.refresh_from_db()
+        self.assertTrue(event.processed)
+        mock_build_index.delay.assert_not_called()
+
+
+class ProcessPushWebhookHappyPathTests(_TaskTestCase):
+    @patch(_PATCHED_BUILD_INDEX)
+    def test_queues_index_rebuild_for_monitored_repository_and_marks_event_processed(self, mock_build_index):
+        integration = make_integration(make_user())
+        repository = make_repository(integration, repository_id=2001, is_active=True)
+        event = make_webhook_event(event_type='push', repository_id=2001)
+
+        process_push_webhook.apply(args=[event.id], throw=False)
+
+        mock_build_index.delay.assert_called_once_with(repository.id)
+        event.refresh_from_db()
+        self.assertTrue(event.processed)
