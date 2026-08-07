@@ -1,0 +1,108 @@
+# Render Blueprint - https://render.com/docs/blueprint-spec
+#
+# Deploys the Django backend (web service), the Celery worker that powers
+# async GitHub PR review, and a managed Redis instance for the Celery
+# broker/result backend. Run via Render's dashboard: New > Blueprint,
+# pointing at this repo.
+#
+# NOTE: Render's Blueprint schema (especially the managed Redis/"Key Value"
+# service type's exact field names) has changed over time. Treat this file as
+# a solid starting point, not guaranteed-correct - check it against Render's
+# current Blueprint docs the first time you run it, since this couldn't be
+# tested against Render's actual API from here.
+#
+# Every `sync: false` env var is a secret/deployment-specific value you must
+# set yourself in the Render dashboard after the blueprint creates the
+# service - never put real secrets in this file, which is committed to git.
+
+envVarGroups:
+  - name: code-analyzer-shared
+    envVars:
+      - key: SECRET_KEY
+        sync: false
+      - key: DATABASE_URL_PROD
+        sync: false
+      - key: FRONTEND_URL
+        sync: false
+      - key: COOKIE_DOMAIN
+        sync: false
+      - key: DEFAULT_FROM_EMAIL
+        sync: false
+      - key: EMAIL_HOST_USER
+        sync: false
+      - key: EMAIL_HOST_PASSWORD
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
+      - key: GITHUB_OAUTH_REDIRECT_URI
+        sync: false
+      - key: GITHUB_WEBHOOK_SECRET
+        sync: false
+      - key: GITHUB_WEBHOOK_BASE_URL
+        sync: false
+      - key: GITHUB_TOKEN_ENCRYPTION_KEY
+        sync: false
+
+services:
+  - type: web
+    name: code-analyzer-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: starter
+    healthCheckPath: /api/health/
+    envVars:
+      - fromGroup: code-analyzer-shared
+      - key: ENVIRONMENT
+        value: production
+      - key: ALLOWED_HOSTS
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: keyvalue
+          name: code-analyzer-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: keyvalue
+          name: code-analyzer-redis
+          property: connectionString
+
+  - type: worker
+    name: code-analyzer-celery-worker
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: celery -A config worker --loglevel=info
+    plan: starter
+    envVars:
+      - fromGroup: code-analyzer-shared
+      - key: ENVIRONMENT
+        value: production
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: keyvalue
+          name: code-analyzer-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: keyvalue
+          name: code-analyzer-redis
+          property: connectionString
+
+  - type: keyvalue
+    name: code-analyzer-redis
+    plan: starter
+    ipAllowList: []

@@ -85,6 +85,16 @@ AUTH_COOKIE_SAMESITE = 'None' if ENVIRONMENT == 'production' else 'Lax'
 CSRF_COOKIE_SAMESITE = AUTH_COOKIE_SAMESITE
 # CSRF_TRUSTED_ORIGINS is set below, once CORS_ALLOWED_ORIGINS exists.
 
+# Only needed once frontend/backend are deployed as subdomains of one domain
+# (e.g. api.example.com / app.example.com, as opposed to dev's same-site
+# different-port setup) - makes the csrftoken cookie visible to frontend JS
+# across the subdomain boundary (see the paragraph above: without this it's
+# host-only, so document.cookie on app.example.com never sees a cookie set by
+# api.example.com, and every mutating request 403s "CSRF token missing").
+# Leading dot is the traditional "this domain and all subdomains" form; left
+# unset (the default), cookies stay host-only, correct for dev.
+CSRF_COOKIE_DOMAIN = os.environ.get('COOKIE_DOMAIN') or None
+
 
 # Application definition
 
