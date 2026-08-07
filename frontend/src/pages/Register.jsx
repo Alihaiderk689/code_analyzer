@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { GoogleLogin } from '@react-oauth/google'
+import { useGoogleLogin } from '@react-oauth/google'
 import { registerUser, getGithubAuthLoginUrl } from '../lib/resources'
 import { useAuth } from '../lib/AuthContext'
 import { ApiError } from '../lib/api'
 import PasswordChecklist from '../components/PasswordChecklist'
 import GitHubIcon from '../components/GitHubIcon'
+import GoogleIcon from '../components/GoogleIcon'
 import {
   validateName,
   validateEmail,
@@ -27,15 +28,33 @@ export default function Register() {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
   const [githubBusy, setGithubBusy] = useState(false)
+  const [googleBusy, setGoogleBusy] = useState(false)
 
-  const handleGoogleSuccess = async (credentialResponse) => {
+  // Classic OAuth popup flow (not Google Identity Services' rendered button)
+  // so the account chooser always shows - see Login.jsx's identical comment.
+  const googleLoginPopup = useGoogleLogin({
+    onSuccess: async (tokenResponse) => {
+      setError('')
+      try {
+        const { isAdmin } = await loginWithGoogle(tokenResponse.access_token)
+        navigate(isAdmin ? '/admin' : '/dashboard', { replace: true })
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : 'Google sign-in failed. Please try again.')
+      } finally {
+        setGoogleBusy(false)
+      }
+    },
+    onError: () => {
+      setError('Google sign-in failed. Please try again.')
+      setGoogleBusy(false)
+    },
+    onNonOAuthError: () => setGoogleBusy(false),
+  })
+
+  const handleGoogleLogin = () => {
     setError('')
-    try {
-      const { isAdmin } = await loginWithGoogle(credentialResponse.credential)
-      navigate(isAdmin ? '/admin' : '/dashboard', { replace: true })
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Google sign-in failed. Please try again.')
-    }
+    setGoogleBusy(true)
+    googleLoginPopup()
   }
 
   const handleGithubLogin = async () => {
@@ -156,11 +175,29 @@ export default function Register() {
             or continue with Google
             <div style={{ flex: 1, height: 1, background: 'var(--color-border)' }} />
           </div>
-          <GoogleLogin
-            onSuccess={handleGoogleSuccess}
-            onError={() => setError('Google sign-in failed. Please try again.')}
-            width={308}
-          />
+          <button
+            type="button"
+            onClick={handleGoogleLogin}
+            disabled={googleBusy}
+            style={{
+              width: 308,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 8,
+              padding: '10px 14px',
+              borderRadius: 10,
+              border: '1px solid var(--color-border-2)',
+              background: 'var(--color-surface)',
+              color: 'var(--color-text)',
+              fontSize: 14,
+              fontWeight: 500,
+              cursor: 'pointer',
+            }}
+          >
+            <GoogleIcon size={18} />
+            {googleBusy ? 'Signing in…' : 'Sign in with Google'}
+          </button>
           <button
             type="button"
             onClick={handleGithubLogin}

@@ -10,7 +10,7 @@ from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .google_auth import GoogleTokenError, verify_google_id_token
+from .google_auth import GoogleTokenError, verify_google_access_token
 from .validators import (
     normalize_email,
     validate_password_strength,
@@ -87,16 +87,17 @@ class EmailLoginSerializer(serializers.Serializer):
 
 
 class GoogleLoginSerializer(serializers.Serializer):
-    """Verifies a Google Identity Services ID token and finds-or-creates the
-    matching User, then mints tokens exactly like EmailLoginSerializer does.
-    Serves both login and signup - the caller doesn't need to know which one
-    it'll turn out to be."""
+    """Verifies a Google OAuth access token (from the classic popup flow, see
+    google_auth.py's module docstring for why not an ID token) and
+    finds-or-creates the matching User, then mints tokens exactly like
+    EmailLoginSerializer does. Serves both login and signup - the caller
+    doesn't need to know which one it'll turn out to be."""
 
-    credential = serializers.CharField(write_only=True)
+    access_token = serializers.CharField(write_only=True)
 
     def validate(self, attrs):
         try:
-            claims = verify_google_id_token(attrs['credential'])
+            claims = verify_google_access_token(attrs['access_token'])
         except GoogleTokenError:
             raise serializers.ValidationError('Invalid Google credential.')
 

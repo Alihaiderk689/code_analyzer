@@ -1,11 +1,12 @@
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.core import mail
 from django.core.cache import cache
+from django.core.exceptions import ImproperlyConfigured
 from django.core.signing import dumps as signing_dumps
-from django.test import override_settings
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
@@ -16,7 +17,7 @@ from core.throttling import LoginRateThrottle
 from github_integration.services.oauth_service import _STATE_SALT
 
 from .cookies import ACCESS_COOKIE, REFRESH_COOKIE
-from .google_auth import GoogleTokenError
+from .google_auth import GoogleTokenError, verify_google_access_token
 from .tokens import email_verification_token
 
 User = get_user_model()
@@ -115,9 +116,9 @@ GOOGLE_CLAIMS = {
 class GoogleLoginTests(APITestCase):
     url = reverse('auth-google-login')
 
-    @patch('accounts.serializers.verify_google_id_token', return_value=GOOGLE_CLAIMS)
+    @patch('accounts.serializers.verify_google_access_token', return_value=GOOGLE_CLAIMS)
     def test_new_user_created_and_cookies_set(self, mock_verify):
-        response = self.client.post(self.url, {'credential': 'fake'})
+        response = self.client.post(self.url, {'access_token': 'fake'})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertNotIn('access', response.data)
@@ -129,48 +130,103 @@ class GoogleLoginTests(APITestCase):
         self.assertEqual(user.first_name, 'Ada')
         self.assertTrue(response.cookies[ACCESS_COOKIE]['httponly'])
 
-    @patch('accounts.serializers.verify_google_id_token', return_value=GOOGLE_CLAIMS)
+    @patch('accounts.serializers.verify_google_access_token', return_value=GOOGLE_CLAIMS)
     def test_auto_links_existing_verified_email(self, mock_verify):
         make_user(email='g@example.com', verified=False)
-        response = self.client.post(self.url, {'credential': 'fake'})
+        response = self.client.post(self.url, {'access_token': 'fake'})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         user = User.objects.get(email='g@example.com')
         self.assertEqual(user.profile.google_id, 'google-sub-123')
         self.assertTrue(user.profile.is_verified)
 
-    @patch('accounts.serializers.verify_google_id_token', return_value=GOOGLE_CLAIMS)
+    @patch('accounts.serializers.verify_google_access_token', return_value=GOOGLE_CLAIMS)
     def test_repeat_login_reuses_same_user(self, mock_verify):
-        self.client.post(self.url, {'credential': 'fake'})
-        response = self.client.post(self.url, {'credential': 'fake'})
+        self.client.post(self.url, {'access_token': 'fake'})
+        response = self.client.post(self.url, {'access_token': 'fake'})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(User.objects.filter(email='g@example.com').count(), 1)
 
     @patch(
-        'accounts.serializers.verify_google_id_token',
+        'accounts.serializers.verify_google_access_token',
         return_value={**GOOGLE_CLAIMS, 'email_verified': False},
     )
     def test_unverified_email_does_not_autolink(self, mock_verify):
         make_user(email='g@example.com')
-        response = self.client.post(self.url, {'credential': 'fake'})
+        response = self.client.post(self.url, {'access_token': 'fake'})
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIsNone(User.objects.get(email='g@example.com').profile.google_id)
 
-    @patch('accounts.serializers.verify_google_id_token')
+    @patch('accounts.serializers.verify_google_access_token')
     def test_conflicting_google_id_rejected(self, mock_verify):
         mock_verify.return_value = GOOGLE_CLAIMS
-        self.client.post(self.url, {'credential': 'fake'})  # links google-sub-123 to g@example.com
+        self.client.post(self.url, {'access_token': 'fake'})  # links google-sub-123 to g@example.com
 
         mock_verify.return_value = {**GOOGLE_CLAIMS, 'sub': 'google-sub-999'}
-        response = self.client.post(self.url, {'credential': 'fake2'})
+        response = self.client.post(self.url, {'access_token': 'fake2'})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    @patch('accounts.serializers.verify_google_id_token', side_effect=GoogleTokenError('bad token'))
+    @patch('accounts.serializers.verify_google_access_token', side_effect=GoogleTokenError('bad token'))
     def test_invalid_credential_rejected(self, mock_verify):
-        response = self.client.post(self.url, {'credential': 'garbage'})
+        response = self.client.post(self.url, {'access_token': 'garbage'})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+@override_settings(GOOGLE_CLIENT_ID='test-google-client-id')
+class VerifyGoogleAccessTokenTests(TestCase):
+    """Direct unit tests for verify_google_access_token itself (the two-call
+    tokeninfo+userinfo flow), not just the serializer-level mock
+    GoogleLoginTests above uses."""
+
+    @staticmethod
+    def _mock_response(ok=True, json_data=None):
+        response = Mock()
+        response.ok = ok
+        response.json.return_value = json_data or {}
+        return response
+
+    @patch('accounts.google_auth.requests.get')
+    def test_returns_claims_on_success(self, mock_get):
+        mock_get.side_effect = [
+            self._mock_response(json_data={'aud': 'test-google-client-id', 'sub': '123'}),
+            self._mock_response(json_data={
+                'sub': '123', 'email': 'g@example.com', 'email_verified': True,
+                'given_name': 'Ada', 'family_name': 'Lovelace',
+            }),
+        ]
+        claims = verify_google_access_token('token123')
+        self.assertEqual(claims, {
+            'sub': '123', 'email': 'g@example.com', 'email_verified': True,
+            'given_name': 'Ada', 'family_name': 'Lovelace',
+        })
+
+    @patch('accounts.google_auth.requests.get')
+    def test_wrong_audience_rejected(self, mock_get):
+        mock_get.return_value = self._mock_response(json_data={'aud': 'someone-elses-client-id', 'sub': '123'})
+        with self.assertRaises(GoogleTokenError):
+            verify_google_access_token('token123')
+
+    @patch('accounts.google_auth.requests.get')
+    def test_invalid_tokeninfo_response_rejected(self, mock_get):
+        mock_get.return_value = self._mock_response(ok=False)
+        with self.assertRaises(GoogleTokenError):
+            verify_google_access_token('token123')
+
+    @patch('accounts.google_auth.requests.get')
+    def test_userinfo_failure_rejected(self, mock_get):
+        mock_get.side_effect = [
+            self._mock_response(json_data={'aud': 'test-google-client-id', 'sub': '123'}),
+            self._mock_response(ok=False),
+        ]
+        with self.assertRaises(GoogleTokenError):
+            verify_google_access_token('token123')
+
+    @override_settings(GOOGLE_CLIENT_ID='')
+    def test_raises_when_not_configured(self):
+        with self.assertRaises(ImproperlyConfigured):
+            verify_google_access_token('token123')
 
 
 _GITHUB_OAUTH_SETTINGS = dict(GITHUB_CLIENT_ID='test-client-id', GITHUB_CLIENT_SECRET='test-secret')
