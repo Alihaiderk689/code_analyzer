@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState, useCallback } from 'react'
 import { primeCsrf, ApiError } from './api'
-import { loginUser, logoutUser, fetchProfile, updateProfile, adminStats } from './resources'
+import { loginUser, logoutUser, fetchProfile, updateProfile, adminStats, googleLogin } from './resources'
 
 // The profile endpoint never returns is_staff, so the only reliable way to know
 // whether the current user is an admin is to probe an admin-only endpoint and see
@@ -80,6 +80,16 @@ export function AuthProvider({ children }) {
     return { user: finalUser, isAdmin: admin }
   }, [])
 
+  // Google already gives us a verified email + name up front, so there's no
+  // pending-name staging to apply here the way email/password login does.
+  const loginWithGoogle = useCallback(async (credential) => {
+    const data = await googleLogin(credential)
+    setUser(data.user)
+    const admin = await checkIsAdmin()
+    setIsAdmin(admin)
+    return { user: data.user, isAdmin: admin }
+  }, [])
+
   const logout = useCallback(async () => {
     try {
       await logoutUser()
@@ -97,7 +107,9 @@ export function AuthProvider({ children }) {
   }, [])
 
   return (
-    <AuthContext.Provider value={{ user, isAdmin, initializing, login, logout, refreshUser, setUser }}>
+    <AuthContext.Provider
+      value={{ user, isAdmin, initializing, login, loginWithGoogle, logout, refreshUser, setUser }}
+    >
       {children}
     </AuthContext.Provider>
   )

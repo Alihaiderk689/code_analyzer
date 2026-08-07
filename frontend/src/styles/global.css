@@ -73,6 +73,7 @@ button {
   background: none;
   border: none;
   color: var(--color-text);
+  cursor: pointer;
 }
 .btn-block {
   width: 100%;
@@ -160,31 +161,6 @@ button {
   align-items: center;
   gap: 10px;
   cursor: pointer;
-}
-.logo-mark {
-  width: 28px;
-  height: 28px;
-  border-radius: 7px;
-  background: var(--color-text);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.logo-mark::after {
-  content: '';
-  width: 10px;
-  height: 10px;
-  border-radius: 2px;
-  background: var(--color-accent);
-}
-.logo-mark.sm {
-  width: 26px;
-  height: 26px;
-}
-.logo-mark.sm::after {
-  width: 9px;
-  height: 9px;
 }
 .logo-word {
   font-size: 18px;

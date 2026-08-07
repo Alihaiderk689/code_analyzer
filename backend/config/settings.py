@@ -229,6 +229,14 @@ CELERY_TASK_TIME_LIMIT = 300
 CELERY_TASK_ALWAYS_EAGER = os.environ.get('CELERY_TASK_ALWAYS_EAGER', '').lower() == 'true'
 CELERY_TASK_EAGER_PROPAGATES = True
 
+# Google Sign-In: Google Identity Services on the frontend hands us a signed
+# ID token, which accounts/google_auth.py verifies server-side against this
+# client ID. Deliberately no GOOGLE_CLIENT_SECRET, unlike the GitHub OAuth App
+# below - this is ID-token verification, not a redirect/code-exchange flow,
+# and OAuth client IDs aren't secret (they ship inside the public frontend
+# bundle by design). Optional at startup, same as GITHUB_CLIENT_ID below.
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
+
 # GitHub OAuth App (https://github.com/settings/developers - "OAuth Apps", not
 # a GitHub App) + webhook secret + the key used to encrypt stored access
 # tokens at rest. All optional at startup - endpoints that need one of these

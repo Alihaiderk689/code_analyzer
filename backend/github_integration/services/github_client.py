@@ -53,12 +53,21 @@ class GitHubRateLimitError(GitHubAPIError):
         self.reset_at = reset_at
 
 
-def build_authorize_url(state: str) -> str:
+# Full scope needed to analyze repos/PRs - the default for build_authorize_url()
+# below, used by the repo-connect flow. The login/signup flow passes a
+# narrower scope explicitly (see oauth_service.build_authorize_url_for_login)
+# so a user who "just wants to log in" isn't shown a broad repo-access
+# consent screen - GitHub's `scope` is a per-request parameter, not fixed by
+# the OAuth App, so both call sites can share one Client ID/Secret/callback.
+DEFAULT_OAUTH_SCOPE = 'repo admin:repo_hook read:user user:email'
+
+
+def build_authorize_url(state: str, scope: str = DEFAULT_OAUTH_SCOPE) -> str:
     from urllib.parse import urlencode
     params = {
         'client_id': settings.GITHUB_CLIENT_ID,
         'redirect_uri': settings.GITHUB_OAUTH_REDIRECT_URI,
-        'scope': 'repo admin:repo_hook read:user user:email',
+        'scope': scope,
         'state': state,
         'allow_signup': 'true',
     }
@@ -169,6 +178,18 @@ class GitHubClient:
 
     def get_authenticated_user(self) -> dict:
         return self._request('GET', '/user').json()
+
+    def get_primary_verified_email(self) -> Optional[str]:
+        """`/user`'s own `email` field is frequently null (private-by-default)
+        or, if present, isn't guaranteed to be the verified primary one - the
+        login flow needs a real answer to "is this email actually theirs and
+        verified", which only `/user/emails` (requires the `user:email`
+        scope) can give."""
+        emails = self._request('GET', '/user/emails').json()
+        for entry in emails:
+            if entry.get('primary') and entry.get('verified'):
+                return entry['email']
+        return None
 
     # ---- Repositories -------------------------------------------------------------------
 
