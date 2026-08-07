@@ -169,8 +169,14 @@ class PRAnalysisServiceTests(TestCase):
         self.assertEqual(performance_issues[0]['type'], 'requests_no_timeout')
         self.assertEqual(performance_issues[0]['severity'], 'medium')
 
+    @patch('analyses.engine.sandbox.run_python', return_value={'status': 'ok'})
     @patch('github_integration.services.pr_analysis_service.GitHubClient')
-    def test_updates_pr_analysis_score_summary_and_status(self, mock_client_cls):
+    def test_updates_pr_analysis_score_summary_and_status(self, mock_client_cls, mock_run_python):
+        # The sandbox runtime check (analyses/sandbox.py) is macOS-only - on
+        # any other host it reports 'unavailable', which engine.py surfaces
+        # as an extra zero-penalty informational issue. Mocked to 'ok' here
+        # so this test's "clean file -> no issues" expectation holds
+        # regardless of which OS actually runs it (e.g. Linux CI vs macOS).
         mock_client_cls.return_value.list_pull_request_files.return_value = [
             {'filename': 'app.py', 'status': 'modified', 'patch': _PATCH_FOR_CLEAN_FILE},
         ]
