@@ -1,4 +1,5 @@
 import { Link, useNavigate } from 'react-router-dom'
+import LogoMark from './LogoMark'
 
 export default function MarketingNav() {
   const navigate = useNavigate()
@@ -14,7 +15,7 @@ export default function MarketingNav() {
       }}
     >
       <div className="logo" onClick={() => navigate('/')}>
-        <div className="logo-mark" />
+        <LogoMark size={28} />
         <span className="logo-word">Code Analyzer</span>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 36, fontSize: 15, color: '#3f3f3c' }}>

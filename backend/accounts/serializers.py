@@ -4,11 +4,13 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.models import update_last_login
 from django.contrib.auth.password_validation import validate_password
 from django.contrib.auth.tokens import default_token_generator
+from django.db import IntegrityError, transaction
 from django.utils.encoding import DjangoUnicodeDecodeError, force_str
 from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from .google_auth import GoogleTokenError, verify_google_id_token
 from .validators import (
     normalize_email,
     validate_password_strength,
@@ -69,6 +71,81 @@ class EmailLoginSerializer(serializers.Serializer):
         user = User.objects.filter(email__iexact=attrs['email']).first()
         if user is None or not user.is_active or not user.check_password(attrs['password']):
             raise serializers.ValidationError('No active account found with the given credentials.')
+
+        update_last_login(None, user)
+        refresh = RefreshToken.for_user(user)
+        return {
+            'refresh': str(refresh),
+            'access': str(refresh.access_token),
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'is_verified': user.profile.is_verified,
+            },
+        }
+
+
+class GoogleLoginSerializer(serializers.Serializer):
+    """Verifies a Google Identity Services ID token and finds-or-creates the
+    matching User, then mints tokens exactly like EmailLoginSerializer does.
+    Serves both login and signup - the caller doesn't need to know which one
+    it'll turn out to be."""
+
+    credential = serializers.CharField(write_only=True)
+
+    def validate(self, attrs):
+        try:
+            claims = verify_google_id_token(attrs['credential'])
+        except GoogleTokenError:
+            raise serializers.ValidationError('Invalid Google credential.')
+
+        google_id = claims['sub']
+        email = normalize_email(claims['email'])
+        email_verified = claims.get('email_verified', False)
+
+        user = User.objects.filter(profile__google_id=google_id).first()
+
+        if user is None:
+            # First time we've seen this Google sub - only auto-link/create
+            # off the email claim if Google itself vouches it's verified,
+            # otherwise anyone could claim an arbitrary email address.
+            if not email_verified:
+                raise serializers.ValidationError(
+                    "Google reports this email isn't verified. Verify it with Google, "
+                    "or sign in with a password if you already have an account."
+                )
+
+            existing = User.objects.filter(email__iexact=email).first()
+            if existing is not None:
+                if existing.profile.google_id and existing.profile.google_id != google_id:
+                    raise serializers.ValidationError('This account is linked to a different Google account.')
+                user = existing
+                user.profile.google_id = google_id
+                if not user.profile.is_verified:
+                    user.profile.is_verified = True
+                user.profile.save(update_fields=['google_id', 'is_verified'])
+            else:
+                try:
+                    with transaction.atomic():
+                        user = User(
+                            username=_generate_username(email),
+                            email=email,
+                            first_name=claims.get('given_name', '') or '',
+                            last_name=claims.get('family_name', '') or '',
+                        )
+                        user.set_unusable_password()
+                        user.save()
+                        user.profile.google_id = google_id
+                        user.profile.is_verified = True
+                        user.profile.save(update_fields=['google_id', 'is_verified'])
+                except IntegrityError:
+                    # Concurrent duplicate first-login (e.g. a double-click)
+                    # racing on the google_id unique constraint.
+                    raise serializers.ValidationError('Something went wrong. Please try again.')
+
+        if not user.is_active:
+            raise serializers.ValidationError('This account is inactive.')
 
         update_last_login(None, user)
         refresh = RefreshToken.for_user(user)

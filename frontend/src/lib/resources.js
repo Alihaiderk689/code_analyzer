@@ -10,6 +10,18 @@ export const registerUser = (email, password, password2) =>
 export const loginUser = (email, password) =>
   apiFetch('/auth/login/', { method: 'POST', auth: false, body: { email, password } })
 
+// Serves both login and signup - the backend finds-or-creates the user from
+// the verified Google ID token, so the frontend doesn't need to know which
+// one it'll turn out to be.
+export const googleLogin = (credential) =>
+  apiFetch('/auth/google/', { method: 'POST', auth: false, body: { credential } })
+
+// Kicks off the redirect-based GitHub OAuth flow (no ID-token shortcut like
+// Google's) - the frontend navigates the browser to the returned
+// authorize_url; GitHub eventually redirects back with the session already
+// established via cookies, same as every other login method.
+export const getGithubAuthLoginUrl = () => apiFetch('/auth/github/', { auth: false })
+
 // No refresh token to send - the backend reads it from its own httpOnly cookie.
 export const logoutUser = () => apiFetch('/auth/logout/', { method: 'POST' })
 

@@ -7,6 +7,14 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework_simplejwt.tokens import RefreshToken
+
+from accounts.cookies import GITHUB_LOGIN_NONCE_COOKIE, clear_github_login_nonce_cookie, set_auth_cookies
+from accounts.github_auth import (
+    GitHubAccountConflictError,
+    GitHubAccountNotEmailVerifiedError,
+    find_or_create_user_from_github,
+)
 
 from .models import GitHubIntegration
 from .serializers import GitHubIntegrationSerializer
@@ -37,25 +45,44 @@ class GitHubCallbackView(APIView):
     """GET /api/github/callback/ - GitHub redirects the browser here directly
     (see oauth_service's module docstring for why this can't use JWT auth).
     Always ends in an HTTP redirect back into the SPA, success or failure -
-    a raw JSON/DRF response here would strand the user on a bare API URL."""
+    a raw JSON/DRF response here would strand the user on a bare API URL.
+
+    Serves TWO unrelated flows through this one callback, since a GitHub
+    OAuth App only supports a single registered callback URL: an
+    already-authenticated user connecting a repo (`purpose=link`, the
+    original behavior) and an unauthenticated user logging in/signing up
+    (`purpose=login`, new) - disambiguated via the signed `state` payload,
+    never via request auth state (there isn't any reliable auth state on a
+    plain top-level GET redirect)."""
 
     permission_classes = [AllowAny]
     authentication_classes = []
 
     def get(self, request):
-        frontend_target = f'{settings.FRONTEND_URL}/github'
+        state = request.query_params.get('state')
+        is_login = GitHubOAuthService.peek_state_purpose(state) == 'login'
+        frontend_target = f'{settings.FRONTEND_URL}/login' if is_login else f'{settings.FRONTEND_URL}/github'
 
+        response = self._handle(request, state, is_login, frontend_target)
+        if is_login:
+            # Single-use regardless of outcome - a stale nonce cookie must
+            # never be reusable for a second callback attempt.
+            clear_github_login_nonce_cookie(response)
+        return response
+
+    def _handle(self, request, state, is_login, frontend_target):
         error_from_github = request.query_params.get('error')
         if error_from_github:
             logger.info('github_oauth.user_denied_access', extra={'error': error_from_github})
             return redirect(f'{frontend_target}?error=access_denied')
 
         code = request.query_params.get('code')
-        state = request.query_params.get('state')
         if not code:
             return redirect(f'{frontend_target}?error=missing_code')
 
         try:
+            if is_login:
+                return self._complete_login(request, code, state)
             GitHubOAuthService().complete_oauth(code, state)
         except OAuthStateError as exc:
             logger.warning('github_oauth.invalid_state', extra={'error': str(exc)})
@@ -68,6 +95,30 @@ class GitHubCallbackView(APIView):
             return redirect(f'{frontend_target}?error=github_error')
 
         return redirect(f'{frontend_target}?connected=true')
+
+    def _complete_login(self, request, code, state):
+        """The find-or-create + cookie-issuing half of the login flow - kept
+        separate so the shared OAuthStateError/ImproperlyConfigured/
+        GitHubAPIError handling in _handle() still covers it (including the
+        nonce-mismatch case, which complete_login_oauth raises as
+        OAuthStateError), while its own account-linking errors
+        (email_not_verified, account_conflict) are handled here since they
+        don't apply to the link flow at all."""
+        login_target = f'{settings.FRONTEND_URL}/login'
+        expected_nonce = request.COOKIES.get(GITHUB_LOGIN_NONCE_COOKIE, '')
+        try:
+            claims = GitHubOAuthService().complete_login_oauth(code, state, expected_nonce)
+            user = find_or_create_user_from_github(claims)
+        except GitHubAccountNotEmailVerifiedError:
+            return redirect(f'{login_target}?error=email_not_verified')
+        except GitHubAccountConflictError:
+            return redirect(f'{login_target}?error=account_conflict')
+
+        refresh = RefreshToken.for_user(user)
+        target = f'{settings.FRONTEND_URL}/admin' if user.is_staff else f'{settings.FRONTEND_URL}/dashboard'
+        response = redirect(target)
+        set_auth_cookies(response, access=str(refresh.access_token), refresh=str(refresh))
+        return response
 
 
 class GitHubDisconnectView(APIView):

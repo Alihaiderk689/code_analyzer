@@ -1,8 +1,11 @@
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { registerUser } from '../lib/resources'
+import { GoogleLogin } from '@react-oauth/google'
+import { registerUser, getGithubAuthLoginUrl } from '../lib/resources'
+import { useAuth } from '../lib/AuthContext'
 import { ApiError } from '../lib/api'
 import PasswordChecklist from '../components/PasswordChecklist'
+import GitHubIcon from '../components/GitHubIcon'
 import {
   validateName,
   validateEmail,
@@ -13,6 +16,7 @@ import {
 
 export default function Register() {
   const navigate = useNavigate()
+  const { loginWithGoogle } = useAuth()
   const [firstName, setFirstName] = useState('')
   const [lastName, setLastName] = useState('')
   const [email, setEmail] = useState('')
@@ -22,6 +26,29 @@ export default function Register() {
   const [fieldErrors, setFieldErrors] = useState({})
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+  const [githubBusy, setGithubBusy] = useState(false)
+
+  const handleGoogleSuccess = async (credentialResponse) => {
+    setError('')
+    try {
+      const { isAdmin } = await loginWithGoogle(credentialResponse.credential)
+      navigate(isAdmin ? '/admin' : '/dashboard', { replace: true })
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Google sign-in failed. Please try again.')
+    }
+  }
+
+  const handleGithubLogin = async () => {
+    setError('')
+    setGithubBusy(true)
+    try {
+      const { authorize_url } = await getGithubAuthLoginUrl()
+      window.location.href = authorize_url
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Could not start GitHub sign-in.')
+      setGithubBusy(false)
+    }
+  }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -124,6 +151,39 @@ export default function Register() {
           <div style={{ fontSize: 12, color: 'var(--color-text-muted)', textAlign: 'center', marginTop: 4 }}>
             We'll send a verification link to your email.
           </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '4px 0', color: 'var(--color-text-secondary-2)', fontSize: 12 }}>
+            <div style={{ flex: 1, height: 1, background: 'var(--color-border)' }} />
+            or continue with Google
+            <div style={{ flex: 1, height: 1, background: 'var(--color-border)' }} />
+          </div>
+          <GoogleLogin
+            onSuccess={handleGoogleSuccess}
+            onError={() => setError('Google sign-in failed. Please try again.')}
+            width={308}
+          />
+          <button
+            type="button"
+            onClick={handleGithubLogin}
+            disabled={githubBusy}
+            style={{
+              width: 308,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              gap: 8,
+              padding: '10px 14px',
+              borderRadius: 10,
+              border: 'none',
+              background: '#24292f',
+              color: '#fff',
+              fontSize: 14,
+              fontWeight: 500,
+              cursor: 'pointer',
+            }}
+          >
+            <GitHubIcon size={18} />
+            {githubBusy ? 'Redirecting…' : 'Sign in with GitHub'}
+          </button>
         </form>
         <div style={{ textAlign: 'center', fontSize: 13, color: 'var(--color-text-secondary-2)', marginTop: 20 }}>
           Already have an account?{' '}
