@@ -66,3 +66,22 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+
+  # Only runs once backend+frontend CI passes, and only for pushes that land
+  # on main (a merged PR is a push to main, so this covers "every merge" too)
+  # - never for PRs or pushes to dev. `environment: production` is what pauses
+  # this job for the required reviewer configured on that GitHub Environment;
+  # Render's/Vercel's own auto-deploy-on-push must be turned off in their
+  # dashboards for this to be the only path to production, otherwise they'd
+  # deploy immediately on push regardless of this gate.
+  deploy:
+    needs: [backend, frontend]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Trigger Render deploy
+        run: curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+
+      - name: Trigger Vercel deploy
+        run: curl -fsS -X POST "${{ secrets.VERCEL_DEPLOY_HOOK_URL }}"
