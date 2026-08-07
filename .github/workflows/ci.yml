@@ -31,6 +31,12 @@ jobs:
       SECRET_KEY: ci-test-secret-key-not-for-production
       DATABASE_URL_DEV: postgresql://postgres:postgres@localhost:5432/code_analyzer_test
       ALLOWED_HOSTS: localhost,127.0.0.1
+      # Dummy key, CI-only - encrypts nothing that leaves this ephemeral test
+      # database. Needed because there's no .env file in CI (it's gitignored)
+      # for github_integration.services.encryption's _get_fernet() to read;
+      # locally this comes from backend/.env instead, which is why this gap
+      # never showed up in local test runs.
+      GITHUB_TOKEN_ENCRYPTION_KEY: 3NLZPInEcOu-N9qM-FycYJtmb7Yld46CS6nLe4B-f28=
     steps:
       - uses: actions/checkout@v4
 
