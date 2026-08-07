@@ -82,8 +82,8 @@ export function AuthProvider({ children }) {
 
   // Google already gives us a verified email + name up front, so there's no
   // pending-name staging to apply here the way email/password login does.
-  const loginWithGoogle = useCallback(async (credential) => {
-    const data = await googleLogin(credential)
+  const loginWithGoogle = useCallback(async (accessToken) => {
+    const data = await googleLogin(accessToken)
     setUser(data.user)
     const admin = await checkIsAdmin()
     setIsAdmin(admin)

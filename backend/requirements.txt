@@ -22,7 +22,6 @@ Django==4.2.30
 django-cors-headers==4.9.0
 djangorestframework==3.16.1
 djangorestframework_simplejwt==5.5.1
-google-auth==2.56.3
 groq==1.0.0
 gunicorn==23.0.0
 h11==0.16.0
@@ -43,8 +42,6 @@ psycopg2-binary==2.9.12
 pycparser==3.0
 pydantic==2.13.4
 pydantic_core==2.46.4
-pyasn1==0.6.4
-pyasn1_modules==0.4.2
 pyflakes==3.4.0
 Pygments==2.20.0
 pyHanko==0.35.2

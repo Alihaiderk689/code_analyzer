@@ -11,10 +11,10 @@ export const loginUser = (email, password) =>
   apiFetch('/auth/login/', { method: 'POST', auth: false, body: { email, password } })
 
 // Serves both login and signup - the backend finds-or-creates the user from
-// the verified Google ID token, so the frontend doesn't need to know which
-// one it'll turn out to be.
-export const googleLogin = (credential) =>
-  apiFetch('/auth/google/', { method: 'POST', auth: false, body: { credential } })
+// the verified Google access token, so the frontend doesn't need to know
+// which one it'll turn out to be.
+export const googleLogin = (accessToken) =>
+  apiFetch('/auth/google/', { method: 'POST', auth: false, body: { access_token: accessToken } })
 
 // Kicks off the redirect-based GitHub OAuth flow (no ID-token shortcut like
 // Google's) - the frontend navigates the browser to the returned

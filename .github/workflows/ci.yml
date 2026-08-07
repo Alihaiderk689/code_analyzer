@@ -31,6 +31,12 @@ jobs:
       SECRET_KEY: ci-test-secret-key-not-for-production
       DATABASE_URL_DEV: postgresql://postgres:postgres@localhost:5432/code_analyzer_test
       ALLOWED_HOSTS: localhost,127.0.0.1
+      # Dummy key, CI-only - encrypts nothing that leaves this ephemeral test
+      # database. Needed because there's no .env file in CI (it's gitignored)
+      # for github_integration.services.encryption's _get_fernet() to read;
+      # locally this comes from backend/.env instead, which is why this gap
+      # never showed up in local test runs.
+      GITHUB_TOKEN_ENCRYPTION_KEY: 3NLZPInEcOu-N9qM-FycYJtmb7Yld46CS6nLe4B-f28=
     steps:
       - uses: actions/checkout@v4
 
@@ -66,3 +72,22 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+
+  # Only runs once backend+frontend CI passes, and only for pushes that land
+  # on main (a merged PR is a push to main, so this covers "every merge" too)
+  # - never for PRs or pushes to dev. `environment: production` is what pauses
+  # this job for the required reviewer configured on that GitHub Environment;
+  # Render's/Vercel's own auto-deploy-on-push must be turned off in their
+  # dashboards for this to be the only path to production, otherwise they'd
+  # deploy immediately on push regardless of this gate.
+  deploy:
+    needs: [backend, frontend]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Trigger Render deploy
+        run: curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+
+      - name: Trigger Vercel deploy
+        run: curl -fsS -X POST "${{ secrets.VERCEL_DEPLOY_HOOK_URL }}"
