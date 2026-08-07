@@ -1,6 +1,7 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../lib/AuthContext'
 import { useTheme } from '../lib/ThemeContext'
+import LogoMark from './LogoMark'
 
 const NAV_LINKS = [
   { to: '/dashboard', label: 'Dashboard' },
@@ -15,6 +16,7 @@ export default function AppNav() {
   const { user, isAdmin, logout } = useAuth()
   const { theme, toggleTheme } = useTheme()
   const links = isAdmin ? [{ to: '/admin', label: 'Admin' }] : NAV_LINKS
+  const homeRoute = isAdmin ? '/admin' : '/dashboard'
 
   const displayName = user?.first_name || user?.username || user?.email || ''
   const initial = (displayName || 'U').charAt(0).toUpperCase()
@@ -35,8 +37,8 @@ export default function AppNav() {
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: 36 }}>
-        <div className="logo" onClick={() => navigate('/')}>
-          <div className="logo-mark sm" />
+        <div className="logo" onClick={() => navigate(homeRoute)}>
+          <LogoMark size={26} />
           <span style={{ fontSize: 16, fontWeight: 600 }}>Code Analyzer</span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 26, fontSize: 14 }}>

@@ -4,6 +4,8 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.core import mail
 from django.core.cache import cache
+from django.core.signing import dumps as signing_dumps
+from django.test import override_settings
 from django.urls import reverse
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
@@ -11,8 +13,10 @@ from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
 from core.throttling import LoginRateThrottle
+from github_integration.services.oauth_service import _STATE_SALT
 
 from .cookies import ACCESS_COOKIE, REFRESH_COOKIE
+from .google_auth import GoogleTokenError
 from .tokens import email_verification_token
 
 User = get_user_model()
@@ -97,6 +101,157 @@ class LoginTests(APITestCase):
         user.save(update_fields=['is_active'])
         response = self.client.post(self.url, {'email': 'inactive@example.com', 'password': 'TestPass123!'})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+GOOGLE_CLAIMS = {
+    'sub': 'google-sub-123',
+    'email': 'g@example.com',
+    'email_verified': True,
+    'given_name': 'Ada',
+    'family_name': 'Lovelace',
+}
+
+
+class GoogleLoginTests(APITestCase):
+    url = reverse('auth-google-login')
+
+    @patch('accounts.serializers.verify_google_id_token', return_value=GOOGLE_CLAIMS)
+    def test_new_user_created_and_cookies_set(self, mock_verify):
+        response = self.client.post(self.url, {'credential': 'fake'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertNotIn('access', response.data)
+        self.assertNotIn('refresh', response.data)
+        user = User.objects.get(email='g@example.com')
+        self.assertEqual(user.profile.google_id, 'google-sub-123')
+        self.assertTrue(user.profile.is_verified)
+        self.assertFalse(user.has_usable_password())
+        self.assertEqual(user.first_name, 'Ada')
+        self.assertTrue(response.cookies[ACCESS_COOKIE]['httponly'])
+
+    @patch('accounts.serializers.verify_google_id_token', return_value=GOOGLE_CLAIMS)
+    def test_auto_links_existing_verified_email(self, mock_verify):
+        make_user(email='g@example.com', verified=False)
+        response = self.client.post(self.url, {'credential': 'fake'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        user = User.objects.get(email='g@example.com')
+        self.assertEqual(user.profile.google_id, 'google-sub-123')
+        self.assertTrue(user.profile.is_verified)
+
+    @patch('accounts.serializers.verify_google_id_token', return_value=GOOGLE_CLAIMS)
+    def test_repeat_login_reuses_same_user(self, mock_verify):
+        self.client.post(self.url, {'credential': 'fake'})
+        response = self.client.post(self.url, {'credential': 'fake'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(User.objects.filter(email='g@example.com').count(), 1)
+
+    @patch(
+        'accounts.serializers.verify_google_id_token',
+        return_value={**GOOGLE_CLAIMS, 'email_verified': False},
+    )
+    def test_unverified_email_does_not_autolink(self, mock_verify):
+        make_user(email='g@example.com')
+        response = self.client.post(self.url, {'credential': 'fake'})
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIsNone(User.objects.get(email='g@example.com').profile.google_id)
+
+    @patch('accounts.serializers.verify_google_id_token')
+    def test_conflicting_google_id_rejected(self, mock_verify):
+        mock_verify.return_value = GOOGLE_CLAIMS
+        self.client.post(self.url, {'credential': 'fake'})  # links google-sub-123 to g@example.com
+
+        mock_verify.return_value = {**GOOGLE_CLAIMS, 'sub': 'google-sub-999'}
+        response = self.client.post(self.url, {'credential': 'fake2'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @patch('accounts.serializers.verify_google_id_token', side_effect=GoogleTokenError('bad token'))
+    def test_invalid_credential_rejected(self, mock_verify):
+        response = self.client.post(self.url, {'credential': 'garbage'})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+
+_GITHUB_OAUTH_SETTINGS = dict(GITHUB_CLIENT_ID='test-client-id', GITHUB_CLIENT_SECRET='test-secret')
+
+GITHUB_CLAIMS = {
+    'github_id': 4242,
+    'username': 'octocat',
+    'email': 'g@example.com',
+    'avatar_url': 'https://example.com/a.png',
+}
+
+
+def _github_login_state():
+    return signing_dumps({'purpose': 'login', 'nonce': 'test-nonce'}, salt=_STATE_SALT)
+
+
+@override_settings(**_GITHUB_OAUTH_SETTINGS)
+class GitHubLoginInitiateViewTests(APITestCase):
+    url = reverse('auth-github-login')
+
+    def test_returns_authorize_url_with_narrow_scope(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('authorize_url', response.data)
+        self.assertIn('scope=read%3Auser+user%3Aemail', response.data['authorize_url'])
+
+    @override_settings(GITHUB_CLIENT_ID='', GITHUB_CLIENT_SECRET='')
+    def test_returns_503_when_not_configured(self):
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
+class GitHubAccountLoginTests(APITestCase):
+    url = reverse('github-callback')
+
+    @patch('github_integration.oauth_views.GitHubOAuthService.complete_login_oauth', return_value=GITHUB_CLAIMS)
+    def test_new_user_created_and_cookies_set(self, mock_complete):
+        response = self.client.get(self.url, {'code': 'abc', 'state': _github_login_state()})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertTrue(response.url.endswith('/dashboard'))
+        user = User.objects.get(email='g@example.com')
+        self.assertEqual(user.profile.github_id, '4242')
+        self.assertTrue(user.profile.is_verified)
+        self.assertFalse(user.has_usable_password())
+        self.assertTrue(response.cookies[ACCESS_COOKIE]['httponly'])
+
+    @patch('github_integration.oauth_views.GitHubOAuthService.complete_login_oauth', return_value=GITHUB_CLAIMS)
+    def test_auto_links_existing_verified_email_and_staff_goes_to_admin(self, mock_complete):
+        User.objects.create_user(username='existingstaff', email='g@example.com', is_staff=True)
+
+        response = self.client.get(self.url, {'code': 'abc', 'state': _github_login_state()})
+
+        self.assertTrue(response.url.endswith('/admin'))
+        user = User.objects.get(email='g@example.com')
+        self.assertEqual(user.profile.github_id, '4242')
+
+    @patch('github_integration.oauth_views.GitHubOAuthService.complete_login_oauth', return_value=GITHUB_CLAIMS)
+    def test_repeat_login_reuses_same_user(self, mock_complete):
+        self.client.get(self.url, {'code': 'abc', 'state': _github_login_state()})
+        response = self.client.get(self.url, {'code': 'abc', 'state': _github_login_state()})
+
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+        self.assertEqual(User.objects.filter(email='g@example.com').count(), 1)
+
+    @patch(
+        'github_integration.oauth_views.GitHubOAuthService.complete_login_oauth',
+        return_value={**GITHUB_CLAIMS, 'email': None},
+    )
+    def test_no_verified_email_redirects_with_error(self, mock_complete):
+        response = self.client.get(self.url, {'code': 'abc', 'state': _github_login_state()})
+        self.assertIn('error=email_not_verified', response.url)
+
+    @patch('github_integration.oauth_views.GitHubOAuthService.complete_login_oauth')
+    def test_conflicting_github_id_rejected(self, mock_complete):
+        mock_complete.return_value = GITHUB_CLAIMS
+        self.client.get(self.url, {'code': 'abc', 'state': _github_login_state()})  # links 4242 to g@example.com
+
+        mock_complete.return_value = {**GITHUB_CLAIMS, 'github_id': 9999}
+        response = self.client.get(self.url, {'code': 'abc', 'state': _github_login_state()})
+        self.assertIn('error=account_conflict', response.url)
 
 
 class LogoutTests(APITestCase):

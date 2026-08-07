@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ImproperlyConfigured
 from django.middleware.csrf import get_token
 from django.utils.encoding import DjangoUnicodeDecodeError, force_str
 from django.utils.http import urlsafe_base64_decode
@@ -13,8 +14,9 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from core.throttling import LoginRateThrottle, PasswordResetRateThrottle, RegisterRateThrottle
+from github_integration.services.oauth_service import GitHubOAuthService
 
-from .cookies import REFRESH_COOKIE, clear_auth_cookies, set_auth_cookies
+from .cookies import REFRESH_COOKIE, clear_auth_cookies, set_auth_cookies, set_github_login_nonce_cookie
 from .emails import send_password_reset_email, send_verification_email
 from .serializers import (
     AvatarUploadSerializer,
@@ -22,6 +24,7 @@ from .serializers import (
     DeleteAccountSerializer,
     EmailLoginSerializer,
     ForgotPasswordSerializer,
+    GoogleLoginSerializer,
     ProfileSerializer,
     RegisterSerializer,
     ResendVerificationSerializer,
@@ -78,6 +81,48 @@ class LoginView(TokenObtainPairView):
             access = response.data.pop('access')
             refresh = response.data.pop('refresh')
             set_auth_cookies(response, access=access, refresh=refresh)
+        return response
+
+
+class GoogleLoginView(TokenObtainPairView):
+    """Same idea as LoginView - identity is established by a verified Google
+    ID token (see GoogleLoginSerializer) instead of email+password, but the
+    tokens it produces still get moved into httpOnly cookies the same way."""
+
+    permission_classes = [AllowAny]
+    serializer_class = GoogleLoginSerializer
+    throttle_classes = [LoginRateThrottle]
+
+    def post(self, request, *args, **kwargs):
+        response = super().post(request, *args, **kwargs)
+        if response.status_code == status.HTTP_200_OK:
+            access = response.data.pop('access')
+            refresh = response.data.pop('refresh')
+            set_auth_cookies(response, access=access, refresh=refresh)
+        return response
+
+
+class GitHubLoginInitiateView(APIView):
+    """GET /api/auth/github/ - unauthenticated, returns the GitHub authorize
+    URL for the frontend to navigate to. GitHub has no client-side ID-token
+    shortcut like Google's Identity Services, so this kicks off the standard
+    redirect flow instead; the actual identity resolution happens in
+    github_integration's GitHubCallbackView (shared with the separate
+    "connect a repo" flow - see its module docstring for why one OAuth App/
+    callback serves both)."""
+
+    permission_classes = [AllowAny]
+    throttle_classes = [LoginRateThrottle]
+
+    def get(self, request):
+        try:
+            url, nonce = GitHubOAuthService().build_authorize_url_for_login()
+        except ImproperlyConfigured as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        response = Response({'authorize_url': url})
+        # Binds the flow to this browser - see build_authorize_url_for_login()'s
+        # docstring; GitHubCallbackView verifies this against state's nonce.
+        set_github_login_nonce_cookie(response, nonce)
         return response
 
 

@@ -14,6 +14,8 @@ COPY . .
 # eventually served from - no rebuild needed to point at a different backend.
 ARG VITE_API_BASE_URL=/api
 ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
+ARG VITE_GOOGLE_CLIENT_ID
+ENV VITE_GOOGLE_CLIENT_ID=$VITE_GOOGLE_CLIENT_ID
 RUN npm run build
 
 # --- serve stage ---------------------------------------------------------

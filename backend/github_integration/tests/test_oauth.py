@@ -39,7 +39,7 @@ class BuildAuthorizeUrlServiceTests(TestCase):
 @override_settings(**_OAUTH_SETTINGS)
 class CompleteOAuthServiceTests(TestCase):
     def _state_for(self, user):
-        return signing.dumps({'user_id': user.id}, salt=_STATE_SALT)
+        return signing.dumps({'purpose': 'link', 'user_id': user.id}, salt=_STATE_SALT)
 
     @patch('github_integration.services.oauth_service.GitHubClient')
     def test_creates_integration_on_success(self, mock_client_cls):
@@ -83,9 +83,80 @@ class CompleteOAuthServiceTests(TestCase):
             GitHubOAuthService().complete_oauth('some-code', state)
 
     def test_state_for_nonexistent_user_raises_oauth_state_error(self):
-        state = signing.dumps({'user_id': 999999}, salt=_STATE_SALT)
+        state = signing.dumps({'purpose': 'link', 'user_id': 999999}, salt=_STATE_SALT)
         with self.assertRaises(OAuthStateError):
             GitHubOAuthService().complete_oauth('some-code', state)
+
+
+@override_settings(**_OAUTH_SETTINGS)
+class LoginOAuthServiceTests(TestCase):
+    def test_build_authorize_url_for_login_uses_narrow_scope(self):
+        url, _nonce = GitHubOAuthService().build_authorize_url_for_login()
+        from urllib.parse import parse_qs, unquote, urlparse
+        query = parse_qs(urlparse(url).query)
+        self.assertEqual(query['scope'][0], 'read:user user:email')
+
+    def test_build_authorize_url_for_login_state_has_login_purpose_and_returned_nonce(self):
+        url, nonce = GitHubOAuthService().build_authorize_url_for_login()
+        state = url.split('state=')[1].split('&')[0]
+        from urllib.parse import unquote
+        data = signing.loads(unquote(state), salt=_STATE_SALT, max_age=600)
+        self.assertEqual(data['purpose'], 'login')
+        self.assertEqual(data['nonce'], nonce)
+
+    @override_settings(GITHUB_CLIENT_ID='', GITHUB_CLIENT_SECRET='')
+    def test_build_authorize_url_for_login_raises_when_not_configured(self):
+        with self.assertRaises(ImproperlyConfigured):
+            GitHubOAuthService().build_authorize_url_for_login()
+
+    def test_link_state_rejected_by_complete_login_oauth(self):
+        user = make_user()
+        link_state = signing.dumps({'purpose': 'link', 'user_id': user.id}, salt=_STATE_SALT)
+        with self.assertRaises(OAuthStateError):
+            GitHubOAuthService().complete_login_oauth('some-code', link_state, 'nonce')
+
+    def test_login_state_rejected_by_complete_oauth(self):
+        login_state = signing.dumps({'purpose': 'login', 'nonce': 'abc'}, salt=_STATE_SALT)
+        with self.assertRaises(OAuthStateError):
+            GitHubOAuthService().complete_oauth('some-code', login_state)
+
+    def test_mismatched_nonce_rejected(self):
+        login_state = signing.dumps({'purpose': 'login', 'nonce': 'abc'}, salt=_STATE_SALT)
+        with self.assertRaises(OAuthStateError):
+            GitHubOAuthService().complete_login_oauth('some-code', login_state, 'not-abc')
+
+    def test_missing_expected_nonce_rejected(self):
+        login_state = signing.dumps({'purpose': 'login', 'nonce': 'abc'}, salt=_STATE_SALT)
+        with self.assertRaises(OAuthStateError):
+            GitHubOAuthService().complete_login_oauth('some-code', login_state, '')
+
+    @patch('github_integration.services.oauth_service.GitHubClient')
+    def test_complete_login_oauth_returns_claims(self, mock_client_cls):
+        login_state = signing.dumps({'purpose': 'login', 'nonce': 'abc'}, salt=_STATE_SALT)
+        mock_client_cls.exchange_code_for_token.return_value = {'access_token': 'gho_tok'}
+        mock_client_cls.return_value.get_authenticated_user.return_value = {
+            'id': 42, 'login': 'octocat', 'avatar_url': 'https://example.com/a.png',
+        }
+        mock_client_cls.return_value.get_primary_verified_email.return_value = 'octocat@example.com'
+
+        claims = GitHubOAuthService().complete_login_oauth('some-code', login_state, 'abc')
+
+        self.assertEqual(claims, {
+            'github_id': 42, 'username': 'octocat',
+            'email': 'octocat@example.com', 'avatar_url': 'https://example.com/a.png',
+        })
+
+
+class PeekStatePurposeTests(TestCase):
+    def test_returns_purpose_for_valid_state(self):
+        state = signing.dumps({'purpose': 'login', 'nonce': 'abc'}, salt=_STATE_SALT)
+        self.assertEqual(GitHubOAuthService.peek_state_purpose(state), 'login')
+
+    def test_returns_none_for_garbage(self):
+        self.assertIsNone(GitHubOAuthService.peek_state_purpose('garbage'))
+
+    def test_returns_none_for_empty(self):
+        self.assertIsNone(GitHubOAuthService.peek_state_purpose(''))
 
 
 @override_settings(**_OAUTH_SETTINGS)
@@ -160,7 +231,7 @@ class GitHubCallbackViewTests(TestCase):
     @patch('github_integration.services.oauth_service.GitHubClient')
     def test_successful_callback_redirects_with_connected_true(self, mock_client_cls):
         user = make_user()
-        state = signing.dumps({'user_id': user.id}, salt=_STATE_SALT)
+        state = signing.dumps({'purpose': 'link', 'user_id': user.id}, salt=_STATE_SALT)
         mock_client_cls.exchange_code_for_token.return_value = {'access_token': 'gho_tok'}
         mock_client_cls.return_value.get_authenticated_user.return_value = {'id': 1, 'login': 'octocat'}
 
@@ -172,12 +243,71 @@ class GitHubCallbackViewTests(TestCase):
     @patch('github_integration.services.oauth_service.GitHubClient')
     def test_github_api_failure_redirects_with_github_error(self, mock_client_cls):
         user = make_user()
-        state = signing.dumps({'user_id': user.id}, salt=_STATE_SALT)
+        state = signing.dumps({'purpose': 'link', 'user_id': user.id}, salt=_STATE_SALT)
         mock_client_cls.exchange_code_for_token.side_effect = GitHubAPIError('boom')
 
         response = APIClient().get(reverse('github-callback'), {'code': 'abc', 'state': state})
 
         self.assertIn('error=github_error', response.url)
+
+
+@override_settings(**_OAUTH_SETTINGS)
+class GitHubLoginNonceBindingTests(TestCase):
+    """Exercises the real (unmocked) nonce-binding check end to end - closes
+    the OAuth login-CSRF gap where a validly-signed `state` alone didn't prove
+    the browser completing the callback is the one that started the flow."""
+
+    def _mock_github_identity(self, mock_client_cls, github_id=777, email='nonce@example.com'):
+        mock_client_cls.exchange_code_for_token.return_value = {'access_token': 'gho_tok'}
+        mock_client_cls.return_value.get_authenticated_user.return_value = {'id': github_id, 'login': 'octocat'}
+        mock_client_cls.return_value.get_primary_verified_email.return_value = email
+
+    @patch('github_integration.services.oauth_service.GitHubClient')
+    def test_matching_nonce_cookie_succeeds(self, mock_client_cls):
+        self._mock_github_identity(mock_client_cls)
+        from urllib.parse import unquote
+        url, nonce = GitHubOAuthService().build_authorize_url_for_login()
+        state = unquote(url.split('state=')[1].split('&')[0])
+        client = APIClient()
+        client.cookies['github_login_nonce'] = nonce
+
+        response = client.get(reverse('github-callback'), {'code': 'abc', 'state': state})
+
+        self.assertTrue(response.url.endswith('/dashboard'))
+        self.assertIn('access_token', response.cookies)
+
+    @patch('github_integration.services.oauth_service.GitHubClient')
+    def test_missing_nonce_cookie_rejected(self, mock_client_cls):
+        self._mock_github_identity(mock_client_cls)
+        from urllib.parse import unquote
+        url, _nonce = GitHubOAuthService().build_authorize_url_for_login()
+        state = unquote(url.split('state=')[1].split('&')[0])
+
+        # No cookie set - simulates a victim's browser receiving a code+state
+        # pair minted by someone else's (the attacker's) authorize step.
+        response = APIClient().get(reverse('github-callback'), {'code': 'abc', 'state': state})
+
+        self.assertIn('error=invalid_state', response.url)
+        self.assertNotIn('access_token', response.cookies)
+
+    @patch('github_integration.services.oauth_service.GitHubClient')
+    def test_mismatched_nonce_cookie_rejected(self, mock_client_cls):
+        self._mock_github_identity(mock_client_cls)
+        from urllib.parse import unquote
+        url, _nonce = GitHubOAuthService().build_authorize_url_for_login()
+        state = unquote(url.split('state=')[1].split('&')[0])
+        client = APIClient()
+        client.cookies['github_login_nonce'] = 'a-different-nonce-entirely'
+
+        response = client.get(reverse('github-callback'), {'code': 'abc', 'state': state})
+
+        self.assertIn('error=invalid_state', response.url)
+        self.assertNotIn('access_token', response.cookies)
+
+    def test_nonce_cookie_cleared_after_login_callback(self):
+        login_state = signing.dumps({'purpose': 'login', 'nonce': 'abc'}, salt=_STATE_SALT)
+        response = APIClient().get(reverse('github-callback'), {'code': 'abc', 'state': login_state})
+        self.assertEqual(response.cookies['github_login_nonce'].value, '')
 
 
 @override_settings(**_OAUTH_SETTINGS)

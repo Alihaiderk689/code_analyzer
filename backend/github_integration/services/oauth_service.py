@@ -12,6 +12,7 @@ relying on a session.
 from __future__ import annotations
 
 import logging
+import secrets
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -52,9 +53,92 @@ def _require_oauth_configured() -> None:
 class GitHubOAuthService:
     def build_authorize_url(self, user) -> str:
         _require_oauth_configured()
-        state = signing.dumps({'user_id': user.id}, salt=_STATE_SALT)
+        state = signing.dumps({'purpose': 'link', 'user_id': user.id}, salt=_STATE_SALT)
         logger.info('github_oauth.authorize_url_issued', extra={'user_id': user.id})
         return build_authorize_url(state)
+
+    def build_authorize_url_for_login(self) -> tuple[str, str]:
+        """Same OAuth App/callback as build_authorize_url() above, but for the
+        unauthenticated login/signup flow (accounts.views.GitHubLoginInitiateView)
+        - there's no user yet to encode into `state`, just a nonce, and the
+        scope requested is deliberately narrower (see github_client's
+        DEFAULT_OAUTH_SCOPE comment).
+
+        Returns (authorize_url, nonce) - the caller (GitHubLoginInitiateView)
+        must set the nonce as a short-lived cookie on its response
+        (accounts.cookies.set_github_login_nonce_cookie) so the callback can
+        verify the browser completing it is the one that started it. Without
+        that binding, a signed-but-unbound `state` only proves *we* issued it,
+        not that the browser presenting it is the one we issued it to - which
+        is exactly the OAuth login-CSRF class of bug (an attacker completes
+        their own authorize step, then hands the resulting code+state to a
+        victim to silently log the victim into the attacker's account)."""
+        _require_oauth_configured()
+        nonce = secrets.token_urlsafe(16)
+        state = signing.dumps({'purpose': 'login', 'nonce': nonce}, salt=_STATE_SALT)
+        logger.info('github_oauth.login_authorize_url_issued')
+        return build_authorize_url(state, scope='read:user user:email'), nonce
+
+    def complete_login_oauth(self, code: str, state: str, expected_nonce: str) -> dict:
+        """The login-flow counterpart to complete_oauth() below - exchanges
+        `code` and returns the GitHub identity claims for
+        accounts.github_auth.find_or_create_user_from_github to turn into a
+        platform User. Doesn't touch GitHubIntegration at all: that model is
+        for the repo-connect feature, an unrelated concern from "who is this
+        person logging in as". `expected_nonce` comes from the browser-bound
+        cookie set by build_authorize_url_for_login()'s caller - see its
+        docstring for why this check exists."""
+        _require_oauth_configured()
+        self._require_login_state(state, expected_nonce)
+
+        token_data = GitHubClient.exchange_code_for_token(code)
+        access_token = token_data['access_token']
+        client = GitHubClient(access_token=access_token)
+        profile = client.get_authenticated_user()
+        email = client.get_primary_verified_email()
+
+        return {
+            'github_id': profile['id'],
+            'username': profile['login'],
+            'email': email,
+            'avatar_url': profile.get('avatar_url'),
+        }
+
+    @staticmethod
+    def peek_state_purpose(state: str) -> str | None:
+        """Best-effort, non-raising read of `purpose` from `state` - used only
+        so the callback view can pick which frontend page to redirect *errors*
+        to before the real (raising) validation in complete_oauth()/
+        complete_login_oauth() runs. Never raises; returns None for anything
+        it can't decode."""
+        if not state:
+            return None
+        try:
+            data = signing.loads(state, salt=_STATE_SALT, max_age=_STATE_MAX_AGE_SECONDS)
+        except signing.BadSignature:
+            return None
+        return data.get('purpose')
+
+    @staticmethod
+    def _require_login_state(state: str, expected_nonce: str) -> None:
+        if not state:
+            raise OAuthStateError('Missing state parameter.')
+        if not expected_nonce:
+            # No nonce cookie means this browser never initiated a login
+            # attempt - either it expired/was already used, or (the case this
+            # check exists for) this code+state pair was minted by someone
+            # else's browser and handed to this one.
+            raise OAuthStateError('Missing or expired GitHub sign-in session - please try again.')
+        try:
+            data = signing.loads(state, salt=_STATE_SALT, max_age=_STATE_MAX_AGE_SECONDS)
+        except signing.SignatureExpired as exc:
+            raise OAuthStateError('The GitHub authorization link expired - please try signing in again.') from exc
+        except signing.BadSignature as exc:
+            raise OAuthStateError('Invalid state parameter.') from exc
+        if data.get('purpose') != 'login':
+            raise OAuthStateError('This authorization link is not valid for signing in.')
+        if not secrets.compare_digest(data.get('nonce', ''), expected_nonce):
+            raise OAuthStateError('This authorization link was not issued to this browser.')
 
     def complete_oauth(self, code: str, state: str) -> GitHubIntegration:
         _require_oauth_configured()
@@ -119,6 +203,9 @@ class GitHubOAuthService:
             raise OAuthStateError('The GitHub authorization link expired - please try connecting again.') from exc
         except signing.BadSignature as exc:
             raise OAuthStateError('Invalid state parameter.') from exc
+
+        if data.get('purpose') != 'link':
+            raise OAuthStateError('This authorization link is not valid for connecting a repository.')
 
         try:
             return User.objects.get(pk=data['user_id'])

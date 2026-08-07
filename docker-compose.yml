@@ -93,6 +93,7 @@ services:
         # Relative path - nginx.conf reverse-proxies /api/ to the backend
         # service, so the built JS never needs to know a real backend host.
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+        VITE_GOOGLE_CLIENT_ID: ${VITE_GOOGLE_CLIENT_ID}
     # Also the published Docker Hub image (linux/amd64 + linux/arm64) - see
     # the backend service's identical comment above.
     image: alihaider310/code-analyzer-frontend:latest
