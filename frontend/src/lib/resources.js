@@ -35,10 +35,8 @@ export const resetPassword = (uid, token, new_password, new_password2) =>
     body: { uid, token, new_password, new_password2 },
   })
 
-export const verifyEmail = (uid, token) =>
-  apiFetch(`/auth/verify-email/?uid=${encodeURIComponent(uid)}&token=${encodeURIComponent(token)}`, {
-    auth: false,
-  })
+export const verifyOtp = (email, code) =>
+  apiFetch('/auth/verify-email/', { method: 'POST', auth: false, body: { email, code } })
 
 export const resendVerification = (email) =>
   apiFetch('/auth/resend-verification/', { method: 'POST', auth: false, body: { email } })

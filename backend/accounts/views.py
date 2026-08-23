@@ -1,8 +1,9 @@
+import logging
+
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
+from django.db import transaction
 from django.middleware.csrf import get_token
-from django.utils.encoding import DjangoUnicodeDecodeError, force_str
-from django.utils.http import urlsafe_base64_decode
 from rest_framework import status
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny
@@ -13,11 +14,19 @@ from rest_framework_simplejwt.serializers import TokenRefreshSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from core.throttling import LoginRateThrottle, PasswordResetRateThrottle, RegisterRateThrottle
+from core.throttling import (
+    LoginRateThrottle,
+    OtpResendRateThrottle,
+    OtpVerifyRateThrottle,
+    PasswordResetRateThrottle,
+    RegisterRateThrottle,
+)
 from github_integration.services.oauth_service import GitHubOAuthService
 
+from .brevo_client import BrevoAPIError
 from .cookies import REFRESH_COOKIE, clear_auth_cookies, set_auth_cookies, set_github_login_nonce_cookie
-from .emails import send_password_reset_email, send_verification_email
+from .emails import send_otp_email, send_password_reset_email
+from .otp import issue_otp
 from .serializers import (
     AvatarUploadSerializer,
     ChangePasswordSerializer,
@@ -29,9 +38,10 @@ from .serializers import (
     RegisterSerializer,
     ResendVerificationSerializer,
     ResetPasswordSerializer,
+    VerifyOtpSerializer,
 )
-from .tokens import email_verification_token
 
+logger = logging.getLogger(__name__)
 User = get_user_model()
 
 
@@ -57,10 +67,19 @@ class RegisterView(APIView):
     def post(self, request):
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
-        send_verification_email(user)
+        try:
+            with transaction.atomic():
+                user = serializer.save()
+                code = issue_otp(user)
+                send_otp_email(user, code)
+        except BrevoAPIError:
+            logger.error('accounts.otp_email_failed', exc_info=True)
+            return Response(
+                {'detail': 'Email service is currently unavailable. Please try again.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         return Response(
-            {'detail': 'Registration successful. Check your email to verify your account.'},
+            {'detail': 'Registration successful. Check your email for a verification code.'},
             status=status.HTTP_201_CREATED,
         )
 
@@ -203,43 +222,42 @@ class ResetPasswordView(APIView):
         return Response({'detail': 'Password has been reset successfully.'})
 
 
-class VerifyEmailView(APIView):
+class VerifyOtpView(APIView):
+    """POST /api/auth/verify-email/ - same route as the old link-click flow,
+    now a POST with {email, code} instead of a GET with ?uid=&token= (see
+    VerifyOtpSerializer for the actual check). Tightly throttled since a
+    6-digit code is brute-forceable in a way a 128-bit token never was -
+    otp.py's own attempt-lockout is the primary defense, this is a backstop."""
+
     permission_classes = [AllowAny]
+    throttle_classes = [OtpVerifyRateThrottle]
 
-    def get(self, request):
-        uidb64 = request.query_params.get('uid')
-        token = request.query_params.get('token')
-        if not uidb64 or not token:
-            return Response({'detail': 'uid and token are required.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            uid = force_str(urlsafe_base64_decode(uidb64))
-            user = User.objects.get(pk=uid)
-        except (User.DoesNotExist, ValueError, TypeError, DjangoUnicodeDecodeError):
-            return Response({'detail': 'Invalid verification link.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        if not email_verification_token.check_token(user, token):
-            return Response({'detail': 'Invalid or expired verification link.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        profile = user.profile
-        if not profile.is_verified:
-            profile.is_verified = True
-            profile.save(update_fields=['is_verified'])
+    def post(self, request):
+        serializer = VerifyOtpSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         return Response({'detail': 'Email verified successfully.'})
 
 
 class ResendVerificationView(APIView):
     permission_classes = [AllowAny]
-    throttle_classes = [PasswordResetRateThrottle]
+    throttle_classes = [OtpResendRateThrottle]
 
     def post(self, request):
         serializer = ResendVerificationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = User.objects.filter(email__iexact=serializer.validated_data['email']).first()
         if user and not user.profile.is_verified:
-            send_verification_email(user)
+            try:
+                code = issue_otp(user)
+                send_otp_email(user, code)
+            except BrevoAPIError:
+                logger.error('accounts.otp_email_failed', exc_info=True)
+                return Response(
+                    {'detail': 'Email service is currently unavailable. Please try again.'},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
         return Response({
-            'detail': 'If an account with that email exists and is unverified, a verification email has been sent.',
+            'detail': 'If an account with that email exists and is unverified, a verification code has been sent.',
         })
 
 

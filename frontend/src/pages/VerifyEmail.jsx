@@ -1,38 +1,53 @@
-import { useEffect, useState } from 'react'
-import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { verifyEmail, resendVerification } from '../lib/resources'
+import { useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
+import { verifyOtp, resendVerification } from '../lib/resources'
 import { ApiError } from '../lib/api'
+import { validateOtpCode } from '../lib/validation'
 
 export default function VerifyEmail() {
-  const [searchParams] = useSearchParams()
   const location = useLocation()
   const navigate = useNavigate()
-
-  const uid = searchParams.get('uid')
-  const token = searchParams.get('token')
   const email = location.state?.email || ''
 
-  const [status, setStatus] = useState(uid && token ? 'verifying' : 'pending')
-  const [errorMsg, setErrorMsg] = useState('')
+  const [code, setCode] = useState('')
+  const [status, setStatus] = useState('entry') // 'entry' | 'success'
+  const [fieldError, setFieldError] = useState('')
+  const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
   const [resendMsg, setResendMsg] = useState(false)
   const [resendBusy, setResendBusy] = useState(false)
 
-  useEffect(() => {
-    if (!uid || !token) return
-    verifyEmail(uid, token)
-      .then(() => setStatus('success'))
-      .catch((err) => {
-        setStatus('error')
-        setErrorMsg(err instanceof ApiError ? err.message : 'Verification link is invalid or has expired.')
-      })
-  }, [uid, token])
+  const handleSubmit = async (e) => {
+    e.preventDefault()
+    setError('')
+
+    const codeError = validateOtpCode(code)
+    setFieldError(codeError)
+    if (codeError) return
+
+    if (!email) {
+      setError('We don’t have your email on this screen — please register or sign in again.')
+      return
+    }
+
+    setSubmitting(true)
+    try {
+      await verifyOtp(email, code.trim())
+      setStatus('success')
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Verification failed. Please try again.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
 
   const handleResend = async () => {
     if (!email) {
-      setErrorMsg('We don’t have your email on this screen — please sign in again to resend it.')
+      setError('We don’t have your email on this screen — please register or sign in again.')
       return
     }
     setResendBusy(true)
+    setError('')
     try {
       await resendVerification(email)
     } finally {
@@ -61,15 +76,7 @@ export default function VerifyEmail() {
           ✉️
         </div>
 
-        {status === 'verifying' && (
-          <>
-            <div style={{ fontFamily: 'var(--font-display)', fontSize: 26, fontWeight: 500, marginTop: 18 }}>
-              Verifying your email…
-            </div>
-          </>
-        )}
-
-        {status === 'success' && (
+        {status === 'success' ? (
           <>
             <div style={{ fontFamily: 'var(--font-display)', fontSize: 26, fontWeight: 500, marginTop: 18 }}>
               Email verified
@@ -81,50 +88,43 @@ export default function VerifyEmail() {
               Continue to sign in
             </button>
           </>
-        )}
-
-        {status === 'error' && (
-          <>
-            <div style={{ fontFamily: 'var(--font-display)', fontSize: 26, fontWeight: 500, marginTop: 18 }}>
-              Verification failed
-            </div>
-            <div className="msg-error" style={{ marginTop: 16 }}>
-              {errorMsg}
-            </div>
-            <button
-              className="btn btn-outline btn-block"
-              style={{ marginTop: 16 }}
-              disabled={resendBusy}
-              onClick={handleResend}
-            >
-              Resend email
-            </button>
-          </>
-        )}
-
-        {status === 'pending' && (
+        ) : (
           <>
             <div style={{ fontFamily: 'var(--font-display)', fontSize: 26, fontWeight: 500, marginTop: 18 }}>
               Verify your email
             </div>
             <div style={{ fontSize: 14, color: 'var(--color-text-secondary)', marginTop: 10, lineHeight: 1.5 }}>
-              We've sent a verification link to <strong>{email || 'your email'}</strong>. Click the link to activate
-              your account.
+              Enter the 6-digit code we sent to <strong>{email || 'your email'}</strong>. It expires in 10 minutes.
             </div>
 
-            {resendMsg && <div className="msg-success" style={{ marginTop: 16 }}>Email resent.</div>}
-            {errorMsg && <div className="msg-error" style={{ marginTop: 16 }}>{errorMsg}</div>}
+            <form onSubmit={handleSubmit} style={{ marginTop: 20 }} noValidate>
+              <input
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                maxLength={6}
+                placeholder="000000"
+                className="field"
+                style={{ textAlign: 'center', fontSize: 22, letterSpacing: 6 }}
+                value={code}
+                onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                onBlur={() => setFieldError(validateOtpCode(code))}
+              />
+              {fieldError && <div className="field-error">{fieldError}</div>}
+              {resendMsg && <div className="msg-success" style={{ marginTop: 12 }}>Code resent.</div>}
+              {error && <div className="msg-error" style={{ marginTop: 12 }}>{error}</div>}
 
-            <button className="btn btn-dark btn-block" style={{ marginTop: 22 }} onClick={() => navigate('/login')}>
-              I've verified — continue
-            </button>
+              <button type="submit" className="btn btn-dark btn-block" style={{ marginTop: 16 }} disabled={submitting}>
+                {submitting ? 'Verifying…' : 'Verify'}
+              </button>
+            </form>
             <button
               className="btn btn-outline btn-block"
               style={{ marginTop: 10 }}
               disabled={resendBusy}
               onClick={handleResend}
             >
-              Resend email
+              Resend code
             </button>
           </>
         )}
