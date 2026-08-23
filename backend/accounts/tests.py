@@ -1,13 +1,14 @@
+from datetime import timedelta
 from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
-from django.core import mail
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from django.core.signing import dumps as signing_dumps
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from rest_framework import status
@@ -16,9 +17,10 @@ from rest_framework.test import APIClient, APITestCase
 from core.throttling import LoginRateThrottle
 from github_integration.services.oauth_service import _STATE_SALT
 
+from .brevo_client import BrevoAPIError
 from .cookies import ACCESS_COOKIE, REFRESH_COOKIE
 from .google_auth import GoogleTokenError, verify_google_access_token
-from .tokens import email_verification_token
+from .otp import OTP_MAX_ATTEMPTS, issue_otp
 
 User = get_user_model()
 
@@ -33,16 +35,29 @@ def make_user(email='user@example.com', password='TestPass123!', verified=False)
 class RegisterTests(APITestCase):
     url = reverse('auth-register')
 
-    def test_register_creates_user_and_sends_verification_email(self):
+    @patch('accounts.emails.BrevoClient')
+    def test_register_creates_inactive_user_and_sends_otp_email(self, mock_brevo_cls):
         response = self.client.post(self.url, {
             'email': 'new@example.com', 'password': 'TestPass123!', 'password2': 'TestPass123!',
         })
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         user = User.objects.get(email='new@example.com')
+        self.assertFalse(user.is_active)
         self.assertFalse(user.profile.is_verified)
-        self.assertEqual(len(mail.outbox), 1)
-        self.assertIn('verify-email', mail.outbox[0].body)
+        self.assertIsNotNone(user.profile.otp_code_hash)
+        mock_brevo_cls.return_value.send_email.assert_called_once()
+        self.assertEqual(mock_brevo_cls.return_value.send_email.call_args.kwargs['to_email'], 'new@example.com')
+
+    @patch('accounts.emails.BrevoClient')
+    def test_register_rolls_back_when_email_send_fails(self, mock_brevo_cls):
+        mock_brevo_cls.return_value.send_email.side_effect = BrevoAPIError('boom')
+        response = self.client.post(self.url, {
+            'email': 'failed@example.com', 'password': 'TestPass123!', 'password2': 'TestPass123!',
+        })
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertFalse(User.objects.filter(email='failed@example.com').exists())
 
     def test_register_duplicate_email_rejected(self):
         make_user(email='dup@example.com')
@@ -461,20 +476,23 @@ class CsrfCookieViewTests(APITestCase):
 class ForgotPasswordTests(APITestCase):
     url = reverse('auth-forgot-password')
 
-    def test_forgot_password_existing_user_sends_email(self):
+    @patch('accounts.emails.BrevoClient')
+    def test_forgot_password_existing_user_sends_email(self, mock_brevo_cls):
         make_user(email='forgot@example.com')
         response = self.client.post(self.url, {'email': 'forgot@example.com'})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(mail.outbox), 1)
-        self.assertIn('reset-password', mail.outbox[0].body)
+        mock_brevo_cls.return_value.send_email.assert_called_once()
+        call_kwargs = mock_brevo_cls.return_value.send_email.call_args.kwargs
+        self.assertIn('reset-password', call_kwargs['html_content'])
 
-    def test_forgot_password_nonexistent_user_same_response(self):
+    @patch('accounts.emails.BrevoClient')
+    def test_forgot_password_nonexistent_user_same_response(self, mock_brevo_cls):
         response = self.client.post(self.url, {'email': 'ghost@example.com'})
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['detail'], 'If an account with that email exists, a reset link has been sent.')
-        self.assertEqual(len(mail.outbox), 0)
+        mock_brevo_cls.return_value.send_email.assert_not_called()
 
 
 class ResetPasswordTests(APITestCase):
@@ -542,45 +560,76 @@ class ResetPasswordTests(APITestCase):
 class VerifyEmailTests(APITestCase):
     url = reverse('auth-verify-email')
 
-    def _link_params(self, user):
-        uid = urlsafe_base64_encode(force_bytes(user.pk))
-        token = email_verification_token.make_token(user)
-        return uid, token
+    def _make_inactive_user_with_otp(self, email='verify@example.com'):
+        user = make_user(email=email, verified=False)
+        user.is_active = False
+        user.save(update_fields=['is_active'])
+        code = issue_otp(user)
+        return user, code
 
-    def test_verify_email_valid_token_marks_verified(self):
-        user = make_user(email='verify@example.com')
-        uid, token = self._link_params(user)
+    def test_verify_email_valid_code_activates_and_verifies(self):
+        user, code = self._make_inactive_user_with_otp()
 
-        response = self.client.get(self.url, {'uid': uid, 'token': token})
+        response = self.client.post(self.url, {'email': user.email, 'code': code})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        user.profile.refresh_from_db()
+        user.refresh_from_db()
+        self.assertTrue(user.is_active)
         self.assertTrue(user.profile.is_verified)
 
     def test_verify_email_missing_params_400(self):
-        response = self.client.get(self.url)
+        response = self.client.post(self.url, {})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_verify_email_invalid_token_400(self):
-        user = make_user(email='verify2@example.com')
-        uid, _ = self._link_params(user)
-        response = self.client.get(self.url, {'uid': uid, 'token': 'garbage'})
+    def test_verify_email_wrong_code_rejected_and_increments_attempts(self):
+        user, _code = self._make_inactive_user_with_otp(email='verify2@example.com')
+        response = self.client.post(self.url, {'email': user.email, 'code': '000000'})
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+        self.assertEqual(user.profile.otp_attempts, 1)
+
+    def test_verify_email_expired_code_rejected(self):
+        user, code = self._make_inactive_user_with_otp(email='verify3@example.com')
+        user.profile.otp_expires_at = timezone.now() - timedelta(minutes=1)
+        user.profile.save(update_fields=['otp_expires_at'])
+
+        response = self.client.post(self.url, {'email': user.email, 'code': code})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('expired', response.data['code'][0])
+
+    def test_verify_email_locks_out_after_max_attempts(self):
+        user, code = self._make_inactive_user_with_otp(email='verify4@example.com')
+        for _ in range(OTP_MAX_ATTEMPTS):
+            self.client.post(self.url, {'email': user.email, 'code': '000000'})
+
+        response = self.client.post(self.url, {'email': user.email, 'code': code})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Too many', response.data['code'][0])
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
 
 
 class ResendVerificationTests(APITestCase):
     url = reverse('auth-resend-verification')
 
-    def test_resend_for_unverified_user_sends_email(self):
-        make_user(email='unverified@example.com', verified=False)
+    @patch('accounts.emails.BrevoClient')
+    def test_resend_for_unverified_user_sends_new_code(self, mock_brevo_cls):
+        user = make_user(email='unverified@example.com', verified=False)
+        old_hash = user.profile.otp_code_hash
+
         response = self.client.post(self.url, {'email': 'unverified@example.com'})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(mail.outbox), 1)
+        mock_brevo_cls.return_value.send_email.assert_called_once()
+        user.profile.refresh_from_db()
+        self.assertIsNotNone(user.profile.otp_code_hash)
+        self.assertNotEqual(user.profile.otp_code_hash, old_hash)
 
-    def test_resend_for_already_verified_user_sends_nothing(self):
+    @patch('accounts.emails.BrevoClient')
+    def test_resend_for_already_verified_user_sends_nothing(self, mock_brevo_cls):
         make_user(email='verified@example.com', verified=True)
         response = self.client.post(self.url, {'email': 'verified@example.com'})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(mail.outbox), 0)
+        mock_brevo_cls.return_value.send_email.assert_not_called()
 
 
 class ChangePasswordTests(APITestCase):

@@ -32,6 +32,20 @@ class PasswordResetRateThrottle(ScopedIdentityRateThrottle):
     scope = 'password_reset'
 
 
+class OtpVerifyRateThrottle(ScopedIdentityRateThrottle):
+    """IP-level backstop on the OTP-check endpoint - the real brute-force
+    defense is the per-account expiry + attempt-lockout in accounts/otp.py,
+    this just stops one IP hammering across many different target emails."""
+
+    scope = 'otp_verify'
+
+
+class OtpResendRateThrottle(ScopedIdentityRateThrottle):
+    """Tighter than otp_verify - each resend costs a real Brevo send."""
+
+    scope = 'otp_resend'
+
+
 class AIRateThrottle(ScopedIdentityRateThrottle):
     scope = 'ai'
 

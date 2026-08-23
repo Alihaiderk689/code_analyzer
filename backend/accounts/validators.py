@@ -4,6 +4,7 @@ from rest_framework import serializers
 
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z '-]*$")
 USERNAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_]*$')
+OTP_CODE_RE = re.compile(r'^\d{6}$')
 
 
 def validate_person_name(value, field_label='This field'):
@@ -43,3 +44,9 @@ def validate_password_strength(value):
 
 def normalize_email(value):
     return value.strip().lower()
+
+
+def validate_otp_code(value):
+    if not OTP_CODE_RE.match(value):
+        raise serializers.ValidationError('Enter the 6-digit code.')
+    return value

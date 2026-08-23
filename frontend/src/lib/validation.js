@@ -1,6 +1,7 @@
 const NAME_RE = /^[A-Za-z][A-Za-z '-]*$/
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9_]*$/
+const OTP_CODE_RE = /^\d{6}$/
 
 export function validateName(value, label = 'This field') {
   const trimmed = (value || '').trim()
@@ -58,5 +59,12 @@ export function validatePassword(value) {
 export function validateConfirmPassword(password, confirm) {
   if (!confirm) return 'Please confirm your password.'
   if (password !== confirm) return 'Passwords do not match.'
+  return ''
+}
+
+export function validateOtpCode(value) {
+  const trimmed = (value || '').trim()
+  if (!trimmed) return 'Enter the 6-digit code.'
+  if (!OTP_CODE_RE.test(trimmed)) return 'Enter the 6-digit code.'
   return ''
 }

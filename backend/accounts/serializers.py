@@ -11,8 +11,10 @@ from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .google_auth import GoogleTokenError, verify_google_access_token
+from .otp import verify_otp
 from .validators import (
     normalize_email,
+    validate_otp_code,
     validate_password_strength,
     validate_person_name,
     validate_username_format,
@@ -58,6 +60,9 @@ class RegisterSerializer(serializers.ModelSerializer):
         password = validated_data.pop('password')
         user = User(username=_generate_username(validated_data['email']), **validated_data)
         user.set_password(password)
+        # Inactive until OTP verification (see accounts/otp.py) - EmailLoginSerializer
+        # already rejects login for is_active=False, so this alone gates login.
+        user.is_active = False
         user.save()
         return user
 
@@ -191,6 +196,29 @@ class ResendVerificationSerializer(serializers.Serializer):
 
     def validate_email(self, value):
         return normalize_email(value)
+
+
+_OTP_ERROR_MESSAGES = {
+    'expired': 'This code has expired, request a new one.',
+    'too_many_attempts': 'Too many incorrect attempts, request a new one.',
+    'incorrect': 'Incorrect code.',
+}
+
+
+class VerifyOtpSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    code = serializers.CharField(validators=[validate_otp_code])
+
+    def validate(self, attrs):
+        email = normalize_email(attrs['email'])
+        user = User.objects.filter(email__iexact=email).first()
+        if user is None:
+            raise serializers.ValidationError({'code': _OTP_ERROR_MESSAGES['incorrect']})
+
+        success, error_code = verify_otp(user, attrs['code'])
+        if not success:
+            raise serializers.ValidationError({'code': _OTP_ERROR_MESSAGES[error_code]})
+        return attrs
 
 
 class ResetPasswordSerializer(serializers.Serializer):
