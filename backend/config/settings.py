@@ -159,6 +159,10 @@ _THROTTLE_RATES = {
     'login': '10/min',
     'register': '5/hour',
     'password_reset': '20/hour',
+    # otp_verify is an IP-level backstop - the real brute-force defense is
+    # the per-account expiry + attempt-lockout in accounts/otp.py.
+    'otp_verify': '20/hour',
+    'otp_resend': '5/hour',
     'ai': '30/min',
     'analysis_create': '30/min',
 }
@@ -189,20 +193,15 @@ SIMPLE_JWT = {
     'UPDATE_LAST_LOGIN': True,
 }
 
-# Email
-# Uses real SMTP when EMAIL_HOST_USER/EMAIL_HOST_PASSWORD are set (e.g. a Gmail
-# address + App Password); otherwise falls back to printing emails to the
-# runserver console, so the app still works out of the box without credentials.
-EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
-EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
-if EMAIL_HOST_USER and EMAIL_HOST_PASSWORD:
-    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-    EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
-    EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
-    EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True') == 'True'
-else:
-    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER or 'noreply@codeanalyzer.local')
+# Email - sent via Brevo's transactional email API (accounts/brevo_client.py),
+# not Django's own mail backends/SMTP. Optional at startup, same pattern as
+# GROQ_API_KEY etc: BrevoClient raises ImproperlyConfigured lazily on first
+# real send, not at boot, so the app still starts without it configured.
+BREVO_API_KEY = os.environ.get('BREVO_API_KEY', '')
+# Must be a verified sender/domain in the Brevo account - see
+# https://app.brevo.com/senders/list.
+BREVO_SENDER_EMAIL = os.environ.get('BREVO_SENDER_EMAIL', '')
+BREVO_SENDER_NAME = os.environ.get('BREVO_SENDER_NAME', 'Code Analyzer')
 
 # Base URL of the frontend app, used to build links inside verification/reset emails.
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')

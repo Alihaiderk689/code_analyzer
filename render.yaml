@@ -26,11 +26,11 @@ envVarGroups:
         sync: false
       - key: COOKIE_DOMAIN
         sync: false
-      - key: DEFAULT_FROM_EMAIL
+      - key: BREVO_API_KEY
         sync: false
-      - key: EMAIL_HOST_USER
+      - key: BREVO_SENDER_EMAIL
         sync: false
-      - key: EMAIL_HOST_PASSWORD
+      - key: BREVO_SENDER_NAME
         sync: false
       - key: GROQ_API_KEY
         sync: false
