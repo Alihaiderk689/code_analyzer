@@ -329,7 +329,13 @@ function RefactorTab({ id, isCompleted, originalSource }) {
           ))}
         </div>
       )}
-      <RegenerateButton busy={busy} onClick={regenerate} />
+      <RegenerateButton
+        busy={busy}
+        onClick={regenerate}
+        label="Try Another Refactor"
+        busyLabel="Refactoring…"
+        title="Asks the AI for a new refactoring instead of showing the saved one. Takes a few seconds."
+      />
     </div>
   )
 }
@@ -379,10 +385,20 @@ function codeBoxStyle(bg, border) {
   }
 }
 
-function RegenerateButton({ busy, onClick }) {
+// Shared by the Suggestions, Explanation and Refactored Code tabs, so the
+// wording is per-usage rather than baked in - each tab produces a different
+// kind of thing, and "Regenerate" alone doesn't tell the user that the result
+// they are looking at was saved from an earlier run.
+function RegenerateButton({ busy, onClick, label = 'Regenerate', busyLabel = 'Regenerating…', title }) {
   return (
-    <button className="btn btn-outline" style={{ marginTop: 16, fontSize: 13, padding: '9px 16px' }} disabled={busy} onClick={onClick}>
-      {busy ? 'Regenerating…' : 'Regenerate'}
+    <button
+      className="btn btn-outline"
+      style={{ marginTop: 16, fontSize: 13, padding: '9px 16px' }}
+      disabled={busy}
+      onClick={onClick}
+      title={title}
+    >
+      {busy ? busyLabel : label}
     </button>
   )
 }

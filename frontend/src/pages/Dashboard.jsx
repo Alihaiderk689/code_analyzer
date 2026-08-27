@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../lib/AuthContext'
-import { getDashboardStats, getDashboardRecent, getDashboardLanguages, getDashboardScores } from '../lib/resources'
+import { getDashboard } from '../lib/resources'
 import { scoreColor, formatScore, formatDate } from '../lib/format'
 import { ApiError } from '../lib/api'
 
@@ -21,13 +21,20 @@ export default function Dashboard() {
   const [scores, setScores] = useState(null)
   const [error, setError] = useState('')
 
+  // One request, not four. GET /api/dashboard/ returns the same four pieces
+  // this page used to fetch in parallel; the backend is a 3-worker sync
+  // gunicorn pool, so a Promise.all of four calls made every dashboard load
+  // demand four workers simultaneously. Same data, same shape after the
+  // mapping below - see DashboardSummaryView in analyses/views.py.
   useEffect(() => {
-    Promise.all([getDashboardStats(), getDashboardRecent(5), getDashboardLanguages(), getDashboardScores()])
-      .then(([statsRes, recentRes, languagesRes, scoresRes]) => {
-        setStats(statsRes)
-        setRecent(recentRes.results)
-        setLanguages(languagesRes.languages)
-        setScores(scoresRes)
+    getDashboard()
+      .then((data) => {
+        setStats(data.stats)
+        setRecent(data.recent_analyses)
+        // `languages`, not `top_languages`: this card renders every language,
+        // and `top_languages` is capped at 5.
+        setLanguages(data.languages)
+        setScores(data.scores)
       })
       .catch((err) => setError(err instanceof ApiError ? err.message : 'Could not load dashboard.'))
   }, [])

@@ -6,6 +6,13 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from ..models import GitHubRepository, RepositoryContextCheck, RepositoryIndex
+from core.execution_budget import (
+    REASON_REQUEST_BUDGET_EXHAUSTED,
+    STAGE_AI_ENRICHMENT,
+    STAGE_BANDIT,
+)
+
+from ..services.fetch_budget import TRUNCATED_BUDGET_EXHAUSTED, FetchBudgetExceeded
 from ..services.github_client import GitHubAPIError, GitHubAuthError, GitHubRateLimitError
 from ..services.repository_service import RepositoryService
 from .factories import TEST_ENCRYPTION_KEY, make_authenticated_client, make_integration, make_repository, make_user
@@ -417,6 +424,7 @@ _CONTEXT_RESULT = {
     'path': 'app.py', 'language': 'Python', 'skipped': False, 'skip_reason': None,
     'content': 'print(1)\n', 'issues': [], 'score': 100.0, 'repo_context': '',
     'related': [{'path': 'utils.py', 'language': 'Python', 'relation': 'imports', 'issues': [], 'score': 100.0}],
+    'context_truncated': False, 'context_truncated_reason': '', 'degraded_stages': [],
 }
 
 
@@ -528,3 +536,106 @@ class RepositoryFileContextAnalyzeViewTests(TestCase):
         response = client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'app.py'})
 
         self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+
+    @patch('github_integration.repository_views.PRAnalysisService')
+    def test_truncated_context_is_persisted_and_exposed(self, mock_service_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_service_cls.return_value.analyze_file_with_context.return_value = {
+            **_CONTEXT_RESULT,
+            'context_truncated': True, 'context_truncated_reason': TRUNCATED_BUDGET_EXHAUSTED,
+        }
+
+        response = client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'app.py'})
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertTrue(response.data['context_truncated'])
+        self.assertEqual(response.data['context_truncated_reason'], TRUNCATED_BUDGET_EXHAUSTED)
+        self.assertEqual(RepositoryContextCheck.objects.get().context_truncated_reason, TRUNCATED_BUDGET_EXHAUSTED)
+
+        # The free "same path again today" response must not read as complete.
+        cached = client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'app.py'})
+        self.assertTrue(cached.data['cached'])
+        self.assertTrue(cached.data['context_truncated'])
+
+    @patch('github_integration.repository_views.PRAnalysisService')
+    def test_request_budget_degradation_is_persisted_and_survives_the_cached_response(self, mock_service_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_service_cls.return_value.analyze_file_with_context.return_value = {
+            **_CONTEXT_RESULT,
+            'context_truncated': True,
+            'context_truncated_reason': REASON_REQUEST_BUDGET_EXHAUSTED,
+            'degraded_stages': [STAGE_BANDIT, STAGE_AI_ENRICHMENT],
+        }
+        url = reverse('github-repository-analyze-file-context', args=[repository.pk])
+
+        response = client.post(url, {'path': 'app.py'})
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['context_truncated_reason'], REASON_REQUEST_BUDGET_EXHAUSTED)
+        self.assertEqual(response.data['degraded_stages'], [STAGE_BANDIT, STAGE_AI_ENRICHMENT])
+        check = RepositoryContextCheck.objects.get()
+        self.assertEqual(check.context_truncated_reason, REASON_REQUEST_BUDGET_EXHAUSTED)
+        self.assertEqual(check.degraded_stages, [STAGE_BANDIT, STAGE_AI_ENRICHMENT])
+
+        # The free "same path again today" response must report the same
+        # degradation - a cached partial result that reads as complete would
+        # be worse than no cache at all.
+        cached = client.post(url, {'path': 'app.py'})
+        self.assertTrue(cached.data['cached'])
+        self.assertTrue(cached.data['context_truncated'])
+        self.assertEqual(cached.data['context_truncated_reason'], REASON_REQUEST_BUDGET_EXHAUSTED)
+        self.assertEqual(cached.data['degraded_stages'], [STAGE_BANDIT, STAGE_AI_ENRICHMENT])
+        mock_service_cls.return_value.analyze_file_with_context.assert_called_once()
+
+    @patch('github_integration.repository_views.PRAnalysisService')
+    def test_stage_degradation_without_truncation_is_reported(self, mock_service_cls):
+        """Every neighbor was analyzed, but the AI prose was skipped. Not
+        truncation - the file coverage is complete - so the two fields must
+        disagree rather than both being forced true."""
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_service_cls.return_value.analyze_file_with_context.return_value = {
+            **_CONTEXT_RESULT, 'degraded_stages': [STAGE_AI_ENRICHMENT],
+        }
+
+        response = client.post(
+            reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'app.py'},
+        )
+
+        self.assertFalse(response.data['context_truncated'])
+        self.assertEqual(response.data['degraded_stages'], [STAGE_AI_ENRICHMENT])
+
+    @patch('github_integration.repository_views.PRAnalysisService')
+    def test_untruncated_context_reports_complete(self, mock_service_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_service_cls.return_value.analyze_file_with_context.return_value = _CONTEXT_RESULT
+
+        response = client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'app.py'})
+
+        self.assertFalse(response.data['context_truncated'])
+        self.assertEqual(response.data['context_truncated_reason'], '')
+        self.assertEqual(response.data['degraded_stages'], [])
+
+    @patch('github_integration.repository_views.PRAnalysisService')
+    def test_budget_exhausted_on_primary_file_is_503_and_not_an_auth_error(self, mock_service_cls):
+        client, user = make_authenticated_client()
+        integration = make_integration(user)
+        repository = make_repository(integration)
+        mock_service_cls.return_value.analyze_file_with_context.side_effect = FetchBudgetExceeded('out of time')
+
+        response = client.post(reverse('github-repository-analyze-file-context', args=[repository.pk]), {'path': 'app.py'})
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.assertEqual(response.data['context_truncated_reason'], TRUNCATED_BUDGET_EXHAUSTED)
+        # Nothing persisted, quota unspent, and the GitHub connection is not
+        # marked invalid - this was our deadline, not GitHub's answer.
+        self.assertEqual(RepositoryContextCheck.objects.count(), 0)
+        integration.refresh_from_db()
+        self.assertFalse(integration.token_invalid)

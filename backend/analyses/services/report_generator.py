@@ -6,7 +6,7 @@ analyses/serializers.py's SecurityReportSerializer for the exact contract).
 """
 from __future__ import annotations
 
-from .types import RiskLevel, SecurityFinding, Severity
+from .types import RiskLevel, ScannerUnavailable, SecurityFinding, Severity
 
 STARTING_SCORE = 100
 
@@ -32,13 +32,30 @@ _RISK_LEVEL_THRESHOLDS: list[tuple[int, RiskLevel]] = [
 
 
 class SecurityReportGenerator:
-    def build_report(self, findings: list[SecurityFinding]) -> dict:
+    def build_report(
+        self, findings: list[SecurityFinding], unavailable: list[ScannerUnavailable] | None = None,
+    ) -> dict:
+        """`unavailable` lists scanners that could not run. It is what stops a
+        failed scanner from rendering as a clean report: `scan_complete` is
+        False whenever any scanner was skipped, so the client can say "partial
+        result" instead of "no vulnerabilities found".
+
+        Deliberately does NOT change the score. A scanner failing is not
+        evidence of vulnerabilities, and inventing a penalty would be as
+        misleading in the other direction; the honest signal is the flag.
+
+        Defaulted to None so existing callers/tests that pass only findings
+        keep working unchanged.
+        """
+        unavailable = unavailable or []
         score = self._score(findings)
         return {
             'score': score,
             'risk_level': self._risk_level(score).value,
             'summary': self._summary(findings),
             'vulnerabilities': [f.to_dict() for f in self._sorted(findings)],
+            'scan_complete': not unavailable,
+            'scanners_unavailable': [u.to_dict() for u in unavailable],
         }
 
     @staticmethod

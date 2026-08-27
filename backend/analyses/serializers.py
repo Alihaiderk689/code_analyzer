@@ -75,6 +75,14 @@ class SecuritySummarySerializer(serializers.Serializer):
     total = serializers.IntegerField()
 
 
+class ScannerUnavailableSerializer(serializers.Serializer):
+    """A scanner that could not run for this submission - see
+    analyses/services/types.py's ScannerUnavailable."""
+    scanner = serializers.CharField()
+    reason = serializers.CharField()
+    detail = serializers.CharField(allow_blank=True, required=False)
+
+
 class SecurityReportSerializer(serializers.Serializer):
     """The full Security Analysis Mode response: overall score + risk badge
     at the top level, then the vulnerability list for the card grid."""
@@ -82,3 +90,8 @@ class SecurityReportSerializer(serializers.Serializer):
     risk_level = serializers.CharField()
     summary = SecuritySummarySerializer()
     vulnerabilities = SecurityVulnerabilitySerializer(many=True)
+    # False when any scanner could not run - the client must not present the
+    # result as a clean bill of health. Defaults keep older cached reports
+    # (stored before these fields existed) deserializing unchanged.
+    scan_complete = serializers.BooleanField(required=False, default=True)
+    scanners_unavailable = ScannerUnavailableSerializer(many=True, required=False, default=list)

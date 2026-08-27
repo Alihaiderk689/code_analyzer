@@ -127,4 +127,27 @@ export async function apiFetch(path, opts = {}) {
   return safeJson(res)
 }
 
+/**
+ * Single reporting point for client-side failures that would otherwise be
+ * swallowed - a caught-but-unexpected error, or a React render crash from
+ * ErrorBoundary.
+ *
+ * Today this writes to the console, which is all the project has: there is no
+ * error-tracking service configured (see docs/OPERATIONS.md). The value of
+ * routing through one function anyway is that wiring a real service later is a
+ * change here rather than a hunt through every catch block, and that the
+ * places which deliberately report are now greppable.
+ */
+export function reportClientError(message, error, context = {}) {
+  const detail = { message, context }
+  if (error instanceof ApiError) {
+    detail.status = error.status
+    detail.data = error.data
+  } else if (error) {
+    detail.error = error
+  }
+  // eslint-disable-next-line no-console
+  console.error('[client-error]', detail)
+}
+
 export { API_BASE_URL }

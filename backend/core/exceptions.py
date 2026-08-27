@@ -11,6 +11,8 @@ exception with a traceback, then always return a small JSON body instead.
 import logging
 
 from django.conf import settings
+from django.db import InterfaceError, OperationalError
+from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_exception_handler
 from rest_framework.exceptions import Throttled
@@ -32,6 +34,27 @@ def custom_exception_handler(exc, context):
         return response
 
     request = context.get('request')
+
+    # A dropped connection or an exhausted pooler is a dependency outage, not a
+    # bug in this code: 503 tells the client to retry, where the generic 500
+    # below implies "we broke, retrying won't help". Deliberately NO automatic
+    # retry here - retrying into an exhausted pooler is what turns a blip into
+    # an outage. Logged at error (not exception) since the traceback is always
+    # the same connection-teardown stack and carries no diagnostic value.
+    if isinstance(exc, (OperationalError, InterfaceError)):
+        logger.error(
+            'database_unavailable',
+            extra={
+                'path': getattr(request, 'path', None),
+                'method': getattr(request, 'method', None),
+                'error': exc.__class__.__name__,
+            },
+        )
+        return Response(
+            {'detail': 'Service temporarily unavailable. Please try again shortly.'},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
     logger.exception(
         'unhandled_exception',
         extra={'path': getattr(request, 'path', None), 'method': getattr(request, 'method', None)},

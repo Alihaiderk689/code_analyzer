@@ -15,15 +15,29 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
 
-from .types import BaseSecurityScanner, SecurityFinding, Severity, VulnerabilityType
+from core.execution_budget import STAGE_BANDIT
+
+from .types import BaseSecurityScanner, ScannerUnavailable, SecurityFinding, Severity, VulnerabilityType
 
 logger = logging.getLogger(__name__)
 
 BANDIT_TIMEOUT_SECONDS = 20
+
+# A Bandit run given less than this is not worth starting: it would almost
+# certainly be killed and reported as `reason='timeout'`, which blames the
+# scanner for our own deadline. Below this the scan is skipped outright and
+# reported as REASON_BUDGET_EXHAUSTED instead.
+MIN_BANDIT_SLICE_SECONDS = 5
+
+# ScannerUnavailable.reason for "the request-wide budget stopped this", kept
+# distinct from 'timeout' (Bandit really did hang), 'not_installed' and
+# 'unparsable_output' - a scanner failure and a deadline need different fixes.
+REASON_BUDGET_EXHAUSTED = 'budget_exhausted'
 
 # Bandit itself only has LOW/MEDIUM/HIGH. These specific checks are escalated
 # to CRITICAL here because they're conventionally treated that way (OWASP-
@@ -85,30 +99,80 @@ _RULE_TYPE_MAP: dict[str, VulnerabilityType] = {
 class BanditScanner(BaseSecurityScanner):
     name = 'bandit'
 
+    def __init__(self, budget=None) -> None:
+        self._unavailable: Optional[ScannerUnavailable] = None
+        # Optional request-wide deadline (core/execution_budget.py), injected
+        # via SecurityAnalysisService(scanners=[...]) by the repository-context
+        # path only. None - every other caller - means the historical
+        # behavior: a flat BANDIT_TIMEOUT_SECONDS with no total bound. Kept on
+        # the constructor rather than scan() so BaseSecurityScanner.scan's
+        # signature, which every scanner and test relies on, is untouched.
+        self._budget = budget
+
+    def consume_unavailable(self) -> Optional[ScannerUnavailable]:
+        unavailable, self._unavailable = self._unavailable, None
+        return unavailable
+
+    def _mark_unavailable(self, reason: str, detail: str = '') -> list[SecurityFinding]:
+        self._unavailable = ScannerUnavailable(scanner=self.name, reason=reason, detail=detail)
+        return []
+
     def scan(self, source_code: str, filename: str = 'submission.py', settings_source: str = '') -> list[SecurityFinding]:
+        self._unavailable = None
         with tempfile.TemporaryDirectory() as scratch_dir:
             script_path = Path(scratch_dir) / Path(filename).name
             script_path.write_text(source_code)
 
+            timeout = BANDIT_TIMEOUT_SECONDS
+            if self._budget is not None:
+                if not self._budget.can_afford(MIN_BANDIT_SLICE_SECONDS, STAGE_BANDIT):
+                    logger.warning('Bandit scan skipped - request budget exhausted.')
+                    return self._mark_unavailable(
+                        REASON_BUDGET_EXHAUSTED,
+                        'Skipped: the request time budget was exhausted before Bandit could run.',
+                    )
+                timeout = min(BANDIT_TIMEOUT_SECONDS, self._budget.remaining())
+
             try:
                 result = subprocess.run(
-                    ['bandit', '-f', 'json', str(script_path)],
+                    # `sys.executable -m bandit`, not a bare 'bandit': the
+                    # console script lives in the interpreter's own bin/ dir,
+                    # which is NOT on PATH when Python is invoked by absolute
+                    # path (a venv that was never "activated", and some process
+                    # managers). That made subprocess raise FileNotFoundError
+                    # and the scan return no findings at all - silently, until
+                    # scan_complete started reporting it. Going through the
+                    # running interpreter binds the scanner to the same
+                    # environment Django itself is running in.
+                    [sys.executable, '-m', 'bandit', '-f', 'json', str(script_path)],
                     capture_output=True,
-                    timeout=BANDIT_TIMEOUT_SECONDS,
+                    timeout=timeout,
                     text=True,
                 )
             except FileNotFoundError:
                 logger.error('Bandit is not installed or not on PATH - security scan skipped.')
-                return []
+                return self._mark_unavailable('not_installed', 'Bandit is not installed or not on PATH.')
             except subprocess.TimeoutExpired:
-                logger.warning('Bandit scan timed out after %ss - security scan skipped.', BANDIT_TIMEOUT_SECONDS)
-                return []
+                if self._budget is not None and self._budget.expired(STAGE_BANDIT):
+                    # Killed on a budget-clamped slice, not on Bandit's own
+                    # 20s ceiling - reporting 'timeout' here would blame the
+                    # scanner for the request running out of time.
+                    self._budget.mark_skipped(STAGE_BANDIT)
+                    logger.warning('Bandit scan cut short - request budget exhausted.')
+                    return self._mark_unavailable(
+                        REASON_BUDGET_EXHAUSTED,
+                        'Cut short: the request time budget was exhausted while Bandit was running.',
+                    )
+                logger.warning('Bandit scan timed out after %ss - security scan skipped.', timeout)
+                return self._mark_unavailable(
+                    'timeout', f'Bandit did not finish within {timeout:g}s.',
+                )
 
             try:
                 payload = json.loads(result.stdout or '{}')
             except json.JSONDecodeError:
                 logger.error('Could not parse Bandit output as JSON. stderr: %s', (result.stderr or '')[:500])
-                return []
+                return self._mark_unavailable('unparsable_output', 'Bandit output was not valid JSON.')
 
             for err in payload.get('errors', []):
                 # e.g. a syntax error in the submitted code - not a scanner bug,

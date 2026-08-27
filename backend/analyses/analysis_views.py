@@ -77,10 +77,24 @@ class UploadView(APIView):
         try:
             code = uploaded_file.read().decode('utf-8')
         except UnicodeDecodeError:
-            analysis = Analysis.objects.create(
-                owner=request.user, name=name, language=language, status=Analysis.Status.FAILED,
+            # Previously this created a FAILED Analysis row and returned 201,
+            # so the client saw "created" for something that never analysed and
+            # carried no reason why (Analysis has no error field). A rejected
+            # upload is a client error: say so, and don't persist a dead row.
+            return Response(
+                {'file': 'File must be UTF-8 encoded text. Binary or differently-encoded files cannot be analysed.'},
+                status=status.HTTP_400_BAD_REQUEST,
             )
-            return Response(AnalysisDetailSerializer(analysis).data, status=status.HTTP_201_CREATED)
+
+        # Matches AnalyzeRequestSerializer.validate_code, which already rejects
+        # whitespace-only pasted input. Without this an all-whitespace upload
+        # analyses to lines_of_code=0 and scores 0.0 - indistinguishable from
+        # genuinely terrible code, when it actually means "no code at all".
+        if not code.strip():
+            return Response(
+                {'file': 'File is empty or contains only whitespace.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         analysis = Analysis.objects.create(
             owner=request.user, name=name, language=language, source_code=code,

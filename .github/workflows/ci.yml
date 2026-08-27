@@ -54,6 +54,19 @@ jobs:
 
       - run: python manage.py test
 
+      # Dependency CVE audit. Non-blocking on purpose: the advisory feed moves
+      # independently of this repo, so a hard failure here would red-line
+      # builds for a newly-published CVE in a transitive dependency that the
+      # PR under test never touched. It also currently reports advisories
+      # against Django 4.2 itself, which are only fixable by a major-version
+      # upgrade. Flip `continue-on-error` off once that backlog is cleared and
+      # this becomes a real gate rather than a report.
+      - name: Audit Python dependencies (advisory)
+        continue-on-error: true
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
   frontend:
     runs-on: ubuntu-latest
     defaults:
@@ -72,6 +85,13 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run build
+
+      # Same rationale as the backend's pip-audit step above - see there.
+      # --audit-level=high ignores low/moderate advisories so this reports
+      # only what would actually warrant an out-of-band dependency bump.
+      - name: Audit npm dependencies (advisory)
+        continue-on-error: true
+        run: npm audit --audit-level=high
 
   # Only runs once backend+frontend CI passes, and only for pushes that land
   # on main (a merged PR is a push to main, so this covers "every merge" too)

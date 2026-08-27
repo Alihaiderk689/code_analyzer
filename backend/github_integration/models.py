@@ -165,6 +165,22 @@ class RepositoryContextCheck(models.Model):
     # out rather than recorded with an error, same as the primary file's own
     # skip handling one level up.
     related = models.JSONField(default=list, blank=True)
+    # '' means the full neighbor set above was fetched. Otherwise a reason
+    # constant from services/fetch_budget.py (today only
+    # 'fetch_budget_exhausted'): the shared GitHub-fetch deadline ran out and
+    # `related` is partial. Stored rather than derived so the free "same path
+    # again today" cached response reports it too, and deliberately distinct
+    # from a neighbor that simply failed to fetch - that is per-file, logged,
+    # and just absent from `related`.
+    context_truncated_reason = models.CharField(max_length=50, blank=True, default='')
+    # Expensive stages the time budget caused to be skipped, from
+    # core/execution_budget.py's STAGE_* constants ('runtime_check', 'bandit',
+    # 'ai_enrichment', 'related_files'). [] means everything ran. Distinct
+    # from context_truncated_reason: a check can be fully non-truncated in
+    # file coverage and still have had its AI prose skipped, and the two
+    # degradations have different operational causes. Stored so the free
+    # same-path-again-today cached response reports it too.
+    degraded_stages = models.JSONField(default=list, blank=True)
     # Backs "chat about this file" for the primary file only, exactly like
     # RepositoryFileCheck.analysis - related files don't get their own
     # Analysis row/chat, only a lightweight issues/score summary.
