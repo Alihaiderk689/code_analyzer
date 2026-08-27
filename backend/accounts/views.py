@@ -26,8 +26,9 @@ from github_integration.services.oauth_service import GitHubOAuthService
 
 from .brevo_client import BrevoAPIError
 from .cookies import REFRESH_COOKIE, clear_auth_cookies, set_auth_cookies, set_github_login_nonce_cookie
-from .emails import send_otp_email, send_password_reset_email
-from .otp import issue_otp
+from .emails import send_otp_email, send_otp_email_to, send_password_reset_email
+from .models import PendingRegistration
+from .otp import issue_otp, issue_otp_to
 from .serializers import (
     AvatarUploadSerializer,
     ChangePasswordSerializer,
@@ -62,6 +63,12 @@ class CsrfCookieView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+def _display_name_for(email):
+    """Greeting for a verification email sent to someone with no account yet,
+    and so no username to greet them by."""
+    return email.split('@')[0]
+
+
 class RegisterView(APIView):
     permission_classes = [AllowAny]
     throttle_classes = [RegisterRateThrottle]
@@ -70,10 +77,12 @@ class RegisterView(APIView):
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         try:
+            # Atomic so a failed send leaves nothing behind: without it the
+            # attempt would be recorded holding a code its owner never got.
             with transaction.atomic():
-                user = serializer.save()
-                code = issue_otp(user)
-                send_otp_email(user, code)
+                pending = serializer.save()
+                code = issue_otp_to(pending)
+                send_otp_email_to(pending.email, _display_name_for(pending.email), code)
         except BrevoAPIError:
             logger.error('accounts.otp_email_failed', exc_info=True)
             return Response(
@@ -81,7 +90,7 @@ class RegisterView(APIView):
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
         return Response(
-            {'detail': 'Registration successful. Check your email for a verification code.'},
+            {'detail': 'Check your email for a verification code to finish creating your account.'},
             status=status.HTTP_201_CREATED,
         )
 
@@ -258,17 +267,25 @@ class ResendVerificationView(APIView):
     def post(self, request):
         serializer = ResendVerificationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = User.objects.filter(email__iexact=serializer.validated_data['email']).first()
-        if user and not user.profile.is_verified:
-            try:
+        email = serializer.validated_data['email']
+        # An unverified signup lives in PendingRegistration and has no account
+        # to look up; an existing account mid email-change carries its code on
+        # the Profile. Same endpoint, same opaque response, two sources.
+        pending = PendingRegistration.objects.filter(email__iexact=email).first()
+        user = None if pending else User.objects.filter(email__iexact=email).first()
+        try:
+            if pending is not None:
+                code = issue_otp_to(pending)
+                send_otp_email_to(pending.email, _display_name_for(pending.email), code)
+            elif user and not user.profile.is_verified:
                 code = issue_otp(user)
                 send_otp_email(user, code)
-            except BrevoAPIError:
-                logger.error('accounts.otp_email_failed', exc_info=True)
-                return Response(
-                    {'detail': 'Email service is currently unavailable. Please try again.'},
-                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
-                )
+        except BrevoAPIError:
+            logger.error('accounts.otp_email_failed', exc_info=True)
+            return Response(
+                {'detail': 'Email service is currently unavailable. Please try again.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         return Response({
             'detail': 'If an account with that email exists and is unverified, a verification code has been sent.',
         })
