@@ -11,6 +11,9 @@ from analyses.models import Analysis
 from .models import GitHubIntegration, GitHubRepository, RepositoryContextCheck, RepositoryFileCheck, RepositoryIndex
 from .serializers import GitHubRepositorySerializer, RepositorySelectSerializer
 from .services.context_check_rate_limit import get_context_check_status
+from core.execution_budget import REASON_REQUEST_BUDGET_EXHAUSTED, BudgetExceeded
+
+from .services.fetch_budget import TRUNCATED_BUDGET_EXHAUSTED, FetchBudgetExceeded
 from .services.file_check_rate_limit import get_file_check_status
 from .services.github_client import GitHubAPIError, GitHubAuthError, GitHubClient, GitHubRateLimitError
 from .services.pr_analysis_service import FileSkipReason, PRAnalysisService, classify_path
@@ -341,7 +344,9 @@ class RepositoryFileContextAnalyzeView(APIView):
         if skip_reason:
             return Response({
                 'path': path, 'language': language, 'skipped': True,
-                'skip_reason': skip_reason, 'issues': [], 'score': None, 'related': [], 'cached': False,
+                'skip_reason': skip_reason, 'issues': [], 'score': None, 'related': [],
+                'context_truncated': False, 'context_truncated_reason': '',
+                'degraded_stages': [], 'cached': False,
             })
 
         tz_offset_minutes = request.data.get('tz_offset_minutes', 0)
@@ -360,6 +365,28 @@ class RepositoryFileContextAnalyzeView(APIView):
             result = PRAnalysisService().analyze_file_with_context(repository, path, integration.get_access_token())
         except GitHubAPIError as exc:
             return _handle_github_error(exc, integration)
+        except BudgetExceeded as exc:
+            # Only reachable if a budget ran out on the *primary* file, i.e.
+            # before any context existed to keep - there is no partial result
+            # worth persisting, and the quota stays unspent. Kept separate
+            # from _handle_github_error: GitHub was fine and no AI provider
+            # failed, we ran out of time. Which budget is reported back so an
+            # operator can tell "GitHub was slow" from "analysis was slow".
+            reason = (
+                TRUNCATED_BUDGET_EXHAUSTED if isinstance(exc, FetchBudgetExceeded)
+                else REASON_REQUEST_BUDGET_EXHAUSTED
+            )
+            logger.warning(
+                'github_context_check.budget_exhausted_on_primary',
+                extra={'path': path, 'reason': reason},
+            )
+            return Response(
+                {
+                    'detail': 'Analyzing this file took too long. Please try again shortly.',
+                    'context_truncated_reason': reason,
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
         if result['skipped']:
             # Doesn't count against the daily quota - a misclick on a binary/
@@ -371,6 +398,8 @@ class RepositoryFileContextAnalyzeView(APIView):
             user=request.user, repository=repository, path=path,
             language=result['language'] or '', issues=result['issues'], score=result['score'],
             related=result['related'], analysis=analysis,
+            context_truncated_reason=result.get('context_truncated_reason', ''),
+            degraded_stages=result.get('degraded_stages', []),
         )
         return Response({**_serialize_context_check(check), 'cached': False}, status=status.HTTP_201_CREATED)
 
@@ -430,6 +459,12 @@ def _serialize_context_check(check: RepositoryContextCheck) -> dict:
         'issues': check.issues,
         'score': check.score,
         'related': check.related,
+        # Partial-context marker - see RepositoryContextCheck
+        # .context_truncated_reason. Carried on the cached response too, so a
+        # truncated result never silently reads as complete.
+        'context_truncated': bool(check.context_truncated_reason),
+        'context_truncated_reason': check.context_truncated_reason,
+        'degraded_stages': check.degraded_stages,
         'analysis_id': check.analysis_id,
         'content': check.analysis.source_code if check.analysis_id else None,
         'repository_id': check.repository_id,

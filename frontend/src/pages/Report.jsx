@@ -3,7 +3,6 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
   getAnalysis,
   downloadReportPdf,
-  downloadReportJson,
   getReportHtml,
   reanalyzeAnalysis,
   deleteAnalysis,
@@ -67,14 +66,14 @@ export default function Report() {
     }
   }
 
-  const handleDownload = async (format) => {
-    setToast(`Generating ${format.toUpperCase()} report…`)
+  const handleDownloadPdf = async () => {
+    setToast('Generating PDF report…')
     try {
-      const blob = format === 'pdf' ? await downloadReportPdf(id) : await downloadReportJson(id)
-      triggerBlobDownload(blob, `analysis-${id}-report.${format}`)
+      const blob = await downloadReportPdf(id)
+      triggerBlobDownload(blob, `analysis-${id}-report.pdf`)
       setToast('Report downloaded.')
     } catch {
-      setToast(`Could not generate the ${format.toUpperCase()} report.`)
+      setToast('Could not generate the PDF report.')
     } finally {
       setTimeout(() => setToast(null), 2800)
     }
@@ -144,16 +143,9 @@ export default function Report() {
             <button
               className="btn-ghost"
               style={{ padding: '12px 16px', fontSize: 13, borderRight: '1px solid var(--color-border-2)' }}
-              onClick={() => handleDownload('pdf')}
+              onClick={handleDownloadPdf}
             >
               ↓ PDF
-            </button>
-            <button
-              className="btn-ghost"
-              style={{ padding: '12px 16px', fontSize: 13, borderRight: '1px solid var(--color-border-2)' }}
-              onClick={() => handleDownload('json')}
-            >
-              ↓ JSON
             </button>
             <button className="btn-ghost" style={{ padding: '12px 16px', fontSize: 13 }} onClick={handleViewHtml}>
               View HTML

@@ -17,6 +17,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 from core.throttling import (
     LoginRateThrottle,
     OtpResendRateThrottle,
+    OtpVerifyAccountRateThrottle,
     OtpVerifyRateThrottle,
     PasswordResetRateThrottle,
     RegisterRateThrottle,
@@ -40,6 +41,7 @@ from .serializers import (
     ResetPasswordSerializer,
     VerifyOtpSerializer,
 )
+from .tokens import revoke_all_refresh_tokens
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -219,6 +221,12 @@ class ResetPasswordView(APIView):
         user = serializer.validated_data['user']
         user.set_password(serializer.validated_data['new_password'])
         user.save()
+        # Whoever prompted this reset may well be locked out of the account
+        # *because* someone else is already logged into it, so leaving that
+        # someone else's refresh token working would defeat the point of the
+        # reset. Nothing is re-issued here: this endpoint is unauthenticated,
+        # and the frontend sends the user to the login page afterwards.
+        revoke_all_refresh_tokens(user)
         return Response({'detail': 'Password has been reset successfully.'})
 
 
@@ -227,10 +235,15 @@ class VerifyOtpView(APIView):
     now a POST with {email, code} instead of a GET with ?uid=&token= (see
     VerifyOtpSerializer for the actual check). Tightly throttled since a
     6-digit code is brute-forceable in a way a 128-bit token never was -
-    otp.py's own attempt-lockout is the primary defense, this is a backstop."""
+    otp.py's own attempt-lockout is the primary defense, these are backstops.
+
+    Two throttles, both applied: one keyed by IP (total volume from one
+    source), one by IP + target email (how much of that volume can be aimed at
+    a single account). See core/throttling.py for why neither subsumes the
+    other."""
 
     permission_classes = [AllowAny]
-    throttle_classes = [OtpVerifyRateThrottle]
+    throttle_classes = [OtpVerifyRateThrottle, OtpVerifyAccountRateThrottle]
 
     def post(self, request):
         serializer = VerifyOtpSerializer(data=request.data)
@@ -262,12 +275,27 @@ class ResendVerificationView(APIView):
 
 
 class ChangePasswordView(APIView):
+    """Changing a password revokes every refresh token the account has, then
+    immediately issues a fresh pair to *this* request's browser.
+
+    The revoke is the security half: a password change is the standard way to
+    boot an attacker (or an old, forgotten device) out of an account, and that
+    only works if their refresh token stops being accepted. Re-issuing is the
+    usability half - without it the caller keeps a still-valid access token
+    for up to its 15-minute lifetime and then gets silently logged out on its
+    next refresh, minutes after an action that appeared to succeed."""
+
     def post(self, request):
         serializer = ChangePasswordSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         request.user.set_password(serializer.validated_data['new_password'])
         request.user.save()
-        return Response({'detail': 'Password changed successfully.'})
+
+        revoke_all_refresh_tokens(request.user)
+        refresh = RefreshToken.for_user(request.user)
+        response = Response({'detail': 'Password changed successfully.'})
+        set_auth_cookies(response, access=str(refresh.access_token), refresh=str(refresh))
+        return response
 
 
 class ProfileView(APIView):
@@ -276,9 +304,40 @@ class ProfileView(APIView):
         return Response(serializer.data)
 
     def patch(self, request):
+        """Changing the email address re-runs verification for the new one.
+
+        Previously `email` was writable while `is_verified` was read-only, so a
+        PATCH moved the address and carried the verified flag across to an
+        address nobody had proved control of - and future password-reset mail
+        followed it there. The account stays active throughout (is_active is
+        untouched), so this costs the user a verification step, not access.
+
+        The whole thing runs in one transaction: if the OTP email cannot be
+        sent, the address change rolls back too, rather than leaving an account
+        pointing at an unverified address with no code on its way.
+        """
         serializer = ProfileSerializer(request.user, data=request.data, partial=True, context={'request': request})
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+
+        new_email = serializer.validated_data.get('email')
+        email_changed = new_email is not None and new_email != request.user.email
+
+        try:
+            with transaction.atomic():
+                serializer.save()
+                if email_changed:
+                    profile = request.user.profile
+                    profile.is_verified = False
+                    profile.save(update_fields=['is_verified'])
+                    code = issue_otp(request.user)
+                    send_otp_email(request.user, code)
+        except BrevoAPIError:
+            logger.error('accounts.otp_email_failed', exc_info=True)
+            return Response(
+                {'detail': 'Email service is currently unavailable. Please try again.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
         return Response(serializer.data)
 
     def delete(self, request):

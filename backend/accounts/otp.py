@@ -9,7 +9,11 @@ import hmac
 import secrets
 from datetime import timedelta
 
+from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
+
+from .models import Profile
 
 OTP_EXPIRY_MINUTES = 10
 # Security model for a 6-digit code is short expiry + attempt-lockout + IP
@@ -19,12 +23,27 @@ OTP_EXPIRY_MINUTES = 10
 OTP_MAX_ATTEMPTS = 5
 
 
+def _otp_pepper():
+    """Server-side secret keying the OTP HMAC (settings.OTP_PEPPER_KEY, falling
+    back to SECRET_KEY). Read per-call rather than at import so override_settings
+    works in tests and so a rotated key takes effect on reload.
+
+    Why HMAC rather than a bare digest: the keyspace here is only 10^6, so an
+    attacker holding a database dump can exhaust every possible plain SHA-256
+    OTP hash in well under a second on commodity hardware. Keying the digest
+    with a secret that lives in the environment (not the database) means a
+    dump of the DB alone is not enough to turn otp_code_hash back into a
+    usable code - the attacker needs the application's secret too.
+    """
+    return (settings.OTP_PEPPER_KEY or settings.SECRET_KEY).encode()
+
+
 def generate_otp_code():
     return f'{secrets.randbelow(1_000_000):06d}'
 
 
 def hash_otp_code(code):
-    return hashlib.sha256(code.encode()).hexdigest()
+    return hmac.new(_otp_pepper(), code.encode(), hashlib.sha256).hexdigest()
 
 
 def issue_otp(user):
@@ -40,37 +59,55 @@ def issue_otp(user):
     return code
 
 
-def _clear_otp(profile):
+def _clear_otp(profile, **extra_fields):
+    for field, value in extra_fields.items():
+        setattr(profile, field, value)
     profile.otp_code_hash = None
     profile.otp_expires_at = None
     profile.otp_attempts = 0
-    profile.save(update_fields=['otp_code_hash', 'otp_expires_at', 'otp_attempts'])
+    profile.save(update_fields=[*extra_fields, 'otp_code_hash', 'otp_expires_at', 'otp_attempts'])
 
 
 def verify_otp(user, submitted_code):
     """Returns (success, error_code) where error_code is one of 'expired',
     'too_many_attempts', 'incorrect', or '' on success. On success, activates
     the account and clears the OTP fields; on a wrong guess, increments the
-    attempt counter (persisted) so lockout survives across requests."""
-    profile = user.profile
+    attempt counter (persisted) so lockout survives across requests.
 
-    if not profile.otp_code_hash or not profile.otp_expires_at:
-        return False, 'incorrect'
+    The whole read-check-write cycle runs inside one transaction with the
+    Profile row locked (SELECT ... FOR UPDATE). Without the lock, N concurrent
+    verify requests for the same account all read the same otp_attempts value
+    and all write back value+1, so N guesses cost one attempt - which is
+    exactly the lockout that OTP_MAX_ATTEMPTS exists to enforce being bypassed
+    by an attacker who simply fires their guesses in parallel.
+    """
+    with transaction.atomic():
+        try:
+            profile = Profile.objects.select_for_update().get(user_id=user.pk)
+        except Profile.DoesNotExist:
+            return False, 'incorrect'
 
-    if timezone.now() > profile.otp_expires_at:
-        return False, 'expired'
+        if not profile.otp_code_hash or not profile.otp_expires_at:
+            return False, 'incorrect'
 
-    if profile.otp_attempts >= OTP_MAX_ATTEMPTS:
-        return False, 'too_many_attempts'
+        if timezone.now() > profile.otp_expires_at:
+            return False, 'expired'
 
-    if not hmac.compare_digest(profile.otp_code_hash, hash_otp_code(submitted_code)):
-        profile.otp_attempts += 1
-        profile.save(update_fields=['otp_attempts'])
-        return False, 'incorrect'
+        if profile.otp_attempts >= OTP_MAX_ATTEMPTS:
+            return False, 'too_many_attempts'
 
-    user.is_active = True
-    user.save(update_fields=['is_active'])
-    profile.is_verified = True
-    profile.save(update_fields=['is_verified'])
-    _clear_otp(profile)
+        if not hmac.compare_digest(profile.otp_code_hash, hash_otp_code(submitted_code)):
+            profile.otp_attempts += 1
+            profile.save(update_fields=['otp_attempts'])
+            user.profile = profile
+            return False, 'incorrect'
+
+        user.is_active = True
+        user.save(update_fields=['is_active'])
+        _clear_otp(profile, is_verified=True)
+
+    # The caller's `user` was loaded before the lock, so its cached reverse
+    # one-to-one still holds the pre-verification Profile - point it at the row
+    # this function actually wrote, so `user.profile.is_verified` is correct.
+    user.profile = profile
     return True, ''

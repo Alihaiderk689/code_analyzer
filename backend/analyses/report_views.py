@@ -1,5 +1,4 @@
 import io
-import json
 
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -19,29 +18,6 @@ def _get_owned_analysis(request, analysis_id):
 
 def _render_report_html(analysis):
     return render_to_string('analyses/report.html', {'analysis': analysis, 'generated_at': timezone.now()})
-
-
-class JSONReportView(APIView):
-    def get(self, request, analysis_id):
-        analysis = _get_owned_analysis(request, analysis_id)
-        data = {
-            'id': analysis.id,
-            'name': analysis.name,
-            'language': analysis.language,
-            'status': analysis.status,
-            'quality_score': analysis.quality_score,
-            'issues_count': analysis.issues_count,
-            'lines_of_code': analysis.lines_of_code,
-            'issues': analysis.issues,
-            'ai_explanation': analysis.ai_explanation or None,
-            'ai_suggestions': analysis.ai_suggestions or None,
-            'ai_refactored_code': analysis.ai_refactored_code or None,
-            'created_at': analysis.created_at.isoformat(),
-            'updated_at': analysis.updated_at.isoformat(),
-        }
-        response = HttpResponse(json.dumps(data, indent=2), content_type='application/json')
-        response['Content-Disposition'] = f'attachment; filename="analysis-{analysis.id}-report.json"'
-        return response
 
 
 class HTMLReportView(APIView):

@@ -65,12 +65,34 @@ def _score_summary_for(queryset):
 
 
 class DashboardSummaryView(APIView):
+    """Everything the dashboard page needs, in one request.
+
+    The page used to fetch /stats/, /recent/, /languages/ and /scores/ as four
+    parallel calls. On a 3-worker sync gunicorn pool that is one page load
+    demanding four workers at once, and load testing measured those four
+    endpoints at 47.8% of all worker time - a third of which was per-request
+    overhead paid four times over rather than once.
+
+    The four endpoints remain, unchanged: they are a supported part of the API
+    and this view has always been the aggregate of them.
+    """
+
     def get(self, request):
         queryset = Analysis.objects.filter(owner=request.user)
+        # Computed once and sliced, exactly as before - `[:5]` was already
+        # applied to the full breakdown, so this adds no query and no work.
+        languages = _language_breakdown_for(queryset)
         return Response({
             'stats': _stats_for(queryset),
             'recent_analyses': AnalysisSerializer(queryset[:5], many=True).data,
-            'top_languages': _language_breakdown_for(queryset)[:5],
+            'top_languages': languages[:5],
+            # The full breakdown, identical to what LanguageUsageView
+            # (/dashboard/languages/) serves. Added rather than lifting the cap
+            # on `top_languages`: the dashboard's "Languages used" card renders
+            # every language, but `top_languages` is an existing part of this
+            # response whose name promises a top-N, and redefining it would
+            # change that contract for anything already reading it.
+            'languages': languages,
             'scores': _score_summary_for(queryset),
         })
 

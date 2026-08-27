@@ -73,6 +73,22 @@ VULNERABILITY_TYPE_LABELS: dict[VulnerabilityType, str] = {
 
 
 @dataclass
+class ScannerUnavailable:
+    """Reported by a scanner that could not run at all (binary missing, timed
+    out, unparsable output). Distinct from "ran and found nothing": without
+    this, a scanner failing produced an empty finding list that rendered as a
+    clean security report, which is worse than an error - it is false
+    assurance on a security feature."""
+
+    scanner: str
+    reason: str
+    detail: str = ''
+
+    def to_dict(self) -> dict:
+        return {'scanner': self.scanner, 'reason': self.reason, 'detail': self.detail}
+
+
+@dataclass
 class SecurityFinding:
     """One vulnerability finding, in the shape every scanner must produce.
     `explanation`/`remediation` start empty - only ai_security_service fills
@@ -123,11 +139,24 @@ class BaseSecurityScanner(abc.ABC):
 
     name: str = 'base'
 
+    def consume_unavailable(self) -> Optional[ScannerUnavailable]:
+        """Returns a ScannerUnavailable if the most recent scan() could not run,
+        else None. Called by SecurityAnalysisService immediately after scan();
+        implementations that can always run may leave this returning None.
+
+        Stateful-by-design (set during scan, read straight after) so the
+        scan() -> list[SecurityFinding] signature every existing scanner and
+        test relies on does not have to change."""
+        return None
+
     @abc.abstractmethod
     def scan(self, source_code: str, filename: str = 'submission.py', settings_source: str = '') -> list[SecurityFinding]:
         """Must not raise for scanner-internal failures (bad input, tool
         crash/missing binary, timeout) - log and return [] instead, so one
-        scanner failing never takes down the whole security analysis.
+        scanner failing never takes down the whole security analysis. When the
+        scanner could not run at all, also record it so consume_unavailable()
+        can report it - an empty list alone is indistinguishable from a clean
+        result.
 
         `settings_source` is the analyzed repo's Django settings file content,
         when one could be found (see pr_analysis_service._find_settings_source) -

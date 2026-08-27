@@ -22,3 +22,10 @@ frontend/*.local
 
 # OS
 .DS_Store
+
+# Load testing (loadtest/) - results are large and machine-specific, and
+# users.json holds minted bearer tokens for the fixture accounts. The k6
+# script, the shell wrappers and the README are committed; these are not.
+loadtest/results/
+loadtest/users.json
+loadtest/__pycache__/

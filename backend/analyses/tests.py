@@ -3,7 +3,7 @@ from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import SimpleTestCase
-from django.urls import reverse
+from django.urls import NoReverseMatch, reverse
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
@@ -221,11 +221,25 @@ class AnalyzeUploadEndpointTests(APITestCase):
         response = self.client.post(reverse('analysis-upload'), {'file': upload}, format='multipart')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_upload_non_utf8_file_marked_failed_not_500(self):
+    def test_upload_non_utf8_file_rejected_with_400(self):
+        """Contract change (was 201 + status='failed'): returning "created" for
+        something that never analysed, with no field to say why, made a client
+        error look like a successful submission. It is a client error, so 400 -
+        and no dead Analysis row is persisted."""
         upload = SimpleUploadedFile('binary.py', b'\xff\xfe\x00\x01', content_type='application/octet-stream')
         response = self.client.post(reverse('analysis-upload'), {'file': upload}, format='multipart')
-        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(response.data['status'], 'failed')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('UTF-8', response.data['file'])
+        self.assertFalse(Analysis.objects.filter(name='binary.py').exists())
+
+    def test_upload_rejects_whitespace_only_file(self):
+        """Mirrors test_analyze_rejects_empty_code for the upload path - without
+        it a whitespace-only file analysed to lines_of_code=0 and scored 0.0,
+        which reads as terrible code rather than no code."""
+        upload = SimpleUploadedFile('blank.py', b'   \n\n\t\n', content_type='text/plain')
+        response = self.client.post(reverse('analysis-upload'), {'file': upload}, format='multipart')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(Analysis.objects.filter(name='blank.py').exists())
 
 
 class AnalysisOwnershipTests(APITestCase):
@@ -361,6 +375,166 @@ class DashboardSummaryTests(APITestCase):
         response = self.client.get(reverse('dashboard-recent'), {'limit': 2})
         self.assertEqual(len(response.data['results']), 2)
         self.assertEqual(response.data['count'], 5)
+
+    def _seed_seven_languages(self):
+        """Seven languages, descending in analysis count, so `top_languages`
+        and `languages` are guaranteed to differ."""
+        languages = ['Python', 'JavaScript', 'TypeScript', 'Java', 'Go', 'Ruby', 'Rust']
+        for rank, language in enumerate(languages):
+            for n in range(len(languages) - rank):
+                Analysis.objects.create(
+                    owner=self.user, name=f'{language}-{n}', language=language,
+                    status=Analysis.Status.COMPLETED, quality_score=80.0, lines_of_code=10,
+                )
+        return languages
+
+    def test_summary_returns_every_language_plus_a_capped_top_five(self):
+        """The dashboard page renders every language, so the summary endpoint
+        has to carry the full breakdown - but `top_languages` is an existing
+        part of this response and stays capped at 5."""
+        self._seed_seven_languages()
+
+        response = self.client.get(reverse('dashboard-summary'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['top_languages']), 5)
+        self.assertEqual(len(response.data['languages']), 7)
+        # top_languages must remain the leading slice of the full breakdown,
+        # not an independently-ordered list.
+        self.assertEqual(response.data['top_languages'], response.data['languages'][:5])
+
+    def test_summary_matches_the_four_dedicated_endpoints(self):
+        """Dashboard.jsx fetches this one endpoint instead of /stats/,
+        /recent/?limit=5, /languages/ and /scores/. If any section drifts from
+        the endpoint it replaced, the page silently renders different data -
+        so pin all four to their originals."""
+        self._seed_seven_languages()
+        Analysis.objects.create(owner=self.user, name='pending.py', language='Python',
+                                 status=Analysis.Status.PENDING)
+
+        summary = self.client.get(reverse('dashboard-summary')).data
+
+        self.assertEqual(summary['stats'], self.client.get(reverse('dashboard-stats')).data)
+        self.assertEqual(summary['scores'], self.client.get(reverse('dashboard-scores')).data)
+        self.assertEqual(
+            summary['languages'],
+            self.client.get(reverse('dashboard-languages')).data['languages'],
+        )
+        self.assertEqual(
+            summary['recent_analyses'],
+            self.client.get(reverse('dashboard-recent'), {'limit': 5}).data['results'],
+        )
+
+    def test_summary_scoped_to_owner(self):
+        other_client, other_user = make_authenticated_client('dash-summary-other@example.com')
+        Analysis.objects.create(owner=other_user, name='not-mine', language='Haskell',
+                                 status=Analysis.Status.COMPLETED, quality_score=10.0)
+
+        response = self.client.get(reverse('dashboard-summary'))
+        self.assertEqual(response.data['stats']['total_analyses'], 0)
+        self.assertEqual(response.data['languages'], [])
+        self.assertEqual(response.data['recent_analyses'], [])
+
+
+class ReportExportTests(APITestCase):
+    """The PDF is now the only download, so it has to carry everything the
+    Report page shows - including the analyzed source, which it previously
+    omitted entirely, and the id/updated_at that the removed JSON export was
+    the only way to get."""
+
+    def setUp(self):
+        self.client, self.user = make_authenticated_client('report@example.com')
+        self.analysis = Analysis.objects.create(
+            owner=self.user, name='payment.py', language='Python',
+            status=Analysis.Status.COMPLETED, quality_score=72.5,
+            issues_count=1, lines_of_code=3,
+            issues=[{'line': 2, 'type': 'todo', 'message': 'TODO left in code'}],
+            source_code='import os\nx = 1  # TODO\nprint(x)\n',
+        )
+
+    def test_html_report_includes_the_analyzed_source(self):
+        response = self.client.get(reverse('report-html', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = response.content.decode()
+        self.assertIn('Source Code', body)
+        self.assertIn('print(x)', body)
+
+    def test_html_report_includes_id_and_updated_at(self):
+        response = self.client.get(reverse('report-html', args=[self.analysis.id]))
+        body = response.content.decode()
+        self.assertIn('Analysis ID', body)
+        self.assertIn(str(self.analysis.id), body)
+        self.assertIn('Last Updated', body)
+
+    def test_ai_sections_appear_only_once_generated(self):
+        before = self.client.get(reverse('report-html', args=[self.analysis.id])).content.decode()
+        self.assertNotIn('AI Explanation', before)
+        self.assertNotIn('AI Suggestions', before)
+        self.assertNotIn('AI-Refactored Code', before)
+
+        self.analysis.ai_explanation = 'This module reads an env var.'
+        self.analysis.ai_suggestions = ['Remove the TODO', 'Add a docstring']
+        self.analysis.ai_refactored_code = 'print(1)\n'
+        self.analysis.save()
+
+        after = self.client.get(reverse('report-html', args=[self.analysis.id])).content.decode()
+        self.assertIn('This module reads an env var.', after)
+        self.assertIn('Remove the TODO', after)
+        self.assertIn('AI-Refactored Code', after)
+
+    def test_security_report_section_renders_when_scanned(self):
+        self.analysis.security_report = {
+            'score': 40, 'risk_level': 'high',
+            'summary': {'critical': 1, 'high': 0, 'medium': 0, 'low': 0, 'total': 1},
+            'vulnerabilities': [{
+                'id': 'v1', 'scanner': 'bandit', 'rule_id': 'B105',
+                'vulnerability_type': 'hardcoded_password', 'severity': 'critical',
+                'title': 'Hardcoded Password', 'description': 'A password literal was found.',
+                'line_number': 2, 'code_snippet': "pw = 'hunter2'",
+                'remediation': 'Read it from the environment instead.',
+            }],
+            'scan_complete': True, 'scanners_unavailable': [],
+        }
+        self.analysis.save(update_fields=['security_report'])
+
+        body = self.client.get(reverse('report-html', args=[self.analysis.id])).content.decode()
+        self.assertIn('Security Report', body)
+        self.assertIn('Hardcoded Password', body)
+        self.assertIn('Read it from the environment instead.', body)
+
+    def test_incomplete_scan_is_flagged_not_presented_as_clean(self):
+        self.analysis.security_report = {
+            'score': 100, 'risk_level': 'minimal',
+            'summary': {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'total': 0},
+            'vulnerabilities': [], 'scan_complete': False,
+            'scanners_unavailable': [{'scanner': 'bandit', 'reason': 'not_installed', 'detail': ''}],
+        }
+        self.analysis.save(update_fields=['security_report'])
+
+        body = self.client.get(reverse('report-html', args=[self.analysis.id])).content.decode()
+        self.assertIn('This scan was incomplete.', body)
+        self.assertIn('bandit', body)
+
+    def test_pdf_report_is_generated_and_served_as_an_attachment(self):
+        response = self.client.get(reverse('report-pdf', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response['Content-Type'], 'application/pdf')
+        self.assertIn(f'analysis-{self.analysis.id}-report.pdf', response['Content-Disposition'])
+        self.assertTrue(response.content.startswith(b'%PDF'))
+
+    def test_reports_are_scoped_to_the_owner(self):
+        other_client, other_user = make_authenticated_client('report-other@example.com')
+        for name in ('report-html', 'report-pdf'):
+            response = other_client.get(reverse(name, args=[self.analysis.id]))
+            self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND, name)
+
+    def test_json_report_route_no_longer_exists(self):
+        """The JSON download was removed; the PDF carries its unique fields now."""
+        with self.assertRaises(NoReverseMatch):
+            reverse('report-json', args=[self.analysis.id])
+        self.assertEqual(
+            self.client.get(f'/api/reports/{self.analysis.id}/json/').status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
 
 
 class SearchTests(APITestCase):
@@ -511,6 +685,104 @@ class SecurityAnalysisViewTests(APITestCase):
         finding = response.data['vulnerabilities'][0]
         self.assertEqual(finding['explanation'], 'Anyone reading the source gets the password.')
         self.assertEqual(finding['remediation'], 'Load it from an environment variable.')
+
+
+class RefactorViewTests(APITestCase):
+    """The Refactored Code tab's "Try Another Refactor" button is the only way
+    past RefactorView's cache, so the cached/regenerate split is the behaviour
+    that button depends on. Previously untested (SuggestionsViewTests covered
+    the equivalent path for suggestions, RefactorView had nothing)."""
+
+    def setUp(self):
+        self.client, self.user = make_authenticated_client('refactor@example.com')
+        self.analysis = Analysis.objects.create(
+            owner=self.user, name='avg.py', language='Python',
+            source_code='def calculate_average(numbers)\n    return sum(numbers) / len(numbers)\n',
+            status=Analysis.Status.COMPLETED, quality_score=40.0,
+            issues=[{'line': 1, 'type': 'syntax_error', 'message': 'SyntaxError: invalid syntax.'}],
+        )
+
+    @patch('analyses.ai_views.generate_text')
+    def test_first_call_generates_and_persists(self, mock_generate):
+        mock_generate.return_value = (
+            '{"code": "def calculate_average(numbers):\\n    return 0.0\\n", '
+            '"changes": [{"summary": "Added the missing colon.", "benefit": "Fixes the SyntaxError."}]}'
+        )
+        response = self.client.get(reverse('analysis-refactor', args=[self.analysis.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data.get('cached', False))
+        self.assertIn('calculate_average', response.data['refactored_code'])
+        self.assertEqual(response.data['explanation'][0]['summary'], 'Added the missing colon.')
+
+        self.analysis.refresh_from_db()
+        self.assertTrue(self.analysis.ai_refactored_code)
+        self.assertEqual(mock_generate.call_count, 1)
+
+    @patch('analyses.ai_views.generate_text')
+    def test_second_call_serves_the_cache_without_calling_the_ai(self, mock_generate):
+        self.analysis.ai_refactored_code = 'print("saved")\n'
+        self.analysis.ai_refactor_explanation = '[{"summary": "Saved change.", "benefit": "Saved benefit."}]'
+        self.analysis.save(update_fields=['ai_refactored_code', 'ai_refactor_explanation'])
+
+        response = self.client.get(reverse('analysis-refactor', args=[self.analysis.id]))
+
+        self.assertTrue(response.data['cached'])
+        self.assertEqual(response.data['refactored_code'], 'print("saved")\n')
+        self.assertEqual(response.data['explanation'][0]['summary'], 'Saved change.')
+        mock_generate.assert_not_called()
+
+    @patch('analyses.ai_views.generate_text')
+    def test_try_another_refactor_bypasses_the_cache_and_overwrites_it(self, mock_generate):
+        """What the button does: ?regenerate=true must reach the AI even though
+        a saved result exists, and replace it."""
+        self.analysis.ai_refactored_code = 'print("old")\n'
+        self.analysis.ai_refactor_explanation = '[{"summary": "Old change.", "benefit": "Old benefit."}]'
+        self.analysis.save(update_fields=['ai_refactored_code', 'ai_refactor_explanation'])
+        mock_generate.return_value = (
+            '{"code": "print(\\"new\\")\\n", '
+            '"changes": [{"summary": "New change.", "benefit": "New benefit."}]}'
+        )
+
+        response = self.client.get(f"{reverse('analysis-refactor', args=[self.analysis.id])}?regenerate=true")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.data.get('cached', False))
+        self.assertIn('new', response.data['refactored_code'])
+        self.assertEqual(response.data['explanation'][0]['summary'], 'New change.')
+        mock_generate.assert_called_once()
+
+        # The new result must replace the old one, not sit alongside it -
+        # otherwise the next plain visit would serve the stale refactor again.
+        self.analysis.refresh_from_db()
+        self.assertIn('new', self.analysis.ai_refactored_code)
+        self.assertNotIn('old', self.analysis.ai_refactored_code)
+
+    @patch('analyses.ai_views.generate_text')
+    def test_regenerate_only_triggers_on_the_exact_flag(self, mock_generate):
+        self.analysis.ai_refactored_code = 'print("saved")\n'
+        self.analysis.save(update_fields=['ai_refactored_code'])
+
+        for query in ('regenerate=false', 'regenerate=1', 'regenerate=yes', ''):
+            response = self.client.get(f"{reverse('analysis-refactor', args=[self.analysis.id])}?{query}")
+            self.assertTrue(response.data['cached'], query)
+        mock_generate.assert_not_called()
+
+    @patch('analyses.ai_views.generate_text', side_effect=RuntimeError('provider down'))
+    def test_regenerate_failure_returns_503_and_keeps_the_cached_result(self, _mock):
+        self.analysis.ai_refactored_code = 'print("saved")\n'
+        self.analysis.save(update_fields=['ai_refactored_code'])
+
+        response = self.client.get(f"{reverse('analysis-refactor', args=[self.analysis.id])}?regenerate=true")
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.analysis.refresh_from_db()
+        self.assertEqual(self.analysis.ai_refactored_code, 'print("saved")\n')
+
+    def test_404_for_another_users_analysis(self):
+        other_client, _ = make_authenticated_client('intruder-refactor@example.com')
+        response = other_client.get(reverse('analysis-refactor', args=[self.analysis.id]))
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
 
 class SuggestionsViewTests(APITestCase):

@@ -4,6 +4,8 @@ import re
 import parso
 from pyflakes.checker import Checker
 
+from core.execution_budget import STAGE_RUNTIME_CHECK
+
 from . import sandbox
 
 _PARSO_GRAMMAR = parso.load_grammar()
@@ -49,6 +51,11 @@ ISSUE_PENALTIES = {
     # Informational only (sandboxed execution isn't available on this host) -
     # not a code quality problem, so it must not move the score.
     'runtime_check_unavailable': 0,
+    # Informational only (the request ran out of time budget before the
+    # runtime check could run) - same zero-penalty rationale: not running a
+    # check is not evidence of a problem. Distinct from the type above so
+    # "this host can't" and "this request couldn't afford it" stay separable.
+    'runtime_check_skipped': 0,
 }
 
 # pyflakes message class name -> (issue type, penalty override or None to use the
@@ -84,7 +91,7 @@ def _dedupe_cascading_syntax_errors(errors):
     return kept
 
 
-def _python_issues(code):
+def _python_issues(code, budget=None):
     """Real syntax + undefined-name/unused-import checks for Python via ast + pyflakes.
     Other languages only get the generic textual checks below - there's no equivalent
     parser wired up for them here."""
@@ -119,16 +126,32 @@ def _python_issues(code):
 
     # Only worth actually running the code once it's known to at least parse cleanly -
     # a file with a syntax error already returned above and never reaches this point.
-    issues.extend(_python_runtime_issues(code))
+    issues.extend(_python_runtime_issues(code, budget))
     return issues
 
 
-def _python_runtime_issues(code):
+def _python_runtime_issues(code, budget=None):
     """Sandboxed execution catches the *first* uncaught runtime error a script would
     hit - things like IndexError/KeyError/ZeroDivisionError that no static analyzer
     can predict without running the code. This can only ever surface one such error
     per analysis, the same way running the script yourself would stop at the first
     uncaught exception; see sandbox.py for exactly what is and isn't sandboxed."""
+    # The sandbox is a fixed-cost stage: it either gets its full
+    # sandbox.TIMEOUT_SECONDS or it is not worth starting, since a run cut
+    # short would report `execution_timeout` ("possible infinite loop") about
+    # code that is fine. `budget` is the optional request-wide deadline
+    # (core/execution_budget.py); None - every caller except the
+    # repository-context path - runs it unconditionally as before.
+    if budget is not None and not budget.can_afford(sandbox.TIMEOUT_SECONDS, STAGE_RUNTIME_CHECK):
+        return [{
+            'line': None,
+            'type': 'runtime_check_skipped',
+            'message': (
+                'Runtime error detection was skipped because this request ran out of its time '
+                'budget; only static analysis was performed for this file.'
+            ),
+        }]
+
     result = sandbox.run_python(code)
 
     if result['status'] == 'error':
@@ -256,7 +279,7 @@ def detect_language_from_code(code):
     return max(scores, key=scores.get)
 
 
-def analyze_code(code, language='Unknown'):
+def analyze_code(code, language='Unknown', budget=None):
     lines = code.splitlines()
     lines_of_code = len([line for line in lines if line.strip()])
 
@@ -280,7 +303,7 @@ def analyze_code(code, language='Unknown'):
         issues.append({'line': None, 'type': 'no_comments', 'message': 'File has no comments.'})
 
     if language == 'Python':
-        issues.extend(_python_issues(code))
+        issues.extend(_python_issues(code, budget))
 
     quality_score = _score(lines_of_code, issues)
     return {
