@@ -8,6 +8,16 @@
 set -e
 
 if [ "$1" = "gunicorn" ]; then
+    # Which database is this container actually pointed at? Printed (password
+    # masked) before migrate runs, because a stale connection string and a
+    # broken database produce the same traceback: migrate names the host only
+    # after failing to connect, so there is no way to tell "the platform never
+    # picked up my new value" from "the new value is wrong". On Render a
+    # service-level env var silently shadows an env-group one, which makes the
+    # first case both common and invisible.
+    if [ "$ENVIRONMENT" = "production" ]; then _db="$DATABASE_URL_PROD"; else _db="$DATABASE_URL_DEV"; fi
+    echo "DB target ($ENVIRONMENT): $(printf '%s' "$_db" | sed -E 's#://([^:]*):[^@]*@#://\1:****@#')"
+
     echo "Applying database migrations..."
     python manage.py migrate --noinput
 
