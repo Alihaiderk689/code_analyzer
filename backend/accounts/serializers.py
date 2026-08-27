@@ -74,8 +74,26 @@ class EmailLoginSerializer(serializers.Serializer):
     def validate(self, attrs):
         attrs['email'] = normalize_email(attrs['email'])
         user = User.objects.filter(email__iexact=attrs['email']).first()
-        if user is None or not user.is_active or not user.check_password(attrs['password']):
-            raise serializers.ValidationError('No active account found with the given credentials.')
+        # An unknown address and a wrong password deliberately share one
+        # message: saying which of the two was wrong turns this endpoint into
+        # an oracle for "is this address registered here", which is worth more
+        # to someone enumerating accounts than the extra precision is to a user
+        # who mistyped their own password.
+        if user is None or not user.check_password(attrs['password']):
+            raise serializers.ValidationError(
+                'Incorrect email or password. If you do not have an account yet, create one.'
+            )
+        # Unverified is a different case, and safe to name: reaching this line
+        # means the password was correct, so the caller already holds the
+        # account's credentials and learns nothing from being told its state.
+        # Folding it into the message above is what produced "no active account
+        # found" for an account that plainly exists - a dead end for the one
+        # user who most needs a next step, since registering is what put them
+        # here (see RegisterSerializer, which sets is_active=False).
+        if not user.is_active:
+            raise serializers.ValidationError(
+                'Your email address is not verified yet. Check your inbox for the verification code.'
+            )
 
         update_last_login(None, user)
         refresh = RefreshToken.for_user(user)

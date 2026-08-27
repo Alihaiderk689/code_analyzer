@@ -14,12 +14,24 @@ export class ApiError extends Error {
 
 function extractMessage(data) {
   if (!data) return null
-  if (typeof data.detail === 'string') return data.detail
+  const firstString = (val) => {
+    const text = Array.isArray(val) ? val[0] : val
+    return typeof text === 'string' ? text : null
+  }
+  // `detail` and `non_field_errors` describe the request as a whole rather
+  // than one field of it, so they're shown verbatim. Running them through the
+  // prefixing branch below put DRF's internal field naming in front of users -
+  // a failed login read "non_field_errors: No active account found...".
+  for (const key of ['detail', 'non_field_errors']) {
+    const text = firstString(data[key])
+    if (text) return text
+  }
+  // A genuine per-field error keeps its key, which is what makes it findable
+  // on a form with several inputs.
   const firstKey = Object.keys(data)[0]
   if (firstKey) {
-    const val = data[firstKey]
-    const text = Array.isArray(val) ? val[0] : val
-    if (typeof text === 'string') return `${firstKey}: ${text}`
+    const text = firstString(data[firstKey])
+    if (text) return `${firstKey}: ${text}`
   }
   return null
 }
