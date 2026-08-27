@@ -1,6 +1,7 @@
 import re
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import update_last_login
 from django.contrib.auth.password_validation import validate_password
 from django.contrib.auth.tokens import default_token_generator
@@ -11,7 +12,8 @@ from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .google_auth import GoogleTokenError, verify_google_access_token
-from .otp import verify_otp
+from .models import PendingRegistration
+from .otp import consume_pending_registration, verify_otp
 from .validators import (
     normalize_email,
     validate_otp_code,
@@ -36,17 +38,21 @@ def _generate_username(email):
     return username
 
 
-class RegisterSerializer(serializers.ModelSerializer):
+class RegisterSerializer(serializers.Serializer):
+    """Records a signup attempt. The account is created on verification, not
+    here - see accounts/models.py's PendingRegistration for why."""
+
+    email = serializers.EmailField()
     password = serializers.CharField(write_only=True, validators=[validate_password_strength, validate_password])
     password2 = serializers.CharField(write_only=True)
 
-    class Meta:
-        model = User
-        fields = ['email', 'password', 'password2']
-
     def validate_email(self, value):
         value = normalize_email(value)
-        if User.objects.filter(email__iexact=value).exists():
+        existing = User.objects.filter(email__iexact=value).first()
+        # Only an account somebody has actually proved they own makes an
+        # address taken. An inactive, never-verified row is an artifact of the
+        # old flow, which created the User up front - see create().
+        if existing is not None and (existing.is_active or existing.profile.is_verified):
             raise serializers.ValidationError('This email is already registered.')
         return value
 
@@ -56,15 +62,45 @@ class RegisterSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
-        validated_data.pop('password2')
-        password = validated_data.pop('password')
-        user = User(username=_generate_username(validated_data['email']), **validated_data)
-        user.set_password(password)
-        # Inactive until OTP verification (see accounts/otp.py) - EmailLoginSerializer
-        # already rejects login for is_active=False, so this alone gates login.
-        user.is_active = False
-        user.save()
-        return user
+        """Returns a PendingRegistration, not a User.
+
+        update_or_create rather than create: someone re-submitting the form for
+        an address they have not verified yet is a person who lost the email,
+        not a conflict, so the in-flight attempt (and its code) is replaced
+        rather than refused. Only a *verified* account, checked in
+        validate_email, makes an address genuinely taken.
+        """
+        # Accounts stranded by the old flow, which created the User up front
+        # and left it inactive until verification. Nobody ever proved they
+        # could read the inbox, so such a row reserves nothing - and leaving it
+        # would make the address permanently unclaimable, since its owner can
+        # neither log in nor register again. Deleting it here is what lets them
+        # start over; verification still decides whether they get the account.
+        User.objects.filter(
+            email__iexact=validated_data['email'], is_active=False, profile__is_verified=False,
+        ).delete()
+        PendingRegistration.purge_expired()
+        pending, _ = PendingRegistration.objects.update_or_create(
+            email=validated_data['email'],
+            defaults={'password': make_password(validated_data['password'])},
+        )
+        return pending
+
+
+def create_verified_user(pending):
+    """Materialises the account a verified PendingRegistration has earned.
+
+    The password is copied across already hashed - it was hashed on the way
+    into PendingRegistration and never existed in plaintext there, so there is
+    nothing to re-hash.
+    """
+    user = User(username=_generate_username(pending.email), email=pending.email)
+    user.password = pending.password
+    user.save()
+    profile = user.profile
+    profile.is_verified = True
+    profile.save(update_fields=['is_verified'])
+    return user
 
 
 class EmailLoginSerializer(serializers.Serializer):
@@ -91,9 +127,16 @@ class EmailLoginSerializer(serializers.Serializer):
         # user who most needs a next step, since registering is what put them
         # here (see RegisterSerializer, which sets is_active=False).
         if not user.is_active:
-            raise serializers.ValidationError(
-                'Your email address is not verified yet. Check your inbox for the verification code.'
-            )
+            # Two ways to be inactive now that signups are held outside the
+            # User table: an account created before that change and never
+            # verified, or one an admin switched off. Telling the second group
+            # to go check their inbox sends them looking for an email that will
+            # never arrive.
+            if not user.profile.is_verified:
+                raise serializers.ValidationError(
+                    'Your email address is not verified yet. Check your inbox for the verification code.'
+                )
+            raise serializers.ValidationError('This account has been disabled.')
 
         update_last_login(None, user)
         refresh = RefreshToken.for_user(user)
@@ -229,6 +272,23 @@ class VerifyOtpSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         email = normalize_email(attrs['email'])
+
+        # A signup: no account exists yet, and the correct code is what creates
+        # one. Checked first because a pending row and a User can briefly share
+        # an address - an account whose owner is mid email-change back to it.
+        pending = PendingRegistration.objects.filter(email__iexact=email).first()
+        if pending is not None:
+            user, error_code = consume_pending_registration(
+                pending, attrs['code'], create_verified_user,
+            )
+            if user is None:
+                raise serializers.ValidationError({'code': _OTP_ERROR_MESSAGES[error_code]})
+            attrs['user'] = user
+            return attrs
+
+        # Otherwise an account that already exists is confirming a *changed*
+        # address (see ProfileView), or is one created before signups were held
+        # in PendingRegistration. Both carry their OTP on the Profile.
         user = User.objects.filter(email__iexact=email).first()
         if user is None:
             raise serializers.ValidationError({'code': _OTP_ERROR_MESSAGES['incorrect']})
@@ -236,6 +296,7 @@ class VerifyOtpSerializer(serializers.Serializer):
         success, error_code = verify_otp(user, attrs['code'])
         if not success:
             raise serializers.ValidationError({'code': _OTP_ERROR_MESSAGES[error_code]})
+        attrs['user'] = user
         return attrs
 
 

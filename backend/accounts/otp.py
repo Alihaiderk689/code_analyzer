@@ -46,17 +46,26 @@ def hash_otp_code(code):
     return hmac.new(_otp_pepper(), code.encode(), hashlib.sha256).hexdigest()
 
 
-def issue_otp(user):
-    """Generates a fresh code, stores its hash + a new expiry on the user's
-    profile (resetting the attempt counter), and returns the plaintext code
-    for the caller to email - nothing else ever sees the plaintext."""
+def issue_otp_to(carrier):
+    """Generates a fresh code, stores its hash + a new expiry on `carrier`
+    (resetting the attempt counter), and returns the plaintext code for the
+    caller to email - nothing else ever sees the plaintext.
+
+    `carrier` is any row holding the otp_code_hash/otp_expires_at/otp_attempts
+    trio: a Profile (email changes, and legacy accounts) or a
+    PendingRegistration (signups, which have no account row yet).
+    """
     code = generate_otp_code()
-    profile = user.profile
-    profile.otp_code_hash = hash_otp_code(code)
-    profile.otp_expires_at = timezone.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)
-    profile.otp_attempts = 0
-    profile.save(update_fields=['otp_code_hash', 'otp_expires_at', 'otp_attempts'])
+    carrier.otp_code_hash = hash_otp_code(code)
+    carrier.otp_expires_at = timezone.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)
+    carrier.otp_attempts = 0
+    carrier.save(update_fields=['otp_code_hash', 'otp_expires_at', 'otp_attempts'])
     return code
+
+
+def issue_otp(user):
+    """issue_otp_to for the Profile-carried case - see its docstring."""
+    return issue_otp_to(user.profile)
 
 
 def _clear_otp(profile, **extra_fields):
@@ -66,6 +75,57 @@ def _clear_otp(profile, **extra_fields):
     profile.otp_expires_at = None
     profile.otp_attempts = 0
     profile.save(update_fields=[*extra_fields, 'otp_code_hash', 'otp_expires_at', 'otp_attempts'])
+
+
+def _check_locked(row, submitted_code):
+    """Validates `submitted_code` against an already-locked carrier row.
+
+    Returns '' on success or one of 'expired'/'too_many_attempts'/'incorrect'.
+    A wrong guess increments and persists the attempt counter here, so lockout
+    survives across requests. Callers must hold SELECT ... FOR UPDATE on `row`
+    - see verify_otp's docstring for why that lock is load-bearing.
+    """
+    if not row.otp_code_hash or not row.otp_expires_at:
+        return 'incorrect'
+
+    if timezone.now() > row.otp_expires_at:
+        return 'expired'
+
+    if row.otp_attempts >= OTP_MAX_ATTEMPTS:
+        return 'too_many_attempts'
+
+    if not hmac.compare_digest(row.otp_code_hash, hash_otp_code(submitted_code)):
+        row.otp_attempts += 1
+        row.save(update_fields=['otp_attempts'])
+        return 'incorrect'
+
+    return ''
+
+
+def consume_pending_registration(pending, submitted_code, materialize):
+    """Verifies a signup's code and turns it into a real account, or not at all.
+
+    `materialize(row)` is called with the locked PendingRegistration once the
+    code checks out, inside the same transaction and lock, and must return the
+    created User. Running it under the lock is the point: two concurrent
+    verifies carrying the same valid code would otherwise both pass the check
+    and both try to create the account, and the loser would surface as an
+    integrity error rather than a duplicate no-op.
+
+    Returns (user, '') on success or (None, error_code).
+    """
+    with transaction.atomic():
+        row = type(pending).objects.select_for_update().filter(pk=pending.pk).first()
+        if row is None:
+            return None, 'incorrect'
+
+        error_code = _check_locked(row, submitted_code)
+        if error_code:
+            return None, error_code
+
+        user = materialize(row)
+        row.delete()
+        return user, ''
 
 
 def verify_otp(user, submitted_code):
@@ -87,20 +147,12 @@ def verify_otp(user, submitted_code):
         except Profile.DoesNotExist:
             return False, 'incorrect'
 
-        if not profile.otp_code_hash or not profile.otp_expires_at:
-            return False, 'incorrect'
-
-        if timezone.now() > profile.otp_expires_at:
-            return False, 'expired'
-
-        if profile.otp_attempts >= OTP_MAX_ATTEMPTS:
-            return False, 'too_many_attempts'
-
-        if not hmac.compare_digest(profile.otp_code_hash, hash_otp_code(submitted_code)):
-            profile.otp_attempts += 1
-            profile.save(update_fields=['otp_attempts'])
+        error_code = _check_locked(profile, submitted_code)
+        if error_code:
+            # _check_locked may have persisted an incremented attempt counter;
+            # point the caller's cached reverse one-to-one at the row it wrote.
             user.profile = profile
-            return False, 'incorrect'
+            return False, error_code
 
         user.is_active = True
         user.save(update_fields=['is_active'])

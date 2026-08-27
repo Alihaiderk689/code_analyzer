@@ -6,24 +6,36 @@ from django.utils.http import urlsafe_base64_encode
 from .brevo_client import BrevoClient
 
 
-def send_otp_email(user, code):
+def send_otp_email_to(email, display_name, code):
+    """Sends a verification code to a bare address.
+
+    Takes the address rather than a User because a signup has no account row
+    to point at yet - it is a PendingRegistration until the code comes back.
+    See accounts/models.py's PendingRegistration.
+    """
     BrevoClient().send_email(
-        to_email=user.email,
+        to_email=email,
         subject='Your verification code',
         html_content=(
-            f'<p>Hi {user.username},</p>'
+            f'<p>Hi {display_name},</p>'
             f'<p>Your verification code is:</p>'
             f'<p style="font-size:28px;font-weight:bold;letter-spacing:4px;">{code}</p>'
             f'<p>This code expires in 10 minutes. If you did not create an account, '
             f'you can ignore this email.</p>'
         ),
         text_content=(
-            f'Hi {user.username},\n\n'
+            f'Hi {display_name},\n\n'
             f'Your verification code is: {code}\n\n'
             f'This code expires in 10 minutes. If you did not create an account, '
             f'you can ignore this email.'
         ),
     )
+
+
+def send_otp_email(user, code):
+    """send_otp_email_to for an account that already exists - the email-change
+    flow, and any account predating PendingRegistration."""
+    return send_otp_email_to(user.email, user.username, code)
 
 
 def send_password_reset_email(user):
