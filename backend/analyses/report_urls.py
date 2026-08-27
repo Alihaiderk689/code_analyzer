@@ -4,6 +4,5 @@ from . import report_views as views
 
 urlpatterns = [
     path('<int:analysis_id>/pdf/', views.PDFReportView.as_view(), name='report-pdf'),
-    path('<int:analysis_id>/json/', views.JSONReportView.as_view(), name='report-json'),
     path('<int:analysis_id>/html/', views.HTMLReportView.as_view(), name='report-html'),
 ]

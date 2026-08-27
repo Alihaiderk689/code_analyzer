@@ -19,6 +19,8 @@ import dj_database_url
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
+from core.settings_validation import validate_allowed_hosts
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -45,24 +47,64 @@ if ENVIRONMENT not in _VALID_ENVIRONMENTS:
 # not silently fall back to a key that might be sitting in git history somewhere.
 SECRET_KEY = os.environ['SECRET_KEY']
 
+# Keys the HMAC that accounts/otp.py stores in place of a raw OTP digest (see
+# its _otp_pepper()). Optional: falls back to SECRET_KEY, which is already
+# required and already secret. Set it separately only if you want to rotate
+# OTP hashing independently of Django's signing key - rotating either one
+# invalidates every OTP currently in flight, which is harmless given they
+# expire in 10 minutes anyway.
+OTP_PEPPER_KEY = os.environ.get('OTP_PEPPER_KEY', '')
+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = ENVIRONMENT == 'development'
 
-ALLOWED_HOSTS = [h for h in os.environ.get('ALLOWED_HOSTS', '').split(',') if h]
+# Explicit allowlist, always - never '*'. validate_allowed_hosts() rejects both
+# the wildcard and an empty list at startup when ENVIRONMENT=production; see
+# its docstring for why each is worth failing the boot over.
+ALLOWED_HOSTS = validate_allowed_hosts(
+    [h.strip() for h in os.environ.get('ALLOWED_HOSTS', '').split(',') if h.strip()],
+    ENVIRONMENT,
+)
 
 # Used below (REST_FRAMEWORK throttle rates) and further down (LOGGING levels)
 # to quiet things down / relax limits specifically while `manage.py test` runs.
 _RUNNING_TESTS = 'test' in sys.argv
 
+# Headers that are safe (and useful) in every environment, so CI and local dev
+# exercise the same behavior that ships. Applied by
+# django.middleware.security.SecurityMiddleware, except Content-Security-Policy
+# and Permissions-Policy, which Django 4.2 has no setting for - see
+# core/middleware.py's SecurityHeadersMiddleware.
+# https://docs.djangoproject.com/en/4.2/topics/security/
+SECURE_CONTENT_TYPE_NOSNIFF = True
+# Django's default is already 'same-origin'; 'strict-origin-when-cross-origin'
+# is looser for same-origin navigation (full path is sent) but keeps the path
+# off cross-origin requests and drops the header entirely on https -> http,
+# which is what analytics/CDN-friendly deployments expect.
+SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
+# Matches Django's own default; set explicitly because "the default is DENY"
+# is a fact about a Django version, and this app never wants to be framed.
+X_FRAME_OPTIONS = 'DENY'
+
 if ENVIRONMENT == 'production':
-    # https://docs.djangoproject.com/en/4.2/topics/security/
     SECURE_SSL_REDIRECT = True
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
+    # HSTS is production-only on purpose. SecurityMiddleware emits it on any
+    # request it considers secure, which includes a local https:// dev server
+    # or a tunnel (ngrok etc.) terminating TLS in front of runserver - and the
+    # header is sticky: once a browser has cached a year of HSTS for
+    # "localhost", every later plain-http project on that hostname is forced
+    # to https until the developer manually clears it. Scoping it here keeps
+    # that failure mode out of development entirely.
     SECURE_HSTS_SECONDS = 31536000
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
-    SECURE_HSTS_PRELOAD = True
-    SECURE_CONTENT_TYPE_NOSNIFF = True
+    # No SECURE_HSTS_PRELOAD: preload is a one-way door. Submitting a domain to
+    # the browser preload list bakes https-only into shipped browser binaries,
+    # and removal takes months to propagate - it should be a deliberate,
+    # separately-decided step for a specific domain, not a default carried by
+    # every deployment of this codebase. `manage.py check --deploy` flags its
+    # absence (W021); that warning is knowingly accepted.
 
 # JWT access/refresh tokens live in httpOnly cookies (see accounts/cookies.py,
 # accounts/authentication.py) rather than being readable by frontend JS, so an
@@ -118,6 +160,11 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # Outermost so its response phase runs last, after every other middleware
+    # has had its say - including requests short-circuited before they ever
+    # reach a view (an SSL/APPEND_SLASH redirect, a WhiteNoise static hit, a
+    # CSRF rejection), which would otherwise go out with no CSP at all.
+    'core.middleware.SecurityHeadersMiddleware',
     'django.middleware.security.SecurityMiddleware',
     # Serves collected static files (admin CSS/JS) directly from gunicorn -
     # django.contrib.staticfiles only auto-serves under `runserver`/DEBUG, and
@@ -162,6 +209,13 @@ _THROTTLE_RATES = {
     # otp_verify is an IP-level backstop - the real brute-force defense is
     # the per-account expiry + attempt-lockout in accounts/otp.py.
     'otp_verify': '20/hour',
+    # Same endpoint, keyed by (IP, target email) instead of IP alone, so one
+    # IP can't aim its whole otp_verify budget at a single account. Set above
+    # OTP_MAX_ATTEMPTS (5) rather than equal to it so a user who mistypes a
+    # code, requests a resend, and mistypes again isn't throttled out of their
+    # own signup - the 5-per-code lockout is what bounds guessing, this bounds
+    # how many codes' worth of guesses one IP can attempt against one account.
+    'otp_verify_account': '10/hour',
     'otp_resend': '5/hour',
     'ai': '30/min',
     'analysis_create': '30/min',
@@ -210,6 +264,15 @@ FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
 # refactor/chat endpoints. Groq is tried first; on any failure (rate limit,
 # outage, missing key) it falls back to Gemini, then to OpenRouter. All three
 # are optional - a provider with no key configured is just skipped.
+# Per-provider request timeout. Applied to all three providers so the
+# fallback chain's worst case is bounded and predictable:
+#   3 providers x AI_REQUEST_TIMEOUT_SECONDS = worst case before the caller
+#   sees a 503.
+# This must stay comfortably below gunicorn's --timeout (see backend/Dockerfile)
+# or a slow chain gets its worker killed (502) instead of falling through to
+# the next provider and returning a clean 503.
+AI_REQUEST_TIMEOUT_SECONDS = int(os.environ.get('AI_REQUEST_TIMEOUT_SECONDS', 30))
+
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 GROQ_MODEL = os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile')
 
@@ -221,6 +284,36 @@ GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-flash-latest')
 
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'openrouter/auto')
+
+# Cache. Backs DRF throttle counters (core/throttling.py) - the reason this
+# matters is that the previous default (per-process LocMemCache) gave every
+# gunicorn worker its own counters, so the real limit was rate x worker_count.
+# Pointed at the Redis that already exists for Celery; no new infrastructure.
+#
+# Uses ResilientRedisCache, not Django's stock RedisCache: a Redis outage must
+# not turn into a 500 on every endpoint. See core/cache.py for the fail-open
+# trade-off and why the protections that actually stop brute force (OTP
+# attempt lockout, daily quotas) are database-backed and unaffected.
+#
+# Falls back to LocMemCache when no Redis URL is configured (and always under
+# `manage.py test`, so the suite needs no running Redis) - same behavior as
+# before this setting existed.
+_CACHE_REDIS_URL = os.environ.get('CACHE_REDIS_URL') or os.environ.get('CELERY_BROKER_URL', '')
+if _CACHE_REDIS_URL and not _RUNNING_TESTS:
+    CACHES = {
+        'default': {
+            'BACKEND': 'core.cache.ResilientRedisCache',
+            'LOCATION': _CACHE_REDIS_URL,
+            'KEY_PREFIX': 'codeanalyzer',
+        }
+    }
+else:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'code-analyzer-locmem',
+        }
+    }
 
 # Celery - runs the GitHub PR analysis pipeline off the request path (a webhook
 # must be acknowledged in seconds or GitHub retries the delivery). Redis is
@@ -278,6 +371,34 @@ GITHUB_MAX_FILE_SIZE_BYTES = int(os.environ.get('GITHUB_MAX_FILE_SIZE_BYTES', 50
 # repo could exhaust the rate limit. Repos with more indexable files than this
 # get a partial graph (RepositoryIndex.truncated=True) rather than failing outright.
 GITHUB_MAX_INDEXED_FILES = int(os.environ.get('GITHUB_MAX_INDEXED_FILES', 300))
+# Total wall-clock allowance for the GitHub fetches one repository-context
+# analysis makes (RepositoryFileContextAnalyzeView -> PRAnalysisService
+# .analyze_file_with_context). That path makes up to 11 fetches; at
+# github_client.REQUEST_TIMEOUT_SECONDS each that is 165s worst case, above
+# gunicorn's --timeout 120. This is the total bound the per-request timeouts
+# cannot express: one monotonic deadline shared by every fetch in the phase
+# (see services/fetch_budget.py), after which the context is returned
+# truncated instead of the request being killed by gunicorn.
+#
+# 45s leaves 75s of the 120s for the analysis that follows: Bandit's hard 20s
+# cap plus one AI_REQUEST_TIMEOUT_SECONDS leg of the AI chain (30s) = 50s,
+# with ~25s of margin. A healthy GitHub answers all 11 fetches in a few
+# seconds, so this only ever bites when GitHub is degraded.
+GITHUB_CONTEXT_FETCH_BUDGET_SECONDS = int(os.environ.get('GITHUB_CONTEXT_FETCH_BUDGET_SECONDS', 45))
+# Total wall-clock allowance for the WHOLE repository-context request
+# (RepositoryFileContextAnalyzeView), not just its GitHub phase: the sandboxed
+# runtime check, Bandit, and the AI fallback chain all run once per analyzed
+# file, and that path analyzes up to 7 (the primary file plus up to 6
+# dependency-graph neighbors). Per-stage timeouts bound each invocation at
+# 5s / 20s / 3x30s; nothing bounded their sum, which is (5+20+90)x7 = 805s
+# against gunicorn's --timeout 120. See core/execution_budget.py.
+#
+# 90s leaves a 30s margin (25%) under the 120s timeout for the DB writes and
+# serialization that follow, and for the CPU-bound static analysis that is too
+# short to be worth budgeting individually. Stages are skipped rather than
+# squeezed when the remainder gets too small, so a degraded run returns a
+# partial-but-honest result instead of a killed worker.
+GITHUB_CONTEXT_REQUEST_BUDGET_SECONDS = int(os.environ.get('GITHUB_CONTEXT_REQUEST_BUDGET_SECONDS', 90))
 
 ROOT_URLCONF = 'config.urls'
 
@@ -334,7 +455,25 @@ AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
     },
+    {
+        # Rejects passwords that appear in the Have I Been Pwned breach
+        # corpus, covering the large middle ground between "password123"
+        # (already caught by CommonPasswordValidator's 20k-entry list) and
+        # genuinely unique: a password can satisfy every rule above and still
+        # be sitting in an attacker's wordlist from some other site's breach.
+        # The lookup is k-anonymous - only the first 5 characters of the
+        # password's SHA-1 leave this process. See
+        # accounts/password_validation.py for the PWNED_PASSWORDS_ENABLED
+        # switch below and why it exists.
+        'NAME': 'accounts.password_validation.PwnedPasswordsValidator',
+    },
 ]
+
+# Off during `manage.py test` for the same reason the throttle rates are
+# relaxed there: a live HTTPS call on the path of every test that sets a
+# password would make the suite slow and dependent on an external service.
+# PwnedPasswordValidatorTests turns it back on with a stubbed API client.
+PWNED_PASSWORDS_ENABLED = not _RUNNING_TESTS
 
 
 # Internationalization

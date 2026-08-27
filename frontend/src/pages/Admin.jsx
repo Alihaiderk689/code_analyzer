@@ -105,6 +105,9 @@ function UsersTab() {
   const [busyId, setBusyId] = useState(null)
 
   const load = (q = query) => {
+    // Clear first: without this a stale failure stays on screen over results
+    // that loaded fine on a later keystroke.
+    setError('')
     adminListUsers(q)
       .then((data) => setUsers(data.results))
       .catch((err) => setError(err instanceof ApiError ? err.message : 'Could not load users.'))
@@ -150,7 +153,7 @@ function UsersTab() {
           <span>VERIFIED</span>
           <span></span>
         </div>
-        {users === null && <div style={{ padding: 16, fontSize: 14, color: 'var(--color-text-muted)' }}>Loading…</div>}
+        {users === null && !error && <div style={{ padding: 16, fontSize: 14, color: 'var(--color-text-muted)' }}>Loading…</div>}
         {users?.map((u) => (
           <div key={u.id} style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 0.6fr 0.6fr 0.6fr 0.8fr', padding: '12px 16px', borderTop: '1px solid var(--color-border)', fontSize: 13, alignItems: 'center' }}>
             <span>{u.username}</span>
@@ -183,6 +186,7 @@ function AnalysesTab() {
   const [error, setError] = useState('')
 
   useEffect(() => {
+    setError('')
     adminListAnalyses({ status: statusFilter || undefined })
       .then((data) => setRows(data.results))
       .catch((err) => setError(err instanceof ApiError ? err.message : 'Could not load analyses.'))
@@ -209,7 +213,11 @@ function AnalysesTab() {
           <span>SCORE</span>
           <span>STATUS</span>
         </div>
-        {rows === null && <div style={{ padding: 16, fontSize: 14, color: 'var(--color-text-muted)' }}>Loading…</div>}
+        {/* `!error` too: a failed request leaves rows null, and without this
+            the table showed "Loading…" forever underneath the error banner.
+            Left null rather than set to [] - the request produced no answer,
+            which is not the same as "no rows". */}
+        {rows === null && !error && <div style={{ padding: 16, fontSize: 14, color: 'var(--color-text-muted)' }}>Loading…</div>}
         {rows?.map((r) => (
           <div key={r.id} style={{ display: 'grid', gridTemplateColumns: '1.4fr 1fr 0.8fr 0.6fr 0.8fr', padding: '12px 16px', borderTop: '1px solid var(--color-border)', fontSize: 13, alignItems: 'center' }}>
             <span>{r.name}</span>

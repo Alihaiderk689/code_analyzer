@@ -93,7 +93,6 @@ export const getDashboardScores = () => apiFetch('/dashboard/scores/')
 
 // Reports
 export const downloadReportPdf = (id) => apiFetch(`/reports/${id}/pdf/`, { responseType: 'blob' })
-export const downloadReportJson = (id) => apiFetch(`/reports/${id}/json/`, { responseType: 'blob' })
 export const getReportHtml = (id) => apiFetch(`/reports/${id}/html/`, { responseType: 'blob' })
 
 // Chat with Your Code - persisted, per-analysis conversation (distinct from the

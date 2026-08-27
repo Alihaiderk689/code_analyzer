@@ -1,26 +1,39 @@
+import hashlib
+import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from unittest.mock import Mock, patch
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.signing import dumps as signing_dumps
-from django.test import TestCase, override_settings
+from django.db import connection
+from django.test import TestCase, TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
+from pwned_passwords_django.exceptions import ErrorCode as PwnedPasswordsErrorCode
+from pwned_passwords_django.exceptions import PwnedPasswordsError
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
+from rest_framework_simplejwt.tokens import RefreshToken
 
-from core.throttling import LoginRateThrottle
+from core.throttling import LoginRateThrottle, OtpVerifyAccountRateThrottle, OtpVerifyRateThrottle
 from github_integration.services.oauth_service import _STATE_SALT
 
 from .brevo_client import BrevoAPIError
 from .cookies import ACCESS_COOKIE, REFRESH_COOKIE
 from .google_auth import GoogleTokenError, verify_google_access_token
-from .otp import OTP_MAX_ATTEMPTS, issue_otp
+from .models import Profile
+from .otp import OTP_MAX_ATTEMPTS, hash_otp_code, issue_otp, verify_otp
+from .password_validation import PwnedPasswordsValidator
+from .tokens import revoke_all_refresh_tokens
 
 User = get_user_model()
 
@@ -723,3 +736,400 @@ class ThrottlingTests(APITestCase):
         self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(third.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
         self.assertIn('detail', third.data)
+
+
+class OtpHashingTests(TestCase):
+    """OTP codes are stored as an HMAC-SHA256 keyed by a server-side secret,
+    not a bare digest. With only 10^6 possible codes, a plain SHA-256 column is
+    trivially reversible from a database dump alone - the pepper is what makes
+    the dump insufficient on its own."""
+
+    def test_stored_hash_is_not_a_bare_sha256_of_the_code(self):
+        self.assertNotEqual(hash_otp_code('123456'), hashlib.sha256(b'123456').hexdigest())
+
+    def test_hash_is_keyed_by_the_pepper(self):
+        with override_settings(OTP_PEPPER_KEY='pepper-one'):
+            first = hash_otp_code('123456')
+        with override_settings(OTP_PEPPER_KEY='pepper-two'):
+            second = hash_otp_code('123456')
+
+        self.assertNotEqual(first, second)
+
+    def test_pepper_falls_back_to_secret_key(self):
+        with override_settings(OTP_PEPPER_KEY='', SECRET_KEY='key-one'):
+            first = hash_otp_code('123456')
+        with override_settings(OTP_PEPPER_KEY='', SECRET_KEY='key-two'):
+            second = hash_otp_code('123456')
+
+        self.assertNotEqual(first, second)
+
+    def test_hash_still_fits_the_otp_code_hash_column(self):
+        """HMAC-SHA256 is the same 64 hex characters SHA-256 was, which is why
+        swapping the algorithm needed no migration on Profile.otp_code_hash."""
+        max_length = Profile._meta.get_field('otp_code_hash').max_length
+        self.assertLessEqual(len(hash_otp_code('123456')), max_length)
+
+    def test_verification_round_trips_through_the_real_hash(self):
+        user = make_user(email='hmac@example.com')
+        user.is_active = False
+        user.save(update_fields=['is_active'])
+        code = issue_otp(user)
+
+        self.assertEqual(verify_otp(user, code), (True, ''))
+
+
+class OtpConcurrencyTests(TransactionTestCase):
+    """The attempt counter is the only thing standing between an attacker and
+    an unlimited number of guesses at a 6-digit code (the IP throttle is a
+    backstop, not a defense against a distributed attempt - see docs/SECURITY.md
+    §3.1). A read-modify-write on otp_attempts without a row lock loses
+    increments under concurrency, which converts N parallel guesses into one
+    counted attempt.
+
+    TransactionTestCase rather than TestCase: the threads below need to see
+    each other's committed writes, which the single wrapping transaction
+    TestCase uses would hide.
+    """
+
+    def _user_with_otp(self):
+        user = make_user(email='race@example.com')
+        user.is_active = False
+        user.save(update_fields=['is_active'])
+        issue_otp(user)
+        return user
+
+    def test_verification_locks_the_profile_row(self):
+        user = self._user_with_otp()
+
+        with CaptureQueriesContext(connection) as queries:
+            verify_otp(user, '000000')
+
+        selects = [q['sql'] for q in queries.captured_queries if 'accounts_profile' in q['sql'].lower()]
+        self.assertTrue(
+            any('FOR UPDATE' in sql.upper() for sql in selects),
+            f'expected a SELECT ... FOR UPDATE on the profile row, got: {selects}',
+        )
+
+    def test_concurrent_wrong_guesses_each_cost_an_attempt(self):
+        user = self._user_with_otp()
+        guesses = OTP_MAX_ATTEMPTS
+
+        def guess():
+            try:
+                verify_otp(user, '000000')
+            finally:
+                # Each thread gets its own connection; leaving them open leaks
+                # them past the test and blocks TransactionTestCase's teardown.
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=guesses) as pool:
+            list(pool.map(lambda _: guess(), range(guesses)))
+
+        user.profile.refresh_from_db()
+        self.assertEqual(user.profile.otp_attempts, guesses)
+
+    def test_lockout_holds_after_concurrent_guesses(self):
+        """The point of counting every attempt: once the counter is spent, the
+        real code stops working until a new one is issued."""
+        user = self._user_with_otp()
+        code = issue_otp(user)
+
+        def guess():
+            try:
+                verify_otp(user, '000000')
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=OTP_MAX_ATTEMPTS) as pool:
+            list(pool.map(lambda _: guess(), range(OTP_MAX_ATTEMPTS)))
+
+        self.assertEqual(verify_otp(user, code), (False, 'too_many_attempts'))
+        user.refresh_from_db()
+        self.assertFalse(user.is_active)
+
+
+class PasswordChangeRevokesSessionsTests(APITestCase):
+    """A password change is how a user boots an attacker (or a lost device) out
+    of their account. That only means anything if the refresh tokens issued to
+    those other sessions stop being accepted."""
+
+    change_url = reverse('auth-change-password')
+    refresh_url = reverse('auth-refresh')
+
+    def _other_session_refresh_token(self, user):
+        return str(RefreshToken.for_user(user))
+
+    def test_change_password_revokes_other_sessions(self):
+        user = make_user(email='revoke@example.com', password='OldPass123!')
+        stolen = self._other_session_refresh_token(user)
+
+        self.client.force_authenticate(user=user)
+        response = self.client.post(self.change_url, {
+            'old_password': 'OldPass123!', 'new_password': 'NewPass456!', 'new_password2': 'NewPass456!',
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        other = APIClient()
+        other.cookies[REFRESH_COOKIE] = stolen
+        self.assertEqual(other.post(self.refresh_url).status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_change_password_keeps_the_calling_session_working(self):
+        """Revoking everything and issuing nothing back would log the caller out
+        a few minutes later, once their access token expired - so the response
+        carries a fresh pair."""
+        user = make_user(email='revoke2@example.com', password='OldPass123!')
+        self.client.force_authenticate(user=user)
+
+        response = self.client.post(self.change_url, {
+            'old_password': 'OldPass123!', 'new_password': 'NewPass456!', 'new_password2': 'NewPass456!',
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn(ACCESS_COOKIE, response.cookies)
+        self.assertIn(REFRESH_COOKIE, response.cookies)
+
+        fresh = APIClient()
+        fresh.cookies[REFRESH_COOKIE] = response.cookies[REFRESH_COOKIE].value
+        self.assertEqual(fresh.post(self.refresh_url).status_code, status.HTTP_200_OK)
+
+    def test_reset_password_revokes_all_sessions(self):
+        user = make_user(email='revoke3@example.com', password='OldPass123!')
+        stolen = self._other_session_refresh_token(user)
+
+        response = self.client.post(reverse('auth-reset-password'), {
+            'uid': urlsafe_base64_encode(force_bytes(user.pk)),
+            'token': default_token_generator.make_token(user),
+            'new_password': 'NewPass456!', 'new_password2': 'NewPass456!',
+        })
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        other = APIClient()
+        other.cookies[REFRESH_COOKIE] = stolen
+        self.assertEqual(other.post(self.refresh_url).status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_revocation_is_idempotent(self):
+        """bulk_create(ignore_conflicts=True) rather than a plain insert: a
+        concurrent logout can blacklist the same token in between."""
+        user = make_user(email='revoke4@example.com')
+        RefreshToken.for_user(user)
+
+        self.assertEqual(revoke_all_refresh_tokens(user), 1)
+        self.assertEqual(revoke_all_refresh_tokens(user), 0)
+
+
+class PwnedPasswordValidatorTests(TestCase):
+    """The HIBP check is switched off for the rest of the suite (it would put a
+    live HTTPS call on every password set - see settings.PWNED_PASSWORDS_ENABLED),
+    so this turns it back on and stubs the API client."""
+
+    def _validator(self, hits):
+        client = Mock()
+        client.check_password.return_value = hits
+        return PwnedPasswordsValidator(api_client=client)
+
+    def test_configured_in_auth_password_validators(self):
+        names = [validator['NAME'] for validator in settings.AUTH_PASSWORD_VALIDATORS]
+        self.assertIn('accounts.password_validation.PwnedPasswordsValidator', names)
+
+    @override_settings(PWNED_PASSWORDS_ENABLED=True)
+    def test_breached_password_rejected(self):
+        with self.assertRaises(DjangoValidationError) as ctx:
+            self._validator(hits=42).validate('Str0ng-But-Breached!')
+
+        self.assertEqual(ctx.exception.error_list[0].code, 'password_compromised')
+
+    @override_settings(PWNED_PASSWORDS_ENABLED=True)
+    def test_unbreached_password_accepted(self):
+        self._validator(hits=0).validate('Str0ng-And-Unseen!')
+
+    @override_settings(PWNED_PASSWORDS_ENABLED=True)
+    def test_api_failure_falls_back_to_the_common_password_list(self):
+        """Fail closed, not open: if HIBP is unreachable the password still has
+        to clear Django's own common-password list rather than sail through."""
+        client = Mock()
+        client.check_password.side_effect = PwnedPasswordsError(
+            'unreachable', code=PwnedPasswordsErrorCode.API_TIMEOUT, params={},
+        )
+        validator = PwnedPasswordsValidator(api_client=client)
+
+        with self.assertRaises(DjangoValidationError):
+            validator.validate('password')
+        validator.validate('Str0ng-And-Unseen!')
+
+    @override_settings(PWNED_PASSWORDS_ENABLED=False)
+    def test_disabled_switch_skips_the_network_call_entirely(self):
+        client = Mock()
+        PwnedPasswordsValidator(api_client=client).validate('Str0ng-But-Breached!')
+
+        client.check_password.assert_not_called()
+
+    @override_settings(PWNED_PASSWORDS_ENABLED=True)
+    @patch('pwned_passwords_django.api.default_client.check_password', return_value=99)
+    def test_registration_rejects_a_breached_password(self, _mock_check):
+        """End-to-end through the real serializer: RegisterSerializer runs
+        Django's validate_password(), so the validator applies to registration,
+        password change and password reset alike."""
+        response = self.client.post(reverse('auth-register'), {
+            'email': 'breached@example.com',
+            'password': 'Str0ng-But-Breached!',
+            'password2': 'Str0ng-But-Breached!',
+        })
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(User.objects.filter(email='breached@example.com').exists())
+
+
+class OtpVerifyThrottlingTests(APITestCase):
+    """Both throttles on the OTP-check endpoint. Rates are widened to
+    effectively-unlimited during the suite (see settings.py), so each test
+    patches THROTTLE_RATES on the throttle class directly - the same technique
+    ThrottlingTests uses, and for the same reason (SimpleRateThrottle binds
+    THROTTLE_RATES at import, so override_settings on the rates has no effect).
+    """
+
+    url = reverse('auth-verify-email')
+
+    def setUp(self):
+        cache.clear()
+
+    def tearDown(self):
+        cache.clear()
+
+    def _attempt(self, email='target@example.com', code='000000'):
+        return self.client.post(self.url, {'email': email, 'code': code})
+
+    @patch.object(OtpVerifyAccountRateThrottle, 'THROTTLE_RATES', {'otp_verify_account': '2/hour'})
+    def test_account_throttle_limits_attempts_against_one_email(self):
+        self.assertEqual(self._attempt().status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._attempt().status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._attempt().status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    @patch.object(OtpVerifyAccountRateThrottle, 'THROTTLE_RATES', {'otp_verify_account': '2/hour'})
+    def test_account_throttle_does_not_spill_onto_a_different_email(self):
+        """The point of keying on the target: exhausting one account's bucket
+        must not lock a second account out from the same IP."""
+        self._attempt(email='first@example.com')
+        self._attempt(email='first@example.com')
+        self.assertEqual(self._attempt(email='first@example.com').status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+        self.assertEqual(self._attempt(email='second@example.com').status_code, status.HTTP_400_BAD_REQUEST)
+
+    @patch.object(OtpVerifyAccountRateThrottle, 'THROTTLE_RATES', {'otp_verify_account': '2/hour'})
+    def test_account_throttle_key_is_case_insensitive(self):
+        """Buckets have to match the serializer's normalize_email(), or varying
+        the capitalisation of the target address would reset the counter."""
+        self._attempt(email='Target@Example.com')
+        self._attempt(email='target@example.com')
+
+        self.assertEqual(self._attempt(email='TARGET@EXAMPLE.COM').status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    @patch.object(OtpVerifyRateThrottle, 'THROTTLE_RATES', {'otp_verify': '2/hour'})
+    def test_ip_throttle_still_applies_across_different_emails(self):
+        """The pre-existing IP-level backstop is unchanged: spreading attempts
+        across many target accounts does not buy an attacker extra volume."""
+        self.assertEqual(self._attempt(email='a@example.com').status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._attempt(email='b@example.com').status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(self._attempt(email='c@example.com').status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+
+    @patch.object(OtpVerifyAccountRateThrottle, 'THROTTLE_RATES', {'otp_verify_account': '1/hour'})
+    def test_request_without_an_email_is_not_account_throttled(self):
+        """Nothing to key on, so this throttle abstains - the request still
+        fails validation, and the IP throttle still counts it."""
+        first = self.client.post(self.url, {'code': '000000'})
+        second = self.client.post(self.url, {'code': '000000'})
+
+        self.assertEqual(first.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(second.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_per_code_lockout_is_unchanged_by_the_new_throttle(self):
+        """The 5-attempt per-OTP lockout remains the primary defense; the
+        throttles sit on top of it, not in place of it."""
+        user = make_user(email='lockout@example.com')
+        user.is_active = False
+        user.save(update_fields=['is_active'])
+        code = issue_otp(user)
+
+        for _ in range(OTP_MAX_ATTEMPTS):
+            self.assertEqual(self._attempt(email=user.email).status_code, status.HTTP_400_BAD_REQUEST)
+
+        response = self._attempt(email=user.email, code=code)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Too many', response.data['code'][0])
+
+
+class EmailChangeVerificationTests(APITestCase):
+    """Changing the email address must not carry the verified flag across to an
+    address nobody proved control of. `email` was writable while `is_verified`
+    was read-only, so a PATCH silently kept a verified badge - and pointed
+    future password-reset mail at the new address."""
+
+    url = reverse('user-profile')
+
+    def setUp(self):
+        self.user = make_user(email='original@example.com', verified=True)
+        self.client.force_authenticate(user=self.user)
+
+    @patch('accounts.emails.BrevoClient')
+    def test_changing_email_clears_verification_and_sends_a_code(self, mock_brevo_cls):
+        response = self.client.patch(self.url, {'email': 'moved@example.com'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.email, 'moved@example.com')
+        self.assertFalse(self.user.profile.is_verified)
+        self.assertIsNotNone(self.user.profile.otp_code_hash)
+        mock_brevo_cls.return_value.send_email.assert_called_once()
+
+    @patch('accounts.emails.BrevoClient')
+    def test_account_stays_usable_during_reverification(self, _mock_brevo_cls):
+        """This costs the user a verification step, not access - is_active is
+        untouched, so they can still log in and use the app."""
+        self.client.patch(self.url, {'email': 'moved2@example.com'})
+
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.is_active)
+        self.assertEqual(self.client.get(self.url).status_code, status.HTTP_200_OK)
+
+    @patch('accounts.emails.BrevoClient')
+    def test_new_address_can_be_verified_with_the_emailed_code(self, mock_brevo_cls):
+        self.client.patch(self.url, {'email': 'moved3@example.com'})
+        sent = mock_brevo_cls.return_value.send_email.call_args.kwargs['text_content']
+        code = re.search(r'\b(\d{6})\b', sent).group(1)
+
+        verify = APIClient().post(
+            reverse('auth-verify-email'), {'email': 'moved3@example.com', 'code': code},
+        )
+
+        self.assertEqual(verify.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.profile.is_verified)
+
+    @patch('accounts.emails.BrevoClient')
+    def test_email_send_failure_rolls_back_the_change(self, mock_brevo_cls):
+        """No half-applied state: the address must not move to one that has no
+        code on its way to it."""
+        mock_brevo_cls.return_value.send_email.side_effect = BrevoAPIError('boom')
+
+        response = self.client.patch(self.url, {'email': 'never@example.com'})
+
+        self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.email, 'original@example.com')
+        self.assertTrue(self.user.profile.is_verified)
+
+    @patch('accounts.emails.BrevoClient')
+    def test_non_email_updates_do_not_trigger_reverification(self, mock_brevo_cls):
+        response = self.client.patch(self.url, {'first_name': 'Ada'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.profile.is_verified)
+        mock_brevo_cls.return_value.send_email.assert_not_called()
+
+    @patch('accounts.emails.BrevoClient')
+    def test_resubmitting_the_same_email_is_not_a_change(self, mock_brevo_cls):
+        response = self.client.patch(self.url, {'email': 'original@example.com'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.profile.is_verified)
+        mock_brevo_cls.return_value.send_email.assert_not_called()

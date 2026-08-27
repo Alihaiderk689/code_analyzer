@@ -19,10 +19,20 @@ from typing import Optional
 from django.conf import settings
 
 from analyses.engine import analyze_code
+from analyses.services.ai_security_service import AISecurityService
+from analyses.services.bandit_service import BanditScanner
+from analyses.services.custom_rules_service import CustomRulesScanner
 from analyses.services.report_generator import SEVERITY_PENALTIES, STARTING_SCORE
 from analyses.services.security_service import SecurityAnalysisService
+from core.execution_budget import (
+    REASON_REQUEST_BUDGET_EXHAUSTED,
+    STAGE_RELATED_FILES,
+    BudgetExceeded,
+    RequestBudget,
+)
 
 from ..models import FileAnalysis, PullRequestAnalysis, RepositoryIndex
+from .fetch_budget import TRUNCATED_BUDGET_EXHAUSTED, FetchBudget, FetchBudgetExceeded
 from .github_client import GitHubAPIError, GitHubClient
 from .performance_service import find_performance_issues
 
@@ -38,6 +48,20 @@ MAX_RELATED_FILES = 5
 # potentially a Groq call (security enrichment), not just a few lines of
 # prompt text.
 MAX_CONTEXT_RELATED_FILES = 3
+
+# A neighbor whose analysis cannot get at least this much of the request budget
+# is not fetched or analyzed at all. Sized to cover the cheapest useful run of
+# the expensive stages (Bandit's MIN_BANDIT_SLICE_SECONDS = 5 plus the AI
+# chain's MIN_AI_SLICE_SECONDS = 8, minus the overlap that a file with no
+# findings never pays) - enough that starting a neighbor is worthwhile, small
+# enough that we don't drop neighbors we could have finished.
+MIN_RELATED_FILE_BUDGET_SECONDS = 12
+
+# Issue type/severity for "a security scanner could not run". The severity is
+# deliberately not a Severity enum member, so SEVERITY_PENALTIES.get(..., 0)
+# scores it at zero - see _analyze_file_content, where it is emitted.
+SCANNER_UNAVAILABLE_ISSUE_TYPE = 'scanner_unavailable'
+SCANNER_UNAVAILABLE_SEVERITY = 'info'
 
 # Matches the languages this feature is required to support. Deliberately its
 # own map rather than reusing analyses.engine.LANGUAGE_BY_EXTENSION - that one
@@ -124,7 +148,12 @@ def _find_settings_source(client: GitHubClient, owner: str, repo: str, ref: str)
     existing heuristic, never gates it."""
     try:
         tree = client.get_repository_tree(owner, repo, ref)['entries']
-    except GitHubAPIError:
+    except (GitHubAPIError, FetchBudgetExceeded):
+        # FetchBudgetExceeded included deliberately: this lookup only refines
+        # a heuristic, so running out of budget here degrades it to "unknown"
+        # rather than killing an otherwise-complete analysis. The budget
+        # itself records that it was exhausted, so the truncation is still
+        # reported - see analyze_file_with_context.
         return ''
     candidates = sorted(
         (entry['path'] for entry in tree if entry['type'] == 'file' and entry['path'].endswith('settings.py')),
@@ -134,7 +163,7 @@ def _find_settings_source(client: GitHubClient, owner: str, repo: str, ref: str)
         return ''
     try:
         return client.get_file_content(owner, repo, candidates[0], ref)
-    except GitHubAPIError:
+    except (GitHubAPIError, FetchBudgetExceeded):
         return ''
 
 
@@ -209,13 +238,22 @@ def _related_paths(repository: 'GitHubRepository', path: str) -> list[tuple[str,
     return related
 
 
-def _analyze_file_content(content: str, language: str, settings_source: str = '') -> list[dict]:
+def _analyze_file_content(
+    content: str, language: str, settings_source: str = '', budget=None,
+) -> list[dict]:
     """Normalizes analyses.engine's issues and SecurityAnalysisService's
     vulnerabilities into one common shape - see FileAnalysis.issues docstring
-    in models.py for the exact fields."""
+    in models.py for the exact fields.
+
+    `budget` is the optional request-wide deadline (core/execution_budget.py).
+    None - the PR-review pipeline and the plain single-file check - runs every
+    stage exactly as before. When set, it is handed to the three stages that
+    can take real wall-clock time (the sandboxed runtime check, Bandit, and
+    the AI fallback chain) so each is skipped rather than started when it can
+    no longer be afforded."""
     issues = []
 
-    quality_result = analyze_code(content, language)
+    quality_result = analyze_code(content, language, budget=budget)
     for issue in quality_result['issues']:
         issues.append({
             'source': 'quality',
@@ -231,7 +269,7 @@ def _analyze_file_content(content: str, language: str, settings_source: str = ''
     # always runs the (language-agnostic) custom-rules scanner; if that finds
     # nothing, AISecurityService short-circuits before ever calling the LLM -
     # so this never pays for a wasted AI call on a clean/non-Python file.
-    security_report = SecurityAnalysisService().analyze(content, language, settings_source=settings_source)
+    security_report = _security_service(budget).analyze(content, language, settings_source=settings_source)
     for vuln in security_report['vulnerabilities']:
         issues.append({
             'source': 'security',
@@ -243,9 +281,60 @@ def _analyze_file_content(content: str, language: str, settings_source: str = ''
             'remediation': vuln['remediation'],
         })
 
+    # A scanner that could not run must never render as a clean scan. The
+    # report already says so via scan_complete/scanners_unavailable, but this
+    # function's contract with its three callers (PR review, the single-file
+    # check, the context check) is a flat issue list - those two fields were
+    # read off the report and dropped here, so a Bandit that was missing,
+    # timed out, produced unparsable output, or was skipped for budget showed
+    # up downstream as "no security issues found". Folding each one in as an
+    # issue is what makes it survive into FileAnalysis.issues,
+    # RepositoryFileCheck.issues, RepositoryContextCheck.issues and the posted
+    # PR comment without any of those needing a new field.
+    #
+    # Severity 'info' is deliberately outside the Severity enum, so
+    # SEVERITY_PENALTIES.get(..., 0) scores it at zero - matching
+    # report_generator.build_report's own rule that a scanner failing is not
+    # evidence of vulnerabilities and must not move the score. Same precedent
+    # as analyses.engine's zero-penalty runtime_check_unavailable issue.
+    for unavailable in security_report['scanners_unavailable']:
+        issues.append({
+            'source': 'security',
+            'type': SCANNER_UNAVAILABLE_ISSUE_TYPE,
+            'severity': SCANNER_UNAVAILABLE_SEVERITY,
+            'line': None,
+            'message': (
+                f"Security scan incomplete: the {unavailable['scanner']} scanner did not run "
+                f"({unavailable['reason']})."
+            ),
+            'explanation': unavailable['detail'] or (
+                f"{unavailable['scanner']} could not run, so any vulnerability only it detects "
+                'would not appear in these results. This is not a finding about the code.'
+            ),
+            'remediation': (
+                'Re-run this analysis. If it keeps recurring, check the server logs - a scanner '
+                'that is unavailable repeatedly is a deployment problem, not a code problem.'
+            ),
+        })
+
     issues.extend(find_performance_issues(content))
 
     return issues
+
+
+def _security_service(budget=None) -> SecurityAnalysisService:
+    """SecurityAnalysisService, with the request budget injected into the two
+    stages that can block for a long time. Uses the composition seam the class
+    was already built with (`scanners=` / `ai_service=`), so neither
+    BaseSecurityScanner.scan's signature nor the security report's shape
+    changes. With no budget it returns the stock service - byte-identical to
+    what every other caller has always constructed."""
+    if budget is None:
+        return SecurityAnalysisService()
+    return SecurityAnalysisService(
+        scanners=[BanditScanner(budget=budget), CustomRulesScanner()],
+        ai_service=AISecurityService(budget=budget),
+    )
 
 
 def _quality_penalty(issue_type: str) -> int:
@@ -256,6 +345,40 @@ def _quality_penalty(issue_type: str) -> int:
 def _score_for_issues(issues: list[dict]) -> float:
     penalty = sum(SEVERITY_PENALTIES.get(issue['severity'], 0) for issue in issues)
     return max(0.0, STARTING_SCORE - penalty)
+
+
+def _degradation_fields(request_budget: RequestBudget, fetch_budget: FetchBudget) -> dict:
+    """The three fields every analyze_file_with_context result carries so the
+    view/DB/API can say *whether* and *why* the answer is partial.
+
+    Two budgets, resolved in precedence order:
+
+    - `request_budget` bounds the whole request (fetch + runtime check +
+      Bandit + AI). It wins, because "the request ran out of time" is the
+      larger truth and points at analysis latency.
+    - `fetch_budget` bounds only the GitHub phase. It is reported when the
+      request as a whole was fine but GitHub specifically was too slow.
+
+    Neither is ever reported for a neighbor that simply 404s or a
+    rate-limited fetch - those are per-file failures, already logged, and
+    just absent from `related`.
+
+    `degraded_stages` names the expensive stages the budget caused to be
+    skipped (`runtime_check`, `bandit`, `ai_enrichment`, `related_files`), so
+    a caller can tell "we analyzed everything, minus the AI prose" from "we
+    stopped analyzing files".
+    """
+    if request_budget.exhausted:
+        reason = REASON_REQUEST_BUDGET_EXHAUSTED
+    elif fetch_budget.exhausted:
+        reason = TRUNCATED_BUDGET_EXHAUSTED
+    else:
+        reason = ''
+    return {
+        'context_truncated': bool(reason),
+        'context_truncated_reason': reason,
+        'degraded_stages': request_budget.degraded_stages,
+    }
 
 
 class PRAnalysisService:
@@ -324,18 +447,29 @@ class PRAnalysisService:
         )
         return results
 
-    def analyze_file_by_path(self, repository: 'GitHubRepository', path: str, access_token: str) -> dict:
+    def analyze_file_by_path(
+        self, repository: 'GitHubRepository', path: str, access_token: str,
+        budget: Optional[FetchBudget] = None, request_budget: Optional[RequestBudget] = None,
+    ) -> dict:
         """On-demand analysis of one file at the HEAD of the repo's default
         branch - not tied to a PR, not automatic. Exactly one GitHub content
         fetch and the same quality/security/performance pipeline PR reviews
         use. Caller (the view) is responsible for the daily quota check -
-        this method always does the real work when called."""
+        this method always does the real work when called.
+
+        Both budgets are None for the plain single-file check (one fetch and
+        one file's analysis, nothing to bound in aggregate).
+        analyze_file_with_context passes both down so the primary file's
+        fetches count against the same GitHub deadline as the neighbors'
+        (`budget`, see fetch_budget.py) and its analysis stages against the
+        same request-wide deadline (`request_budget`, see
+        core/execution_budget.py)."""
         language, skip_reason = classify_path(path)
         if skip_reason:
             return {'path': path, 'language': None, 'skipped': True, 'skip_reason': skip_reason, 'issues': [], 'score': None}
 
         owner, _, repo = repository.full_name.partition('/')
-        client = GitHubClient(access_token)
+        client = GitHubClient(access_token, budget=budget)
         content = client.get_file_content(owner, repo, path, repository.default_branch)
 
         if len(content.encode('utf-8')) > settings.GITHUB_MAX_FILE_SIZE_BYTES:
@@ -345,7 +479,7 @@ class PRAnalysisService:
             }
 
         settings_source = _find_settings_source(client, owner, repo, repository.default_branch) if language == 'Python' else ''
-        issues = _analyze_file_content(content, language, settings_source)
+        issues = _analyze_file_content(content, language, settings_source, budget=request_budget)
         return {
             'path': path, 'language': language, 'skipped': False, 'content': content,
             'skip_reason': None, 'issues': issues, 'score': _score_for_issues(issues),
@@ -360,42 +494,121 @@ class PRAnalysisService:
         file in isolation. Falls back to the primary file alone if there's no
         completed index yet or it has no recorded neighbors. Caller is
         responsible for the daily quota check (see RepositoryContextCheck) -
-        this method always does the real work when called."""
-        primary = self.analyze_file_by_path(repository, path, access_token)
+        this method always does the real work when called.
+
+        This is the only synchronous request path in the project that runs
+        the expensive stages repeatedly - once for the primary file and once
+        per neighbor - so it is bounded by two monotonic deadlines, both
+        started here:
+
+        - `fetch_budget` (settings.GITHUB_CONTEXT_FETCH_BUDGET_SECONDS, see
+          fetch_budget.py) bounds the GitHub phase. Per-request timeouts alone
+          left it at 11 x 15s = 165s.
+        - `request_budget` (settings.GITHUB_CONTEXT_REQUEST_BUDGET_SECONDS,
+          see core/execution_budget.py) bounds the whole request, and is what
+          the sandboxed runtime check, Bandit and the AI fallback chain are
+          checked against. Per-stage timeouts alone left those at
+          (5 + 20 + 90) x 7 files = 805s.
+
+        Both together put a real wall-clock ceiling on the request, well under
+        gunicorn's --timeout 120. Exhausting either returns whatever was
+        already analyzed rather than failing - flagged via `context_truncated`
+        / `context_truncated_reason` / `degraded_stages`, and kept
+        distinguishable from an auth error, a rate limit, a genuine fetch
+        failure or an AI provider outage (all of which keep raising and
+        logging exactly as before).
+        """
+        request_budget = RequestBudget(settings.GITHUB_CONTEXT_REQUEST_BUDGET_SECONDS)
+        # The fetch phase never gets more than what the request as a whole has
+        # left, so the GitHub sub-budget can't outlive its parent.
+        budget = FetchBudget(min(
+            settings.GITHUB_CONTEXT_FETCH_BUDGET_SECONDS, request_budget.remaining(),
+        ))
+        primary = self.analyze_file_by_path(
+            repository, path, access_token, budget=budget, request_budget=request_budget,
+        )
         if primary['skipped']:
-            return {**primary, 'related': []}
+            return {**primary, 'related': [], **_degradation_fields(request_budget, budget)}
 
         owner, _, repo = repository.full_name.partition('/')
-        client = GitHubClient(access_token)
+        client = GitHubClient(access_token, budget=budget)
         settings_source = None  # lazy, only fetched if a related Python file actually needs it
 
         related = []
-        for related_path, relation in _related_paths(repository, path):
-            related_language, skip_reason = classify_path(related_path)
-            if skip_reason:
-                continue
-
-            try:
-                content = client.get_file_content(owner, repo, related_path, repository.default_branch)
-            except GitHubAPIError:
-                logger.warning(
-                    'github_context_check.related_fetch_failed', exc_info=True, extra={'path': related_path},
+        try:
+            for related_path, relation in _related_paths(repository, path):
+                # Two gates, checked before the fetch so no further GitHub call
+                # *and* no further Bandit/AI work is even attempted once either
+                # total is spent. The request-budget gate demands enough for a
+                # worthwhile analysis, not merely a non-zero remainder -
+                # fetching a neighbor we then can't analyze helps nobody.
+                out_of_request_budget = not request_budget.can_afford(
+                    MIN_RELATED_FILE_BUDGET_SECONDS, STAGE_RELATED_FILES,
                 )
-                continue
+                if out_of_request_budget or budget.expired(stage='context_related_files'):
+                    logger.warning(
+                        'github_context_check.truncated',
+                        extra={
+                            'path': path, 'stopped_at': related_path,
+                            'analyzed_related': len(related),
+                            'reason': (
+                                REASON_REQUEST_BUDGET_EXHAUSTED if out_of_request_budget
+                                else TRUNCATED_BUDGET_EXHAUSTED
+                            ),
+                        },
+                    )
+                    break
 
-            if len(content.encode('utf-8')) > settings.GITHUB_MAX_FILE_SIZE_BYTES:
-                continue
+                related_language, skip_reason = classify_path(related_path)
+                if skip_reason:
+                    continue
 
-            if related_language == 'Python' and settings_source is None:
-                settings_source = _find_settings_source(client, owner, repo, repository.default_branch)
+                try:
+                    content = client.get_file_content(owner, repo, related_path, repository.default_branch)
+                except GitHubAPIError:
+                    # Not a FetchBudgetExceeded - that isn't a GitHubAPIError
+                    # subclass precisely so it can't be swallowed here as a
+                    # per-file failure; it unwinds to the handler below.
+                    logger.warning(
+                        'github_context_check.related_fetch_failed', exc_info=True, extra={'path': related_path},
+                    )
+                    continue
 
-            issues = _analyze_file_content(content, related_language, settings_source or '')
-            related.append({
-                'path': related_path, 'language': related_language, 'relation': relation,
-                'issues': issues, 'score': _score_for_issues(issues),
-            })
+                if len(content.encode('utf-8')) > settings.GITHUB_MAX_FILE_SIZE_BYTES:
+                    continue
 
-        return {**primary, 'related': related}
+                if related_language == 'Python' and settings_source is None:
+                    settings_source = _find_settings_source(client, owner, repo, repository.default_branch)
+
+                issues = _analyze_file_content(
+                    content, related_language, settings_source or '', budget=request_budget,
+                )
+                related.append({
+                    'path': related_path, 'language': related_language, 'relation': relation,
+                    'issues': issues, 'score': _score_for_issues(issues),
+                })
+        except BudgetExceeded as exc:
+            # A deadline ran out mid-stage - either mid-fetch (the GitHub
+            # client clamps each call's timeout to what's left) or inside the
+            # AI chain. Catching the shared base class covers both; the reason
+            # reported is resolved from the budgets themselves, not from which
+            # subclass was raised, so it stays right either way. Keep the
+            # neighbors already analyzed and the fully-analyzed primary file -
+            # dropping them would waste the user's one daily context check for
+            # no gain.
+            logger.warning(
+                'github_context_check.truncated',
+                exc_info=True,
+                extra={
+                    'path': path, 'analyzed_related': len(related),
+                    'reason': (
+                        TRUNCATED_BUDGET_EXHAUSTED if isinstance(exc, FetchBudgetExceeded)
+                        else REASON_REQUEST_BUDGET_EXHAUSTED
+                    ),
+                },
+            )
+
+        return {**primary, 'related': related, **_degradation_fields(request_budget, budget)}
 
     @staticmethod
     def _overall_score(results: list[tuple[FileAnalysis, str]]) -> Optional[float]:
@@ -414,10 +627,28 @@ class PRAnalysisService:
             1 for file_analysis, _patch in results for issue in file_analysis.issues
             if issue['severity'] == 'critical'
         )
+        # Files where a security scanner could not run. Called out in the
+        # headline rather than left to be inferred from the issue list: this
+        # summary is the first (often only) line a PR author reads, and
+        # "found 1 issue(s)" reads as a finding about the code even when that
+        # one issue is the incomplete-scan notice itself. Appended to both
+        # branches so the disclosure survives even if the issue-count
+        # invariant that makes the zero branch unreachable ever changes.
+        incomplete_files = len({
+            file_analysis.file_path for file_analysis, _patch in results
+            for issue in file_analysis.issues
+            if issue['type'] == SCANNER_UNAVAILABLE_ISSUE_TYPE
+        })
+        caveat = (
+            f' Security scanning was incomplete for {incomplete_files} file(s), '
+            'so these results may be partial.'
+            if incomplete_files else ''
+        )
+
         if total_issues == 0:
-            return f'Analyzed {len(results)} file(s). No issues found.'
+            return f'Analyzed {len(results)} file(s). No issues found.' + caveat
 
         summary = f'Analyzed {len(results)} file(s), found {total_issues} issue(s)'
         if critical:
             summary += f', including {critical} critical'
-        return summary + '.'
+        return summary + '.' + caveat

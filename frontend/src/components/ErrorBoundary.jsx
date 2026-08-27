@@ -1,4 +1,5 @@
 import { Component } from 'react'
+import { reportClientError } from '../lib/api'
 
 // React error boundaries only catch render/lifecycle errors thrown by class or
 // function components below them in the tree - they must be class components
@@ -12,7 +13,10 @@ export default class ErrorBoundary extends Component {
   }
 
   componentDidCatch(error, info) {
-    console.error('Unhandled UI error:', error, info.componentStack)
+    // Routed through the shared reporter rather than a bare console.error, so
+    // React crashes land in the same place as other client-side failures and
+    // wiring up real error tracking is a one-file change (see lib/api.js).
+    reportClientError('Unhandled UI error', error, { componentStack: info.componentStack })
   }
 
   handleReload = () => {

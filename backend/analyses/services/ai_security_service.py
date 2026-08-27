@@ -16,6 +16,7 @@ import logging
 from typing import Optional
 
 from ai.client import generate_text
+from core.execution_budget import STAGE_AI_ENRICHMENT, BudgetExceeded
 
 from .types import SecurityFinding
 
@@ -38,14 +39,35 @@ class AISecurityService:
     scan, not one per finding) - cheaper and keeps findings from the same file
     explained with awareness of each other."""
 
+    def __init__(self, budget=None):
+        # Optional request-wide deadline (core/execution_budget.py), passed
+        # only by the repository-context path via
+        # SecurityAnalysisService(ai_service=...). None - every other caller -
+        # keeps the unbounded chain and the identical fallback behavior.
+        self._budget = budget
+
     def enrich(self, findings: list[SecurityFinding], source_code: str) -> list[SecurityFinding]:
         if not findings:
             return findings
 
         prompt = self._build_prompt(findings)
         try:
-            raw = generate_text(prompt, _SYSTEM_INSTRUCTION)
+            raw = generate_text(prompt, _SYSTEM_INSTRUCTION, budget=self._budget)
             entries = self._parse_response(raw, expected_count=len(findings))
+        except BudgetExceeded:
+            # Caught before the broad handler below on purpose: running out of
+            # time is not an AI failure. The findings themselves are real and
+            # are kept - only the AI-written prose is replaced with the
+            # scanner's own text, exactly as in the failure case, but recorded
+            # against the budget as a skipped stage rather than logged as a
+            # provider problem.
+            if self._budget is not None:
+                self._budget.mark_skipped(STAGE_AI_ENRICHMENT)
+            logger.warning(
+                'AI security enrichment skipped - request budget exhausted; '
+                'using scanner-provided text.',
+            )
+            entries = [None] * len(findings)
         except Exception:
             logger.exception('AI security enrichment failed - falling back to scanner-provided text.')
             entries = [None] * len(findings)

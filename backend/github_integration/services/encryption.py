@@ -5,6 +5,18 @@ signing) - a stolen database backup should not hand out live GitHub tokens.
 Validated lazily, on first actual use, not at import/Django-startup time -
 same pattern as GROQ_API_KEY in ai/client.py: the rest of the app must still
 boot and run when GitHub integration hasn't been configured yet.
+
+Single-key by design, for now. Rotating GITHUB_TOKEN_ENCRYPTION_KEY today
+makes every stored token undecryptable (TokenDecryptionError below), which
+degrades to "affected users reconnect GitHub" rather than data loss - the
+tokens are re-obtainable through the OAuth flow at any time, and nothing else
+is encrypted with this key. Supporting rotation without that reconnect would
+mean MultiFernet (decrypt against a list of keys, encrypt with the first) plus
+a re-encryption management command; that is deliberately not built yet, since
+it adds a key-list configuration surface to solve a problem this deployment
+does not currently have. Tracked as a backlog item in docs/SECURITY.md - revisit if
+tokens ever become non-reissuable, if a compliance requirement mandates
+scheduled key rotation, or if the user base makes mass reconnection costly.
 """
 from cryptography.fernet import Fernet, InvalidToken
 from django.conf import settings

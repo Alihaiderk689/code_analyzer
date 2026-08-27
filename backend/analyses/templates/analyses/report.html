@@ -1,4 +1,17 @@
-<!DOCTYPE html>
+{% comment %}
+The single source of truth for BOTH exports: /api/reports/<id>/pdf/ renders
+this and pipes it through xhtml2pdf, /api/reports/<id>/html/ serves it as-is.
+
+Section order deliberately mirrors the Report page's tabs
+(frontend/src/components/AnalysisTabs.jsx: Issues, Source Code, AI Suggestions,
+AI Explanation, Refactored Code) so the download reads the same way the screen
+does. The security report follows, since it comes from a separate pipeline
+(analyses/security_views.py) rather than the tab strip.
+
+Every section after Issues is {% if %}-guarded: an analysis that has not had
+the AI actions run, or has never been security-scanned, simply has fewer
+sections rather than a page of empty headings.
+{% endcomment %}<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -21,6 +34,13 @@
   .status-pending { background: #757575; }
   .status-running { background: #1565c0; }
   .status-cancelled { background: #9e9e9e; }
+  .sev-critical { background: #b71c1c; }
+  .sev-high { background: #e64a19; }
+  .sev-medium { background: #f9a825; }
+  .sev-low { background: #616161; }
+  .note { color: #666; font-size: 11px; }
+  .vuln { border: 1px solid #ddd; padding: 8px 10px; margin-bottom: 8px; }
+  .vuln-title { font-weight: bold; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -29,12 +49,14 @@
 
   <table class="summary-table">
     <tr><td class="label">Name</td><td>{{ analysis.name }}</td></tr>
+    <tr><td class="label">Analysis ID</td><td>{{ analysis.id }}</td></tr>
     <tr><td class="label">Language</td><td>{{ analysis.language|default:"Unknown" }}</td></tr>
     <tr><td class="label">Status</td><td><span class="badge status-{{ analysis.status }}">{{ analysis.get_status_display }}</span></td></tr>
     <tr><td class="label">Quality Score</td><td>{% if analysis.quality_score is not None %}{{ analysis.quality_score }}/100{% else %}N/A{% endif %}</td></tr>
     <tr><td class="label">Lines of Code</td><td>{{ analysis.lines_of_code }}</td></tr>
     <tr><td class="label">Issues Found</td><td>{{ analysis.issues_count }}</td></tr>
     <tr><td class="label">Created</td><td>{{ analysis.created_at }}</td></tr>
+    <tr><td class="label">Last Updated</td><td>{{ analysis.updated_at }}</td></tr>
   </table>
 
   <h2>Issues</h2>
@@ -49,9 +71,13 @@
   <p>No issues found.</p>
   {% endif %}
 
-  {% if analysis.ai_explanation %}
-  <h2>AI Explanation</h2>
-  <p>{{ analysis.ai_explanation|linebreaks }}</p>
+  {% if analysis.source_code %}
+  <h2>Source Code</h2>
+  {# linenumbers so the Line column in Issues above can actually be followed. #}
+  <pre>{{ analysis.source_code|linenumbers }}</pre>
+  {% else %}
+  <h2>Source Code</h2>
+  <p class="note">The submitted source is not stored for this analysis.</p>
   {% endif %}
 
   {% if analysis.ai_suggestions %}
@@ -63,9 +89,56 @@
   </ul>
   {% endif %}
 
+  {% if analysis.ai_explanation %}
+  <h2>AI Explanation</h2>
+  {# No wrapping <p>: the linebreaks filter emits its own <p> tags, and
+     nesting them produced invalid markup that xhtml2pdf spaced oddly. #}
+  {{ analysis.ai_explanation|linebreaks }}
+  {% endif %}
+
   {% if analysis.ai_refactored_code %}
   <h2>AI-Refactored Code</h2>
   <pre>{{ analysis.ai_refactored_code }}</pre>
+  {% endif %}
+
+  {% if analysis.security_report %}
+  <h2>Security Report</h2>
+  <table class="summary-table">
+    <tr><td class="label">Security Score</td><td>{{ analysis.security_report.score }}/100</td></tr>
+    <tr><td class="label">Risk Level</td><td>{{ analysis.security_report.risk_level|title }}</td></tr>
+    <tr><td class="label">Findings</td><td>
+      {{ analysis.security_report.summary.total }} total &mdash;
+      {{ analysis.security_report.summary.critical }} critical,
+      {{ analysis.security_report.summary.high }} high,
+      {{ analysis.security_report.summary.medium }} medium,
+      {{ analysis.security_report.summary.low }} low
+    </td></tr>
+  </table>
+
+  {% if analysis.security_report.scan_complete is False %}
+  {# Never present a partial scan as a clean bill of health - the same rule
+     the API applies (analyses/serializers.py SecurityReportSerializer). #}
+  <p class="note"><strong>This scan was incomplete.</strong> One or more scanners could not run, so
+  absence of a finding below does not mean absence of a vulnerability.
+  {% for s in analysis.security_report.scanners_unavailable %}
+  {{ s.scanner }} ({{ s.reason }}){% if not forloop.last %}, {% endif %}
+  {% endfor %}
+  </p>
+  {% endif %}
+
+  {% for v in analysis.security_report.vulnerabilities %}
+  <div class="vuln">
+    <div class="vuln-title">
+      <span class="badge sev-{{ v.severity }}">{{ v.severity|title }}</span>
+      {{ v.title }}{% if v.line_number %} &mdash; line {{ v.line_number }}{% endif %}
+    </div>
+    <p class="note">{{ v.scanner }} / {{ v.rule_id }}</p>
+    {% if v.description %}<p>{{ v.description }}</p>{% endif %}
+    {% if v.code_snippet %}<pre>{{ v.code_snippet }}</pre>{% endif %}
+    {% if v.explanation %}<p><strong>Why this matters:</strong> {{ v.explanation }}</p>{% endif %}
+    {% if v.remediation %}<p><strong>How to fix:</strong> {{ v.remediation }}</p>{% endif %}
+  </div>
+  {% endfor %}
   {% endif %}
 </body>
 </html>

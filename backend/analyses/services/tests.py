@@ -1,6 +1,7 @@
-from unittest.mock import patch
+import subprocess
+from unittest.mock import Mock, patch
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 from .ai_security_service import AISecurityService
 from .bandit_service import BanditScanner
@@ -336,3 +337,80 @@ class _PassthroughAI:
 
     def enrich(self, findings, source_code):
         return findings
+
+
+class ScannerUnavailabilityTests(TestCase):
+    """A scanner that cannot run must never be indistinguishable from a clean
+    result. Bandit returning [] on a missing binary previously rendered as a
+    security report with zero vulnerabilities - false assurance on a security
+    feature, which is worse than an error."""
+
+    def _service(self):
+        # AI enrichment is irrelevant here and would make a network call.
+        return SecurityAnalysisService(ai_service=Mock(enrich=lambda findings, src: findings))
+
+    def test_missing_bandit_binary_marks_the_scan_incomplete(self):
+        with patch('analyses.services.bandit_service.subprocess.run', side_effect=FileNotFoundError):
+            report = self._service().analyze(source_code='x = 1\n', language='Python')
+
+        self.assertFalse(report['scan_complete'])
+        self.assertEqual(report['scanners_unavailable'][0]['scanner'], 'bandit')
+        self.assertEqual(report['scanners_unavailable'][0]['reason'], 'not_installed')
+
+    def test_bandit_timeout_marks_the_scan_incomplete(self):
+        with patch(
+            'analyses.services.bandit_service.subprocess.run',
+            side_effect=subprocess.TimeoutExpired(cmd='bandit', timeout=1),
+        ):
+            report = self._service().analyze(source_code='x = 1\n', language='Python')
+
+        self.assertFalse(report['scan_complete'])
+        self.assertEqual(report['scanners_unavailable'][0]['reason'], 'timeout')
+
+    def test_unparsable_bandit_output_marks_the_scan_incomplete(self):
+        result = Mock(stdout='not json at all', stderr='')
+        with patch('analyses.services.bandit_service.subprocess.run', return_value=result):
+            report = self._service().analyze(source_code='x = 1\n', language='Python')
+
+        self.assertFalse(report['scan_complete'])
+        self.assertEqual(report['scanners_unavailable'][0]['reason'], 'unparsable_output')
+
+    def test_partial_results_are_preserved_when_one_scanner_fails(self):
+        """The other scanners still run - a partial report beats no report,
+        as long as the report says it is partial."""
+        with patch('analyses.services.bandit_service.subprocess.run', side_effect=FileNotFoundError):
+            report = self._service().analyze(
+                # Flagged by CustomRulesScanner, which is unaffected by Bandit
+                # being unavailable.
+                source_code='API_KEY = "sk-abcdefghijklmnopqrstuvwxyz123456"\n',
+                language='Python',
+            )
+
+        self.assertFalse(report['scan_complete'])
+        self.assertTrue(report['vulnerabilities'], 'custom rules scanner should still contribute findings')
+
+    def test_a_scanner_raising_is_reported_not_swallowed(self):
+        broken = Mock(name='broken')
+        broken.name = 'broken'
+        broken.scan.side_effect = RuntimeError('tool exploded')
+        service = SecurityAnalysisService(
+            scanners=[broken], ai_service=Mock(enrich=lambda findings, src: findings),
+        )
+
+        report = service.analyze(source_code='x = 1\n', language='Python')
+
+        self.assertFalse(report['scan_complete'])
+        self.assertEqual(report['scanners_unavailable'][0]['reason'], 'error')
+
+    def test_healthy_scan_reports_complete(self):
+        report = self._service().analyze(source_code='x = 1\n', language='Python')
+
+        self.assertTrue(report['scan_complete'])
+        self.assertEqual(report['scanners_unavailable'], [])
+
+    def test_language_mismatch_is_not_reported_as_unavailable(self):
+        """Skipping a Python-only scanner for JavaScript is correct behavior,
+        not a failure - it must not flag the scan incomplete."""
+        report = self._service().analyze(source_code='const a = 1;\n', language='JavaScript')
+
+        self.assertTrue(report['scan_complete'])

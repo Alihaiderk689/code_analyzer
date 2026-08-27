@@ -1,0 +1,42 @@
+# Load-testing overlay. Adds the minimum server-side observability needed to
+# tell *what* is slow, and changes nothing else about how the stack runs.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d --build
+#
+# Kept as a separate overlay rather than edits to docker-compose.yml/Dockerfile
+# so production configuration (and the published image's CMD) is untouched -
+# see docs/SCALABILITY.md, which notes this project has no APM.
+#
+# What it does NOT change, deliberately, because these are the things under test:
+#   - gunicorn stays at --workers 3 --timeout 120, matching Render's `starter`
+#     plan (render.yaml) - 3 concurrent requests is the ceiling being measured.
+#   - Postgres max_connections stays at its default.
+#   - No throttle rates are relaxed. The test is designed to stay under them
+#     (one fixture user per VU); 429s showing up in the k6 summary is a signal
+#     the test itself is misconfigured, not a limit to tune away.
+services:
+  backend:
+    # Same gunicorn invocation as backend/Dockerfile's CMD, plus an access log.
+    # `gunicorn` must stay as the first argument: entrypoint.sh keys on $1 to
+    # decide whether to run migrate/collectstatic.
+    #
+    # %(D)s is per-request time in MICROSECONDS, measured inside gunicorn. It
+    # is the number that separates "the app is slow" from "the request queued"
+    # - k6 sees queueing + service time, this sees service time alone.
+    command: >
+      gunicorn config.wsgi:application
+      --bind 0.0.0.0:8000
+      --workers 3
+      --timeout 120
+      --access-logfile -
+      --access-logformat "ACCESS method=%(m)s path=%(U)s query=%(q)s status=%(s)s bytes=%(b)s micros=%(D)s"
+
+  db:
+    # pg_stat_statements needs to be preloaded at server start; it cannot be
+    # enabled later by CREATE EXTENSION alone. loadtest/run.sh creates the
+    # extension and resets the stats before each run.
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c pg_stat_statements.max=5000

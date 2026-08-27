@@ -17,6 +17,8 @@ from urllib.parse import urljoin
 import requests
 from django.conf import settings
 
+from .fetch_budget import FetchBudget, FetchBudgetExceeded
+
 logger = logging.getLogger(__name__)
 
 GITHUB_API_BASE = 'https://api.github.com/'
@@ -75,8 +77,13 @@ def build_authorize_url(state: str, scope: str = DEFAULT_OAUTH_SCOPE) -> str:
 
 
 class GitHubClient:
-    def __init__(self, access_token: Optional[str] = None):
+    def __init__(self, access_token: Optional[str] = None, budget: Optional[FetchBudget] = None):
         self.access_token = access_token
+        # Optional shared total-time deadline across every request this client
+        # makes (see fetch_budget.py). None - the default, and what every
+        # caller except the repository-context flow passes - keeps the
+        # historical behavior: REQUEST_TIMEOUT_SECONDS per call, no total bound.
+        self.budget = budget
 
     # ---- low-level request plumbing -------------------------------------------------
 
@@ -91,11 +98,25 @@ class GitHubClient:
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         url = path if path.startswith('http') else urljoin(GITHUB_API_BASE, path.lstrip('/'))
+        timeout = REQUEST_TIMEOUT_SECONDS
+        if self.budget is not None:
+            # Raises FetchBudgetExceeded if the shared deadline is already
+            # spent, and otherwise clamps this call's timeout so it cannot
+            # outlive it - that clamp is what makes the total an actual bound
+            # rather than a hope.
+            timeout = self.budget.slice_for(REQUEST_TIMEOUT_SECONDS, stage=f'{method} {url}')
         try:
             response = requests.request(
-                method, url, headers=self._headers(), timeout=REQUEST_TIMEOUT_SECONDS, **kwargs,
+                method, url, headers=self._headers(), timeout=timeout, **kwargs,
             )
         except requests.RequestException as exc:
+            if self.budget is not None and self.budget.expired(stage=f'{method} {url}'):
+                # The call died on the clamped timeout, i.e. the deadline ran
+                # out mid-request. Reporting that as a network error would
+                # blame GitHub for our own budget - raise the honest type.
+                raise FetchBudgetExceeded(
+                    f'Repository-context fetch budget exhausted during {method} {url}.'
+                ) from exc
             logger.error(
                 'github_api.network_error', extra={'method': method, 'url': url, 'error': str(exc)},
             )
