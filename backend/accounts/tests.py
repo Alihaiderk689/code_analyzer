@@ -30,8 +30,8 @@ from github_integration.services.oauth_service import _STATE_SALT
 from .brevo_client import BrevoAPIError
 from .cookies import ACCESS_COOKIE, REFRESH_COOKIE
 from .google_auth import GoogleTokenError, verify_google_access_token
-from .models import Profile
-from .otp import OTP_MAX_ATTEMPTS, hash_otp_code, issue_otp, verify_otp
+from .models import PendingRegistration, Profile
+from .otp import OTP_MAX_ATTEMPTS, hash_otp_code, issue_otp, issue_otp_to, verify_otp
 from .password_validation import PwnedPasswordsValidator
 from .tokens import revoke_all_refresh_tokens
 
@@ -49,18 +49,75 @@ class RegisterTests(APITestCase):
     url = reverse('auth-register')
 
     @patch('accounts.emails.BrevoClient')
-    def test_register_creates_inactive_user_and_sends_otp_email(self, mock_brevo_cls):
+    def test_register_creates_no_account_only_a_pending_attempt(self, mock_brevo_cls):
         response = self.client.post(self.url, {
             'email': 'new@example.com', 'password': 'TestPass123!', 'password2': 'TestPass123!',
         })
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        user = User.objects.get(email='new@example.com')
-        self.assertFalse(user.is_active)
-        self.assertFalse(user.profile.is_verified)
-        self.assertIsNotNone(user.profile.otp_code_hash)
+        # The whole point: registering reserves nothing in the User table, so
+        # an address typed by someone who cannot read that inbox is not burned.
+        self.assertFalse(User.objects.filter(email='new@example.com').exists())
+        pending = PendingRegistration.objects.get(email='new@example.com')
+        self.assertIsNotNone(pending.otp_code_hash)
+        self.assertNotEqual(pending.password, 'TestPass123!')
         mock_brevo_cls.return_value.send_email.assert_called_once()
         self.assertEqual(mock_brevo_cls.return_value.send_email.call_args.kwargs['to_email'], 'new@example.com')
+
+    @patch('accounts.emails.BrevoClient')
+    def test_verifying_the_code_creates_the_account(self, mock_brevo_cls):
+        self.client.post(self.url, {
+            'email': 'earned@example.com', 'password': 'TestPass123!', 'password2': 'TestPass123!',
+        })
+        pending = PendingRegistration.objects.get(email='earned@example.com')
+        code = issue_otp_to(pending)
+
+        response = self.client.post(reverse('auth-verify-email'), {'email': 'earned@example.com', 'code': code})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        user = User.objects.get(email='earned@example.com')
+        self.assertTrue(user.is_active)
+        self.assertTrue(user.profile.is_verified)
+        # The password survived the round trip through PendingRegistration.
+        self.assertTrue(user.check_password('TestPass123!'))
+        self.assertFalse(PendingRegistration.objects.filter(email='earned@example.com').exists())
+
+    @patch('accounts.emails.BrevoClient')
+    def test_reregistering_an_unverified_address_replaces_the_attempt(self, mock_brevo_cls):
+        for _ in range(2):
+            response = self.client.post(self.url, {
+                'email': 'again@example.com', 'password': 'TestPass123!', 'password2': 'TestPass123!',
+            })
+            self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        # Someone who lost the first email is not in conflict with themselves -
+        # they get a fresh code, not "this email is already registered".
+        self.assertEqual(PendingRegistration.objects.filter(email='again@example.com').count(), 1)
+
+    @patch('accounts.emails.BrevoClient')
+    def test_register_reclaims_an_address_stranded_by_the_old_flow(self, mock_brevo_cls):
+        stranded = make_user(email='stranded@example.com', verified=False)
+        stranded.is_active = False
+        stranded.save(update_fields=['is_active'])
+
+        response = self.client.post(self.url, {
+            'email': 'stranded@example.com', 'password': 'TestPass123!', 'password2': 'TestPass123!',
+        })
+
+        # Without this the address is unclaimable forever: its owner can
+        # neither log in (inactive) nor register again (already exists).
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(User.objects.filter(pk=stranded.pk).exists())
+        self.assertTrue(PendingRegistration.objects.filter(email='stranded@example.com').exists())
+
+    def test_register_rejected_when_a_verified_account_holds_the_address(self):
+        user = make_user(email='taken@example.com', verified=True)
+        self.assertTrue(user.is_active)
+        response = self.client.post(self.url, {
+            'email': 'taken@example.com', 'password': 'TestPass123!', 'password2': 'TestPass123!',
+        })
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(User.objects.filter(pk=user.pk).exists())
 
     @patch('accounts.emails.BrevoClient')
     def test_register_rolls_back_when_email_send_fails(self, mock_brevo_cls):
@@ -71,6 +128,8 @@ class RegisterTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_503_SERVICE_UNAVAILABLE)
         self.assertFalse(User.objects.filter(email='failed@example.com').exists())
+        # Nor a pending attempt holding a code nobody received.
+        self.assertFalse(PendingRegistration.objects.filter(email='failed@example.com').exists())
 
     def test_register_duplicate_email_rejected(self):
         make_user(email='dup@example.com')
