@@ -41,6 +41,30 @@ jobs:
     # not counted against this.
     timeout-minutes: 60
     steps:
+      # Two commits deep is all this needs: HEAD and its first parent, which
+      # for a merge commit is the previous tip of main.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # Vercel skips a build when nothing under its Root Directory (frontend)
+      # changed, and reports that skip as CANCELED - the same state a genuinely
+      # failed or superseded build gets. Without knowing whether this commit
+      # touched the frontend at all, the wait below cannot tell "correctly did
+      # nothing" from "was supposed to deploy and didn't", and a docs-only
+      # commit fails the run for no reason.
+      - name: Did the frontend change?
+        id: changes
+        run: |
+          set -euo pipefail
+          if git diff --quiet HEAD^ HEAD -- frontend/; then
+            echo "No frontend/ changes in $GITHUB_SHA - Vercel is expected to skip its build."
+            echo "frontend=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "frontend/ changed in $GITHUB_SHA - Vercel must produce a deployment."
+            echo "frontend=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # Vercel fires first, and deliberately: it is a bare POST with nothing
       # to parse, so nothing about the Render hook - a malformed URL, a
       # response shape change, an outage - can stop the frontend from
@@ -194,6 +218,7 @@ jobs:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
           TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+          FRONTEND_CHANGED: ${{ steps.changes.outputs.frontend }}
         run: |
           set -euo pipefail
           # Same absent-vs-rejected split as the Render wait above.
@@ -246,9 +271,26 @@ jobs:
                 echo "Vercel deployment for $GITHUB_SHA is ready."
                 exit 0
                 ;;
-              ERROR|CANCELED)
-                echo "Vercel deployment for $GITHUB_SHA ended as '$state'." >&2
+              ERROR)
+                echo "Vercel deployment for $GITHUB_SHA ended as 'ERROR' - the build failed." >&2
+                echo "Open the deployment in Vercel; the build log has the reason." >&2
                 exit 1
+                ;;
+              CANCELED)
+                # CANCELED covers two unrelated things: a build Vercel chose
+                # not to run because nothing under the Root Directory changed,
+                # and one that was genuinely killed or superseded. Only the
+                # frontend diff separates them.
+                if [ "$FRONTEND_CHANGED" = 'true' ]; then
+                  echo "Vercel deployment for $GITHUB_SHA was CANCELED even though this commit" >&2
+                  echo "changes frontend/. Either a newer deployment superseded it, or the build" >&2
+                  echo "was cancelled - check the deployment in Vercel." >&2
+                  exit 1
+                fi
+                echo "Vercel skipped the build for $GITHUB_SHA (reported as CANCELED)."
+                echo "That is correct: this commit changes nothing under frontend/, so the"
+                echo "existing production deployment is still the right one."
+                exit 0
                 ;;
               '')
                 echo "No Vercel deployment for $GITHUB_SHA yet."
@@ -291,10 +333,24 @@ jobs:
             # variable joined to a path yields "/api/health/", which is not
             # empty and would sail past this check straight into a curl
             # against a relative path.
+            # A value pasted into the Actions UI arrives with whatever
+            # whitespace came with it. curl rejects a URL containing a stray
+            # space or newline with "(3) Malformed input to a URL function",
+            # which reads like a bug in the address rather than an invisible
+            # character around it - and --retry then repeats it five times.
+            base="$(printf '%s' "$base" | tr -d '[:space:]')"
             if [ -z "$base" ]; then
               echo "SKIP $name - no URL configured (set the repo variable)."
               return 0
             fi
+            case "$base" in
+              http://*|https://*) ;;
+              *)
+                echo "FAIL $name - '$base' is not a URL; it needs the https:// scheme." >&2
+                failed=1
+                return 0
+                ;;
+            esac
             checked=$((checked + 1))
             local url="${base%/}$path" body
             # --retry covers a container still finishing its first request;
