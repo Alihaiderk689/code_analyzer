@@ -224,16 +224,35 @@ jobs:
             deadline=$(( SECONDS + 900 ))
             status=''
             while [ "$SECONDS" -lt "$deadline" ]; do
-              # A single failed poll is a blip, not a failed deploy - keep
-              # waiting and let the deadline be what gives up.
-              if ! response="$(curl -fsS \
+              # Status is read separately from the body so a rejected
+              # credential can be told apart from a blip. Retrying a 401/403
+              # is pointless - the answer will not change in 15 seconds or in
+              # 15 minutes - and it buries the real cause under hundreds of
+              # identical lines. Only transport failures and 5xx are retried.
+              reply="$(curl -sS -w $'\n%{http_code}' \
                 -H "Authorization: Bearer $RENDER_API_KEY" \
                 -H 'Accept: application/json' \
-                "https://api.render.com/v1/services/$service_id/deploys/$deploy_id")"; then
-                echo "Render API poll failed for $service_id; retrying."
-                sleep 15
-                continue
-              fi
+                "https://api.render.com/v1/services/$service_id/deploys/$deploy_id" || true)"
+              code="${reply##*$'\n'}"
+              response="${reply%$'\n'*}"
+              case "$code" in
+                200) ;;
+                401|403)
+                  echo "Render API rejected the credential (HTTP $code). Check that the" >&2
+                  echo "RENDER_API_KEY secret is set and still valid." >&2
+                  exit 1
+                  ;;
+                404)
+                  echo "Render API has no deploy $deploy_id on service $service_id (HTTP 404)." >&2
+                  echo "The hook URL and the API key may belong to different accounts." >&2
+                  exit 1
+                  ;;
+                *)
+                  echo "Render API poll for $service_id returned HTTP ${code:-no response}; retrying."
+                  sleep 15
+                  continue
+                  ;;
+              esac
               status="$(jq -r '.status // empty' <<<"$response")"
               case "$status" in
                 live)
@@ -275,13 +294,33 @@ jobs:
           deadline=$(( SECONDS + 900 ))
           state=''
           while [ "$SECONDS" -lt "$deadline" ]; do
-            if ! response="$(curl -fsS \
+            # Same split as the Render poll above: a rejected credential is
+            # not a blip, and retrying it for 15 minutes only buries the cause.
+            reply="$(curl -sS -w $'\n%{http_code}' \
               -H "Authorization: Bearer $VERCEL_TOKEN" \
-              "https://api.vercel.com/v6/deployments?$query")"; then
-              echo "Vercel API poll failed; retrying."
-              sleep 15
-              continue
-            fi
+              "https://api.vercel.com/v6/deployments?$query" || true)"
+            code="${reply##*$'\n'}"
+            response="${reply%$'\n'*}"
+            case "$code" in
+              200) ;;
+              401|403)
+                echo "Vercel API rejected the credential (HTTP $code)." >&2
+                echo "Check VERCEL_TOKEN is set and valid. A 403 also comes back when the" >&2
+                echo "project belongs to a team and VERCEL_TEAM_ID is unset - a personal" >&2
+                echo "token cannot read a team's deployments without the team scope." >&2
+                exit 1
+                ;;
+              404)
+                echo "Vercel API does not recognise project '$PROJECT_ID' (HTTP 404)." >&2
+                echo "VERCEL_PROJECT_ID should be the prj_... id from Settings > General." >&2
+                exit 1
+                ;;
+              *)
+                echo "Vercel API poll returned HTTP ${code:-no response}; retrying."
+                sleep 15
+                continue
+                ;;
+            esac
             # Matched on the commit rather than "the newest one", so a
             # deployment somebody else triggers mid-run can't be mistaken for
             # this one and reported as its result.
