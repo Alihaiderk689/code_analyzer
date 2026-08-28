@@ -4,10 +4,18 @@ import { verifyOtp, resendVerification } from '../lib/resources'
 import { ApiError } from '../lib/api'
 import { validateOtpCode } from '../lib/validation'
 
+// Register.jsx stashes the address here alongside the pending name, because
+// router state does not survive a reload. Someone who switches to their mail
+// app for the code and comes back to a refreshed tab would otherwise land on
+// this screen with no address to verify - and since the account does not exist
+// until the code lands (accounts/models.py's PendingRegistration), there is no
+// account to sign into either. Registering again would be their only way out.
+const PENDING_EMAIL_KEY = 'ca_pending_email'
+
 export default function VerifyEmail() {
   const location = useLocation()
   const navigate = useNavigate()
-  const email = location.state?.email || ''
+  const email = location.state?.email || sessionStorage.getItem(PENDING_EMAIL_KEY) || ''
 
   const [code, setCode] = useState('')
   const [status, setStatus] = useState('entry') // 'entry' | 'success'
@@ -33,6 +41,7 @@ export default function VerifyEmail() {
     setSubmitting(true)
     try {
       await verifyOtp(email, code.trim())
+      sessionStorage.removeItem(PENDING_EMAIL_KEY)
       setStatus('success')
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Verification failed. Please try again.')
@@ -50,10 +59,15 @@ export default function VerifyEmail() {
     setError('')
     try {
       await resendVerification(email)
-    } finally {
-      setResendBusy(false)
       setResendMsg(true)
       setTimeout(() => setResendMsg(false), 2500)
+    } catch (err) {
+      // Reporting success from `finally` claimed the code had been resent
+      // whatever happened - and the resend budget is 5/hour, so the throttled
+      // 429 this hides is one a real user hits by clicking twice and waiting.
+      setError(err instanceof ApiError ? err.message : 'Could not resend the code. Please try again.')
+    } finally {
+      setResendBusy(false)
     }
   }
 
