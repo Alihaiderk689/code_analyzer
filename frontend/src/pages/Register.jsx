@@ -90,6 +90,9 @@ export default function Register() {
       await registerUser(cleanEmail, password, password2)
       sessionStorage.setItem('ca_pending_first_name', firstName.trim())
       sessionStorage.setItem('ca_pending_last_name', lastName.trim())
+      // Router state alone strands anyone who reloads /verify-email - see the
+      // key's definition there.
+      sessionStorage.setItem('ca_pending_email', cleanEmail)
       navigate('/verify-email', { state: { email: cleanEmail } })
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Something went wrong. Please try again.')
@@ -168,7 +171,7 @@ export default function Register() {
             {submitting ? 'Creating account…' : 'Create account'}
           </button>
           <div style={{ fontSize: 12, color: 'var(--color-text-muted)', textAlign: 'center', marginTop: 4 }}>
-            We'll send a verification link to your email.
+            We'll send a 6-digit verification code to your email.
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '4px 0', color: 'var(--color-text-secondary-2)', fontSize: 12 }}>
             <div style={{ flex: 1, height: 1, background: 'var(--color-border)' }} />
