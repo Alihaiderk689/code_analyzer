@@ -145,7 +145,7 @@ cd backend && python manage.py test
 cd frontend && npm test && npm run lint && npm run build
 ```
 
-CI (`.github/workflows/ci.yml`) runs both suites against a real Postgres instance on every push/PR to `main`/`dev`.
+CI (`.github/workflows/ci.yml`) runs both suites against a real Postgres instance on every PR to `main`/`dev`, and on pushes to `main` — where a passing run also gates the `deploy` job.
 
 ## API
 
