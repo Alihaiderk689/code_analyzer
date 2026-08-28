@@ -1,27 +1,33 @@
 name: CI
 
-# `push` covers main alone because that is the deploy path - a merge to main
-# is a push to main, which is what lets the deploy job below run. Everything
-# else is tested as a pull request.
+# The quality gate, and nothing else - deploying lives in deploy.yml.
 #
-# Listing dev under `push` as well ran every job twice on a dev -> main PR:
-# once for the push that updated dev, once for the PR itself. Same commit,
-# same result, double the minutes, and eight checks to read instead of three.
-# The trade is that a commit pushed straight to dev without a PR is no longer
-# tested - work through PRs and nothing is lost.
+# `workflow_call` is what makes this importable: deploy.yml runs it with
+# `uses: ./.github/workflows/ci.yml` rather than repeating the steps, so the
+# definition of "the tests" exists once and the deploy path cannot drift from
+# what a PR was checked against.
+#
+# There is deliberately no `push:` trigger. deploy.yml is what handles a push
+# to main, and it calls this workflow itself - listing push here as well would
+# run every job twice for one commit. Listing `dev` under push had that same
+# effect on a dev -> main PR: eight checks for three jobs, same commit, double
+# the minutes. The trade is that a commit pushed straight to dev with no PR
+# goes untested; work through PRs and nothing is lost.
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main, dev]
+  workflow_call:
 
-# One in-flight run per branch or PR. Pushing a fixup while CI is still
-# chewing on the previous commit now cancels that run instead of racing it.
-# Deploys are deliberately exempt: cancelling half-way through a production
-# rollout is worse than letting a superseded one finish.
+# One in-flight run per PR. Pushing a fixup while CI is still chewing on the
+# previous commit cancels that run instead of racing it.
+#
+# `github.event.pull_request.number ||` still matters even though this only
+# triggers on PRs: under `workflow_call` the event is deploy.yml's push, where
+# that field is absent and `github.ref` is what identifies the run. Deploys
+# are never cancelled - deploy.yml sets its own concurrency for that.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   backend:
@@ -109,242 +115,3 @@ jobs:
       - name: Audit npm dependencies (advisory)
         continue-on-error: true
         run: npm audit --audit-level=high
-
-  # Only runs once backend+frontend CI passes, and only for pushes that land
-  # on main (a merged PR is a push to main, so this covers "every merge" too)
-  # - never for PRs or pushes to dev.
-  #
-  # `environment: production` does NOT gate this job on its own. It pauses for
-  # a human only if that GitHub Environment has required reviewers configured,
-  # and today it has none - deploys are automatic once the tests pass, which
-  # is the intent. The environment is kept because it scopes any
-  # production-only secrets and gives deploys their own audit trail; adding a
-  # reviewer there is what would make it a manual gate. Do not read the
-  # presence of this key as proof that anything is waiting for approval.
-  #
-  # The real gate is `needs:` plus the `if:` below. Both Render services have
-  # autoDeploy off (render.yaml) and Vercel's Git auto-deploy is off in its
-  # dashboard, so this job is the only path to production. Re-enabling
-  # auto-deploy on one provider but not the other is what previously left a
-  # current backend serving a months-stale frontend.
-  #
-  # A deploy hook returns as soon as the build is *queued*, so firing one
-  # proves only that the request was accepted - the build can fail afterwards
-  # and leave this job green over a production that never moved. The wait
-  # steps poll each provider to a terminal state, so a green deploy means
-  # production actually updated.
-  #
-  # All hooks fire before any wait, so the three builds run concurrently
-  # rather than each queueing behind the last.
-  #
-  # Secrets this needs, beyond RENDER_DEPLOY_HOOK_URL/VERCEL_DEPLOY_HOOK_URL:
-  #   RENDER_WORKER_DEPLOY_HOOK_URL  deploy hook on the Celery worker service
-  #   RENDER_API_KEY                 to poll deploy status
-  #   VERCEL_TOKEN                   to poll deployment status
-  #   VERCEL_PROJECT_ID              Settings > General > Project ID
-  #   VERCEL_TEAM_ID                 only if the project sits under a team
-  deploy:
-    needs: [backend, frontend]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    environment: production
-    # Backstop only - each of the three waits has its own 15-minute deadline,
-    # so 45 is the real ceiling. Were a required reviewer ever added to the
-    # production environment, that pause happens before the job starts and is
-    # not counted against this.
-    timeout-minutes: 60
-    steps:
-      # Vercel fires first, and deliberately: it is a bare POST with nothing
-      # to parse, so nothing about the Render hook - a malformed URL, a
-      # response shape change, an outage - can stop the frontend from
-      # deploying. Ordered the other way, a Render-side problem would leave
-      # the frontend pinned to whatever it was last serving, which is the
-      # exact failure this whole job exists to make impossible.
-      - name: Trigger Vercel deploy
-        id: vercel
-        env:
-          HOOK_URL: ${{ secrets.VERCEL_DEPLOY_HOOK_URL }}
-        run: curl -fsS -X POST "$HOOK_URL"
-
-      - name: Trigger Render deploys
-        id: render
-        env:
-          WEB_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
-          WORKER_HOOK_URL: ${{ secrets.RENDER_WORKER_DEPLOY_HOOK_URL }}
-        run: |
-          set -euo pipefail
-          # Both Render services have autoDeploy off (render.yaml), so this
-          # job is the only thing that deploys them - and it has to deploy
-          # BOTH. The worker runs the web service's image, so shipping one
-          # without the other leaves two halves of the app on different
-          # commits, which is worse than either being stale.
-          #
-          # A missing worker hook is a hard error rather than a skip: quietly
-          # not deploying a service is the exact failure this job exists to
-          # prevent, and a warning in a log nobody reads is still quiet.
-          if [ -z "$WORKER_HOOK_URL" ]; then
-            echo "RENDER_WORKER_DEPLOY_HOOK_URL is not set, and the worker no longer" >&2
-            echo "auto-deploys. Create a deploy hook on the code-analyzer-celery-worker" >&2
-            echo "service (Settings > Deploy Hook) and add it as an Actions secret." >&2
-            exit 1
-          fi
-          deploys=''
-          for hook in "$WEB_HOOK_URL" "$WORKER_HOOK_URL"; do
-            # The service id is already inside the hook URL
-            # (.../deploy/srv-xxxx?key=...), so deriving it beats another
-            # secret that can silently drift out of sync with the hook.
-            service_id="$(sed -n 's#.*/deploy/\(srv-[^/?]*\).*#\1#p' <<<"$hook")"
-            if [ -z "$service_id" ]; then
-              echo "No srv-... id found in one of the Render hook URLs." >&2
-              exit 1
-            fi
-            response="$(curl -fsS -X POST "$hook")"
-            deploy_id="$(jq -r '.deploy.id // empty' <<<"$response")"
-            if [ -z "$deploy_id" ]; then
-              echo "Render hook for $service_id returned no deploy id. Response: $response" >&2
-              exit 1
-            fi
-            echo "Queued Render deploy $deploy_id on $service_id."
-            deploys="$deploys $service_id/$deploy_id"
-          done
-          echo "deploys=${deploys# }" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for Render deploys
-        env:
-          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
-          DEPLOYS: ${{ steps.render.outputs.deploys }}
-        run: |
-          set -euo pipefail
-          # Both were queued in the step above, so Render builds them
-          # concurrently - watching them one after the other costs roughly the
-          # slower of the two, not the sum.
-          for pair in $DEPLOYS; do
-            service_id="${pair%%/*}"
-            deploy_id="${pair##*/}"
-            deadline=$(( SECONDS + 900 ))
-            status=''
-            while [ "$SECONDS" -lt "$deadline" ]; do
-              # Status is read separately from the body so a rejected
-              # credential can be told apart from a blip. Retrying a 401/403
-              # is pointless - the answer will not change in 15 seconds or in
-              # 15 minutes - and it buries the real cause under hundreds of
-              # identical lines. Only transport failures and 5xx are retried.
-              reply="$(curl -sS -w $'\n%{http_code}' \
-                -H "Authorization: Bearer $RENDER_API_KEY" \
-                -H 'Accept: application/json' \
-                "https://api.render.com/v1/services/$service_id/deploys/$deploy_id" || true)"
-              code="${reply##*$'\n'}"
-              response="${reply%$'\n'*}"
-              case "$code" in
-                200) ;;
-                401|403)
-                  echo "Render API rejected the credential (HTTP $code). Check that the" >&2
-                  echo "RENDER_API_KEY secret is set and still valid." >&2
-                  exit 1
-                  ;;
-                404)
-                  echo "Render API has no deploy $deploy_id on service $service_id (HTTP 404)." >&2
-                  echo "The hook URL and the API key may belong to different accounts." >&2
-                  exit 1
-                  ;;
-                *)
-                  echo "Render API poll for $service_id returned HTTP ${code:-no response}; retrying."
-                  sleep 15
-                  continue
-                  ;;
-              esac
-              status="$(jq -r '.status // empty' <<<"$response")"
-              case "$status" in
-                live)
-                  echo "Render deploy $deploy_id on $service_id is live."
-                  break
-                  ;;
-                # deactivated means a later deploy superseded this one, so the
-                # commit this job is gating is not what production ends up
-                # serving - not something to report as a success.
-                build_failed|update_failed|pre_deploy_failed|canceled|deactivated)
-                  echo "Render deploy $deploy_id on $service_id ended as '$status'." >&2
-                  exit 1
-                  ;;
-              esac
-              echo "Render deploy $deploy_id on $service_id: ${status:-unknown}"
-              sleep 15
-            done
-            if [ "$status" != live ]; then
-              echo "Timed out after 15m on Render deploy $deploy_id ($service_id), last status '${status:-unknown}'." >&2
-              exit 1
-            fi
-          done
-
-      - name: Wait for Vercel deploy
-        # Runs even when the Render wait failed, so one provider's bad deploy
-        # doesn't hide the other's outcome - but not when the hook never fired,
-        # which would just burn the full 15 minutes waiting for nothing.
-        if: ${{ !cancelled() && steps.vercel.outcome == 'success' }}
-        env:
-          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
-          PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
-          TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
-        run: |
-          set -euo pipefail
-          query="projectId=$PROJECT_ID&target=production&limit=20"
-          if [ -n "$TEAM_ID" ]; then
-            query="$query&teamId=$TEAM_ID"
-          fi
-          deadline=$(( SECONDS + 900 ))
-          state=''
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            # Same split as the Render poll above: a rejected credential is
-            # not a blip, and retrying it for 15 minutes only buries the cause.
-            reply="$(curl -sS -w $'\n%{http_code}' \
-              -H "Authorization: Bearer $VERCEL_TOKEN" \
-              "https://api.vercel.com/v6/deployments?$query" || true)"
-            code="${reply##*$'\n'}"
-            response="${reply%$'\n'*}"
-            case "$code" in
-              200) ;;
-              401|403)
-                echo "Vercel API rejected the credential (HTTP $code)." >&2
-                echo "Check VERCEL_TOKEN is set and valid. A 403 also comes back when the" >&2
-                echo "project belongs to a team and VERCEL_TEAM_ID is unset - a personal" >&2
-                echo "token cannot read a team's deployments without the team scope." >&2
-                exit 1
-                ;;
-              404)
-                echo "Vercel API does not recognise project '$PROJECT_ID' (HTTP 404)." >&2
-                echo "VERCEL_PROJECT_ID should be the prj_... id from Settings > General." >&2
-                exit 1
-                ;;
-              *)
-                echo "Vercel API poll returned HTTP ${code:-no response}; retrying."
-                sleep 15
-                continue
-                ;;
-            esac
-            # Matched on the commit rather than "the newest one", so a
-            # deployment somebody else triggers mid-run can't be mistaken for
-            # this one and reported as its result.
-            state="$(jq -r --arg sha "$GITHUB_SHA" \
-              '[.deployments[] | select(.meta.githubCommitSha == $sha)][0].state // ""' \
-              <<<"$response")"
-            case "$state" in
-              READY)
-                echo "Vercel deployment for $GITHUB_SHA is ready."
-                exit 0
-                ;;
-              ERROR|CANCELED)
-                echo "Vercel deployment for $GITHUB_SHA ended as '$state'." >&2
-                exit 1
-                ;;
-              '')
-                echo "No Vercel deployment for $GITHUB_SHA yet."
-                ;;
-              *)
-                echo "Vercel deployment for $GITHUB_SHA: $state"
-                ;;
-            esac
-            sleep 15
-          done
-          echo "Timed out after 15m waiting on a Vercel deployment for $GITHUB_SHA (last state: '${state:-none}')." >&2
-          echo "A state that never appeared at all points at the project's Git integration: a deploy hook only stamps meta.githubCommitSha while it is connected." >&2
-          exit 1

@@ -16,7 +16,7 @@ Companion docs: [ARCHITECTURE.md](ARCHITECTURE.md) · [ERROR_HANDLING.md](ERROR_
 
 | Area | Status | Detail |
 |---|---|---|
-| Application deploy pipeline | 🟢 Implemented | CI-gated, manual approval, `.github/workflows/ci.yml` |
+| Application deploy pipeline | 🟢 Implemented | CI-gated + status-polled + smoke-tested, `.github/workflows/deploy.yml` |
 | Automated tests in CI | 🟢 Implemented | Backend + frontend, blocking |
 | Schema migrations on deploy | 🟡 Automatic, unguarded | `backend/entrypoint.sh`; no backup, no rollback (§5) |
 | Startup config validation | 🟢 Implemented | `ENVIRONMENT`, `SECRET_KEY`, `ALLOWED_HOSTS` fail closed |
@@ -94,13 +94,28 @@ Shutdown relies entirely on Gunicorn's and Celery's own `SIGTERM` handling; ther
 
 ## 4. Deployment Procedure
 
-### Pipeline (`.github/workflows/ci.yml`)
+### Pipeline (`ci.yml` + `deploy.yml`)
 
-Triggers: `pull_request` on `main`/`dev`, `push` on `main` only. `push` excludes `dev` on purpose — with it listed, a `dev`→`main` PR ran every job twice (once for the branch push, once for the PR), showing eight checks for three jobs. A `concurrency` group cancels superseded in-flight runs per branch/PR, but never on `main`, where cancelling mid-rollout is worse than letting a superseded deploy finish.
+The pipeline is split in two: **`ci.yml` decides whether a commit is good, `deploy.yml` decides what to do about it.**
+
+`ci.yml` triggers on `pull_request` to `main`/`dev` and declares **`workflow_call:`**, which makes it importable. `deploy.yml` triggers on `push` to `main` (plus `workflow_dispatch` for a re-run without an empty commit) and consumes it:
+
+```yaml
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml   # the real gate, not a copy
+  deploy:
+    needs: ci
+    environment: production
+```
+
+One definition of "the tests" exists, so the deploy path cannot drift from what a PR was checked against. **`ci.yml` has no `push:` trigger** — `deploy.yml` calls it, and adding one would run every job twice for the same commit. `dev` under `push` had that exact effect on a `dev`→`main` PR: eight checks for three jobs. The trade is that a commit pushed straight to `dev` with no PR goes untested.
+
+`ci.yml`'s concurrency cancels superseded PR runs; `deploy.yml` uses a fixed `deploy-production` group with `cancel-in-progress: false`, because aborting a half-finished rollout leaves the two services on different commits.
 
 1. **`backend`** — Postgres 16 service container; `pip install`, `manage.py check`, `makemigrations --check --dry-run`, `manage.py test`, `pip-audit` *(advisory, `continue-on-error: true`)*.
 2. **`frontend`** — `npm ci`, `npm run lint`, `npm test`, `npm run build`, `npm audit --audit-level=high` *(advisory)*.
-3. **`deploy`** — `needs: [backend, frontend]`, `if: github.ref == 'refs/heads/main' && github.event_name == 'push'`, `environment: production`. It fires all three deploy hooks, then **polls each provider until its deploy reaches a terminal state**:
+3. **`deploy`** (in `deploy.yml`) — `needs: ci`, `environment: production`. It fires all three deploy hooks, **polls each provider until its deploy reaches a terminal state**, then smoke-tests production:
 
 > **`environment: production` is not a gate today.** It pauses for a human only when that GitHub Environment has required reviewers, and it has none — deploys run automatically once tests pass, which is the intent. The key is kept for production-scoped secrets and the deploy audit trail. Do not read its presence as proof that something is waiting for approval; a run that reached the trigger steps was never waiting.
 
@@ -110,8 +125,13 @@ Triggers: `pull_request` on `main`/`dev`, `push` on `main` only. `push` excludes
 | Trigger Render deploys | — | POSTs the web **and** worker hooks; reads `.deploy.id` from each, fails if absent |
 | Wait for Render deploys | `GET /v1/services/{srv}/deploys/{dep}`, per service | pass `live`; fail `build_failed`, `update_failed`, `pre_deploy_failed`, `canceled`, `deactivated` |
 | Wait for Vercel deploy | `GET /v6/deployments`, matched on `meta.githubCommitSha == $GITHUB_SHA` | pass `READY`; fail `ERROR`, `CANCELED` |
+| Smoke-test production | `curl -f` on `${{ vars.RENDER_BACKEND_URL }}/api/health/` and `${{ vars.VERCEL_FRONTEND_URL }}` | pass 2xx (and `"status"` in the health body); fail any 4xx/5xx |
 
-All three hooks fire before any wait, so the builds run concurrently. Each wait polls every 15s with a 15-minute deadline and tolerates a failed poll (a blip is not a failed deploy). The Vercel wait carries `if: !cancelled() && steps.vercel.outcome == 'success'` so a bad Render deploy does not hide the frontend's outcome.
+All three hooks fire before any wait, so the builds run concurrently. Each wait polls every 15s with a 15-minute deadline. Polls distinguish failure kinds: `401`/`403`/`404` stop immediately and name the credential or id to check, while transport errors, `429` and `5xx` retry — retrying a rejected credential only buries the cause under hundreds of identical lines. The Vercel wait carries `if: !cancelled() && steps.vercel.outcome == 'success'` so a bad Render deploy does not hide the frontend's outcome, and the smoke test runs under `if: !cancelled()` so a partial rollout still reports which half of production is up.
+
+> **`vars`, not `secrets`, for the URLs.** They are public addresses, and keeping them readable means a failed smoke test names the host it could not reach instead of printing `***`. Hook URLs and API keys stay in `secrets`. An unset variable makes the check **skip** rather than fail — the emptiness test is on the base URL, not the composed one, since an unset base joined to a path yields `/api/health/`, which is not empty.
+
+> **What the smoke test does and does not prove.** It proves production is reachable and serving. It does **not** prove the right version is live — a stale-but-healthy frontend passes it. The commit-matched Vercel poll is what catches that, which is why both exist.
 
 > **Why the polling exists.** A deploy hook returns as soon as the build is *queued*. The job previously ended at the two `curl`s, so it went green on a build that subsequently failed — production could sit frozen behind a wall of green checkmarks with nothing in CI to say so.
 

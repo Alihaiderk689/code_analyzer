@@ -1,0 +1,297 @@
+name: Deploy
+
+# The delivery half of the pipeline, split out from ci.yml so the gate and the
+# release are separate concerns: ci.yml decides whether a commit is good, this
+# decides what to do about it. ci.yml declares `workflow_call`, so the `ci`
+# job below runs the real thing rather than a copy of it - there is exactly
+# one definition of "the tests" in this repo and it cannot drift.
+on:
+  push:
+    branches: [main]
+  # Re-run a deploy without pushing an empty commit - after fixing a secret,
+  # or to redeploy a commit whose provider-side build failed.
+  workflow_dispatch:
+
+# Never cancel a deploy. `cancel-in-progress` elsewhere is a convenience;
+# here it would abort a half-finished rollout and leave the two services on
+# different commits. Queued deploys run in order instead.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # Calls ci.yml as a reusable workflow. Its jobs appear nested under this
+  # run, so a failure shows up as "ci / backend" rather than an opaque
+  # dependency that failed somewhere else.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    # `needs: ci` is the whole gate: the reusable workflow above must have
+    # gone green - backend tests, frontend lint/test/build, both audits -
+    # before a single hook is fired. There is no `if:` on branch or event any
+    # more; this workflow only triggers on push to main, so the condition that
+    # used to live here is now the trigger itself.
+    needs: ci
+    runs-on: ubuntu-latest
+    environment: production
+    # Backstop only - each of the three waits has its own 15-minute deadline,
+    # so 45 is the real ceiling. Were a required reviewer ever added to the
+    # production environment, that pause happens before the job starts and is
+    # not counted against this.
+    timeout-minutes: 60
+    steps:
+      # Vercel fires first, and deliberately: it is a bare POST with nothing
+      # to parse, so nothing about the Render hook - a malformed URL, a
+      # response shape change, an outage - can stop the frontend from
+      # deploying. Ordered the other way, a Render-side problem would leave
+      # the frontend pinned to whatever it was last serving, which is the
+      # exact failure this whole job exists to make impossible.
+      - name: Trigger Vercel deploy
+        id: vercel
+        env:
+          HOOK_URL: ${{ secrets.VERCEL_DEPLOY_HOOK_URL }}
+        run: curl -fsS -X POST "$HOOK_URL"
+
+      - name: Trigger Render deploys
+        id: render
+        env:
+          WEB_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          WORKER_HOOK_URL: ${{ secrets.RENDER_WORKER_DEPLOY_HOOK_URL }}
+        run: |
+          set -euo pipefail
+          # Both Render services have autoDeploy off (render.yaml), so this
+          # job is the only thing that deploys them - and it has to deploy
+          # BOTH. The worker runs the web service's image, so shipping one
+          # without the other leaves two halves of the app on different
+          # commits, which is worse than either being stale.
+          #
+          # A missing worker hook is a hard error rather than a skip: quietly
+          # not deploying a service is the exact failure this job exists to
+          # prevent, and a warning in a log nobody reads is still quiet.
+          if [ -z "$WORKER_HOOK_URL" ]; then
+            echo "RENDER_WORKER_DEPLOY_HOOK_URL is not set, and the worker no longer" >&2
+            echo "auto-deploys. Create a deploy hook on the code-analyzer-celery-worker" >&2
+            echo "service (Settings > Deploy Hook) and add it as an Actions secret." >&2
+            exit 1
+          fi
+          deploys=''
+          for hook in "$WEB_HOOK_URL" "$WORKER_HOOK_URL"; do
+            # The service id is already inside the hook URL
+            # (.../deploy/srv-xxxx?key=...), so deriving it beats another
+            # secret that can silently drift out of sync with the hook.
+            service_id="$(sed -n 's#.*/deploy/\(srv-[^/?]*\).*#\1#p' <<<"$hook")"
+            if [ -z "$service_id" ]; then
+              echo "No srv-... id found in one of the Render hook URLs." >&2
+              exit 1
+            fi
+            response="$(curl -fsS -X POST "$hook")"
+            deploy_id="$(jq -r '.deploy.id // empty' <<<"$response")"
+            if [ -z "$deploy_id" ]; then
+              echo "Render hook for $service_id returned no deploy id. Response: $response" >&2
+              exit 1
+            fi
+            echo "Queued Render deploy $deploy_id on $service_id."
+            deploys="$deploys $service_id/$deploy_id"
+          done
+          echo "deploys=${deploys# }" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for Render deploys
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          DEPLOYS: ${{ steps.render.outputs.deploys }}
+        run: |
+          set -euo pipefail
+          # Both were queued in the step above, so Render builds them
+          # concurrently - watching them one after the other costs roughly the
+          # slower of the two, not the sum.
+          for pair in $DEPLOYS; do
+            service_id="${pair%%/*}"
+            deploy_id="${pair##*/}"
+            deadline=$(( SECONDS + 900 ))
+            status=''
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              # Status is read separately from the body so a rejected
+              # credential can be told apart from a blip. Retrying a 401/403
+              # is pointless - the answer will not change in 15 seconds or in
+              # 15 minutes - and it buries the real cause under hundreds of
+              # identical lines. Only transport failures and 5xx are retried.
+              reply="$(curl -sS -w $'\n%{http_code}' \
+                -H "Authorization: Bearer $RENDER_API_KEY" \
+                -H 'Accept: application/json' \
+                "https://api.render.com/v1/services/$service_id/deploys/$deploy_id" || true)"
+              code="${reply##*$'\n'}"
+              response="${reply%$'\n'*}"
+              case "$code" in
+                200) ;;
+                401|403)
+                  echo "Render API rejected the credential (HTTP $code). Check that the" >&2
+                  echo "RENDER_API_KEY secret is set and still valid." >&2
+                  exit 1
+                  ;;
+                404)
+                  echo "Render API has no deploy $deploy_id on service $service_id (HTTP 404)." >&2
+                  echo "The hook URL and the API key may belong to different accounts." >&2
+                  exit 1
+                  ;;
+                *)
+                  echo "Render API poll for $service_id returned HTTP ${code:-no response}; retrying."
+                  sleep 15
+                  continue
+                  ;;
+              esac
+              status="$(jq -r '.status // empty' <<<"$response")"
+              case "$status" in
+                live)
+                  echo "Render deploy $deploy_id on $service_id is live."
+                  break
+                  ;;
+                # deactivated means a later deploy superseded this one, so the
+                # commit this job is gating is not what production ends up
+                # serving - not something to report as a success.
+                build_failed|update_failed|pre_deploy_failed|canceled|deactivated)
+                  echo "Render deploy $deploy_id on $service_id ended as '$status'." >&2
+                  exit 1
+                  ;;
+              esac
+              echo "Render deploy $deploy_id on $service_id: ${status:-unknown}"
+              sleep 15
+            done
+            if [ "$status" != live ]; then
+              echo "Timed out after 15m on Render deploy $deploy_id ($service_id), last status '${status:-unknown}'." >&2
+              exit 1
+            fi
+          done
+
+      - name: Wait for Vercel deploy
+        # Runs even when the Render wait failed, so one provider's bad deploy
+        # doesn't hide the other's outcome - but not when the hook never fired,
+        # which would just burn the full 15 minutes waiting for nothing.
+        if: ${{ !cancelled() && steps.vercel.outcome == 'success' }}
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          query="projectId=$PROJECT_ID&target=production&limit=20"
+          if [ -n "$TEAM_ID" ]; then
+            query="$query&teamId=$TEAM_ID"
+          fi
+          deadline=$(( SECONDS + 900 ))
+          state=''
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            # Same split as the Render poll above: a rejected credential is
+            # not a blip, and retrying it for 15 minutes only buries the cause.
+            reply="$(curl -sS -w $'\n%{http_code}' \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v6/deployments?$query" || true)"
+            code="${reply##*$'\n'}"
+            response="${reply%$'\n'*}"
+            case "$code" in
+              200) ;;
+              401|403)
+                echo "Vercel API rejected the credential (HTTP $code)." >&2
+                echo "Check VERCEL_TOKEN is set and valid. A 403 also comes back when the" >&2
+                echo "project belongs to a team and VERCEL_TEAM_ID is unset - a personal" >&2
+                echo "token cannot read a team's deployments without the team scope." >&2
+                exit 1
+                ;;
+              404)
+                echo "Vercel API does not recognise project '$PROJECT_ID' (HTTP 404)." >&2
+                echo "VERCEL_PROJECT_ID should be the prj_... id from Settings > General." >&2
+                exit 1
+                ;;
+              *)
+                echo "Vercel API poll returned HTTP ${code:-no response}; retrying."
+                sleep 15
+                continue
+                ;;
+            esac
+            # Matched on the commit rather than "the newest one", so a
+            # deployment somebody else triggers mid-run can't be mistaken for
+            # this one and reported as its result.
+            state="$(jq -r --arg sha "$GITHUB_SHA" \
+              '[.deployments[] | select(.meta.githubCommitSha == $sha)][0].state // ""' \
+              <<<"$response")"
+            case "$state" in
+              READY)
+                echo "Vercel deployment for $GITHUB_SHA is ready."
+                exit 0
+                ;;
+              ERROR|CANCELED)
+                echo "Vercel deployment for $GITHUB_SHA ended as '$state'." >&2
+                exit 1
+                ;;
+              '')
+                echo "No Vercel deployment for $GITHUB_SHA yet."
+                ;;
+              *)
+                echo "Vercel deployment for $GITHUB_SHA: $state"
+                ;;
+            esac
+            sleep 15
+          done
+          echo "Timed out after 15m waiting on a Vercel deployment for $GITHUB_SHA (last state: '${state:-none}')." >&2
+          echo "A state that never appeared at all points at the project's Git integration: a deploy hook only stamps meta.githubCommitSha while it is connected." >&2
+          exit 1
+
+      # The polls above prove each provider finished its build. These prove
+      # the result is actually reachable and serving - a deploy can go READY
+      # against a container that then crash-loops, or a Vercel alias that
+      # never moved to the new deployment.
+      #
+      # Runs even if a wait failed, so a partial rollout still reports which
+      # half of production is up. `-f` is what makes a 4xx/5xx fail the step;
+      # without it curl exits 0 on an error page.
+      #
+      # URLs are `vars`, not `secrets`: they are public addresses, and keeping
+      # them readable means a failure here names the host it could not reach
+      # instead of printing three asterisks.
+      - name: Smoke-test production
+        if: ${{ !cancelled() }}
+        env:
+          BACKEND_URL: ${{ vars.RENDER_BACKEND_URL }}
+          FRONTEND_URL: ${{ vars.VERCEL_FRONTEND_URL }}
+        run: |
+          set -uo pipefail
+          failed=0
+
+          check() {  # name, base-url, path, expected-substring (optional)
+            local name="$1" base="$2" path="$3" want="${4:-}"
+            # Emptiness is tested on the base, not the composed URL: an unset
+            # variable joined to a path yields "/api/health/", which is not
+            # empty and would sail past this check straight into a curl
+            # against a relative path.
+            if [ -z "$base" ]; then
+              echo "SKIP $name - no URL configured (set the repo variable)."
+              return 0
+            fi
+            local url="${base%/}$path" body
+            # --retry covers a container still finishing its first request;
+            # -f turns any 4xx/5xx into a non-zero exit.
+            if ! body="$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors "$url")"; then
+              echo "FAIL $name - $url did not return a success status." >&2
+              failed=1
+              return 0
+            fi
+            if [ -n "$want" ] && [[ "$body" != *"$want"* ]]; then
+              echo "FAIL $name - $url responded, but did not contain '$want'." >&2
+              failed=1
+              return 0
+            fi
+            echo "OK   $name - $url"
+          }
+
+          # The health endpoint is the same one render.yaml points its own
+          # healthCheckPath at, so a pass here means what Render means by up.
+          check "backend health" "$BACKEND_URL" "/api/health/" '"status"'
+          # Root of the SPA. Deliberately not a deep link: vercel.json rewrites
+          # everything to index.html, so any path would 200 and prove nothing.
+          check "frontend"       "$FRONTEND_URL" ""
+
+          if [ "$failed" -ne 0 ]; then
+            echo "Production is not serving correctly after deploy." >&2
+            exit 1
+          fi
+          echo "Production is up."
