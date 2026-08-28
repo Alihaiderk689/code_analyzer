@@ -18,6 +18,7 @@ const CALLBACK_ERROR_MESSAGE = {
   invalid_state: 'The GitHub authorization link expired or was invalid. Please try again.',
   not_configured: 'GitHub integration is not configured on the server yet.',
   github_error: 'GitHub returned an error while connecting your account.',
+  account_already_linked: 'That GitHub account is already connected to another user.',
 }
 
 export default function GitHub() {
@@ -32,11 +33,15 @@ export default function GitHub() {
   const [disconnecting, setDisconnecting] = useState(false)
   const [busyRepoId, setBusyRepoId] = useState(null)
 
-  const callbackNotice = searchParams.get('connected') === 'true'
-    ? { kind: 'success', text: 'GitHub account connected.' }
-    : searchParams.get('error')
-      ? { kind: 'error', text: CALLBACK_ERROR_MESSAGE[searchParams.get('error')] || 'Could not connect your GitHub account.' }
-      : null
+  // Captured once at mount, independent of `searchParams` - the effect below
+  // strips ?connected=/?error= from the URL almost immediately, which would
+  // otherwise make the derived notice flash to null before it's visible.
+  const [callbackNotice] = useState(() => {
+    if (searchParams.get('connected') === 'true') return { kind: 'success', text: 'GitHub account connected.' }
+    const errorCode = searchParams.get('error')
+    if (errorCode) return { kind: 'error', text: CALLBACK_ERROR_MESSAGE[errorCode] || 'Could not connect your GitHub account.' }
+    return null
+  })
 
   useEffect(() => {
     if (searchParams.get('connected') || searchParams.get('error')) {
