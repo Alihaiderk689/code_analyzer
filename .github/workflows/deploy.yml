@@ -110,6 +110,7 @@ jobs:
             exit 1
           fi
           deploys=''
+          seen_services=''
           for hook in "${hooks[@]}"; do
             # Secrets carry whatever whitespace came with the paste. A newline
             # inside the URL makes curl reject it outright, which reads like a
@@ -124,6 +125,21 @@ jobs:
               echo "hook looks like https://api.render.com/deploy/srv-XXXX?key=YYYY." >&2
               exit 1
             fi
+            # Two hooks naming the same service means one secret holds a copy
+            # of the other, and the worker is not being deployed despite a
+            # secret that looks present. Caught here rather than at the second
+            # POST, where Render answers "Accepted {}" - it is refusing a
+            # duplicate deploy, but reads like a broken hook.
+            case " $seen_services " in
+              *" $service_id "*)
+                echo "RENDER_DEPLOY_HOOK_URL and RENDER_WORKER_DEPLOY_HOOK_URL both point at" >&2
+                echo "$service_id. One is a copy of the other, so the worker is not being" >&2
+                echo "deployed. Take the worker's hook from ITS OWN service page:" >&2
+                echo "Render > code-analyzer-celery-worker > Settings > Deploy Hook." >&2
+                exit 1
+                ;;
+            esac
+            seen_services="$seen_services $service_id"
             response="$(curl -fsS -X POST "$hook")"
             # jq must not be what fails here. Letting it abort the step under
             # `set -e` replaced a message naming the service and quoting the
