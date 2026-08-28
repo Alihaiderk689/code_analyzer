@@ -39,7 +39,7 @@ npx vitest run src/lib/api.test.js   # one file
 **Note:** `vitest.config.js` only runs `src/**/*.test.js` under a plain Node environment (no DOM/JSX) — it exercises pure-JS lib modules (`api.js`, `format.js`) only. There is no component/page-level test setup in this repo.
 
 ### CI
-`.github/workflows/ci.yml` runs on push/PR to `main`/`dev`: backend (`check` + `test` against real Postgres) and frontend (`lint`, `test`, `build`) as separate jobs.
+`.github/workflows/ci.yml` runs on PRs to `main`/`dev` and on pushes to `main` only: backend (`check` + `test` against real Postgres) and frontend (`lint`, `test`, `build`) as separate jobs, then a `deploy` job gated on both. `push` deliberately excludes `dev` — listing it there ran every job twice on a `dev`→`main` PR (once for the branch push, once for the PR). The consequence is that a commit pushed straight to `dev` without a PR is not tested.
 
 ## Architecture
 

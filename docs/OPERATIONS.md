@@ -96,16 +96,36 @@ Shutdown relies entirely on Gunicorn's and Celery's own `SIGTERM` handling; ther
 
 ### Pipeline (`.github/workflows/ci.yml`)
 
+Triggers: `pull_request` on `main`/`dev`, `push` on `main` only. `push` excludes `dev` on purpose — with it listed, a `dev`→`main` PR ran every job twice (once for the branch push, once for the PR), showing eight checks for three jobs. A `concurrency` group cancels superseded in-flight runs per branch/PR, but never on `main`, where cancelling mid-rollout is worse than letting a superseded deploy finish.
+
 1. **`backend`** — Postgres 16 service container; `pip install`, `manage.py check`, `makemigrations --check --dry-run`, `manage.py test`, `pip-audit` *(advisory, `continue-on-error: true`)*.
 2. **`frontend`** — `npm ci`, `npm run lint`, `npm test`, `npm run build`, `npm audit --audit-level=high` *(advisory)*.
-3. **`deploy`** — `needs: [backend, frontend]`, `if: github.ref == 'refs/heads/main' && github.event_name == 'push'`, `environment: production` (required-reviewer pause). Then:
+3. **`deploy`** — `needs: [backend, frontend]`, `if: github.ref == 'refs/heads/main' && github.event_name == 'push'`, `environment: production`. It fires all three deploy hooks, then **polls each provider until its deploy reaches a terminal state**:
 
-```yaml
-- run: curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
-- run: curl -fsS -X POST "${{ secrets.VERCEL_DEPLOY_HOOK_URL }}"
-```
+> **`environment: production` is not a gate today.** It pauses for a human only when that GitHub Environment has required reviewers, and it has none — deploys run automatically once tests pass, which is the intent. The key is kept for production-scoped secrets and the deploy audit trail. Do not read its presence as proof that something is waiting for approval; a run that reached the trigger steps was never waiting.
 
-**Render's and Vercel's own auto-deploy-on-push must be disabled in their dashboards**, or they deploy regardless of this gate. Not enforceable from the repo.
+| Step | Waits on | Terminal states |
+| --- | --- | --- |
+| Trigger Vercel deploy | — | bare POST — runs **first** so nothing on the Render side can block the frontend |
+| Trigger Render deploys | — | POSTs the web **and** worker hooks; reads `.deploy.id` from each, fails if absent |
+| Wait for Render deploys | `GET /v1/services/{srv}/deploys/{dep}`, per service | pass `live`; fail `build_failed`, `update_failed`, `pre_deploy_failed`, `canceled`, `deactivated` |
+| Wait for Vercel deploy | `GET /v6/deployments`, matched on `meta.githubCommitSha == $GITHUB_SHA` | pass `READY`; fail `ERROR`, `CANCELED` |
+
+All three hooks fire before any wait, so the builds run concurrently. Each wait polls every 15s with a 15-minute deadline and tolerates a failed poll (a blip is not a failed deploy). The Vercel wait carries `if: !cancelled() && steps.vercel.outcome == 'success'` so a bad Render deploy does not hide the frontend's outcome.
+
+> **Why the polling exists.** A deploy hook returns as soon as the build is *queued*. The job previously ended at the two `curl`s, so it went green on a build that subsequently failed — production could sit frozen behind a wall of green checkmarks with nothing in CI to say so.
+
+> **Why the worker gets its own hook.** `autoDeploy: false` applies to both Render services, and one hook only deploys one service. Without a second hook the worker would never be redeployed — it would drift onto an older commit than the web container it shares an image with. The job treats a missing `RENDER_WORKER_DEPLOY_HOOK_URL` as a hard error rather than skipping it, because silently not deploying a service is the failure this whole job exists to prevent.
+
+Actions secrets required beyond the two hook URLs: `RENDER_WORKER_DEPLOY_HOOK_URL`, `RENDER_API_KEY`, `VERCEL_TOKEN`, `VERCEL_PROJECT_ID`, and `VERCEL_TEAM_ID` (leave unset unless the Vercel project sits under a team). **Until they are set the deploy job fails**, at the Render trigger or the first wait.
+
+### Deploys are gated, not automatic
+
+`render.yaml` sets `autoDeploy: false` on both the web service and the worker; Vercel's Git auto-deploy is off in its dashboard. **The `deploy` job is the only path to production.**
+
+> **This was not always true, and the asymmetry caused a real outage-shaped bug.** Render's `autoDeploy` defaults to *true* and was never overridden, so the backend redeployed on every push to `main` — on push, not on "CI passed", meaning a merge that broke the test suite shipped anyway and the red X arrived minutes later. Vercel's auto-deploy had been turned off as instructed, so the frontend depended entirely on an approval nobody was giving and sat months behind. The result was a current backend serving a stale frontend against an API contract that had moved on under it. If you ever re-enable auto-deploy on one provider, enable it on both or neither.
+
+`autoDeploy: false` binds only services Render manages through the Blueprint. A service created by hand in the dashboard also needs **Settings → Auto-Deploy → No**; treat the key as the statement of intent.
 
 Migrations run inside the Render container start — after CI, with no further gate.
 
