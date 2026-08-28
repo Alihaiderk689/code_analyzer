@@ -149,6 +149,18 @@ class GitHubOAuthService:
 
         profile = GitHubClient(access_token=access_token).get_authenticated_user()
 
+        already_linked_to_other_user = GitHubIntegration.objects.filter(
+            github_user_id=profile['id'],
+        ).exclude(user=user).exists()
+        if already_linked_to_other_user:
+            logger.warning(
+                'github_oauth.account_already_linked',
+                extra={'user_id': user.id, 'github_username': profile['login']},
+            )
+            raise GitHubAccountAlreadyLinkedError(
+                f"The GitHub account @{profile['login']} is already connected to another user.",
+            )
+
         integration, created = GitHubIntegration.objects.update_or_create(
             user=user,
             defaults={

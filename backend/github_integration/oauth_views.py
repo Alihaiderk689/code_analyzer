@@ -19,7 +19,7 @@ from accounts.github_auth import (
 from .models import GitHubIntegration
 from .serializers import GitHubIntegrationSerializer
 from .services.github_client import GitHubAPIError
-from .services.oauth_service import GitHubOAuthService, OAuthStateError
+from .services.oauth_service import GitHubAccountAlreadyLinkedError, GitHubOAuthService, OAuthStateError
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,9 @@ class GitHubCallbackView(APIView):
         except GitHubAPIError:
             logger.error('github_oauth.callback_failed', exc_info=True)
             return redirect(f'{frontend_target}?error=github_error')
+        except GitHubAccountAlreadyLinkedError as exc:
+            logger.info('github_oauth.account_already_linked', extra={'error': str(exc)})
+            return redirect(f'{frontend_target}?error=account_already_linked')
 
         return redirect(f'{frontend_target}?connected=true')
 

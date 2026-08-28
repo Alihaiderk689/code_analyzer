@@ -49,9 +49,12 @@ export function AuthProvider({ children }) {
       // might make; access/refresh tokens are httpOnly, so JS can't check
       // for them up front the way it used to - just attempt the profile
       // fetch and let a 401 (even after apiFetch's automatic refresh retry)
-      // mean "not logged in".
-      await primeCsrf()
+      // mean "not logged in". primeCsrf() is inside this try (rather than
+      // ahead of it) so a failure here - e.g. the backend was briefly
+      // unreachable at boot - is caught by the same handler below instead of
+      // escaping as an unhandled rejection and leaving `initializing` stuck.
       try {
+        await primeCsrf()
         const profile = await fetchProfile()
         const admin = await checkIsAdmin()
         if (!cancelled) {

@@ -20,6 +20,17 @@ const TABS = [
 // /analysis/<id>/... AI endpoints work unmodified for either caller.
 export default function AnalysisTabs({ analysisId, issues, isCompleted, originalSource, headerRight }) {
   const [tab, setTab] = useState('issues')
+  // Tabs the user has opened at least once this session. An AI tab mounts
+  // (and its useLazyAi fetch fires) the first time it's opened, same as
+  // before - but once mounted it's kept alive and merely hidden on switch
+  // instead of unmounted, so switching back doesn't lose its fetched data
+  // and re-trigger a "Generating..." fetch the backend already answered.
+  const [visited, setVisited] = useState(() => new Set(['issues']))
+
+  const selectTab = (key) => {
+    setTab(key)
+    setVisited((prev) => (prev.has(key) ? prev : new Set(prev).add(key)))
+  }
 
   return (
     <div>
@@ -37,7 +48,7 @@ export default function AnalysisTabs({ analysisId, issues, isCompleted, original
           {TABS.map((t) => (
             <button
               key={t.key}
-              onClick={() => setTab(t.key)}
+              onClick={() => selectTab(t.key)}
               style={{
                 border: 'none',
                 background: 'none',
@@ -57,11 +68,27 @@ export default function AnalysisTabs({ analysisId, issues, isCompleted, original
       </div>
 
       <div style={{ marginTop: 22 }}>
-        {tab === 'issues' && <IssuesTab issues={issues} isCompleted={isCompleted} />}
-        {tab === 'source' && <SourceTab source={originalSource} />}
-        {tab === 'suggestions' && <AiListTab id={analysisId} isCompleted={isCompleted} loader={getSuggestions} />}
-        {tab === 'explanation' && <AiTextTab id={analysisId} isCompleted={isCompleted} loader={getExplanation} />}
-        {tab === 'refactored' && <RefactorTab id={analysisId} isCompleted={isCompleted} originalSource={originalSource} />}
+        <div style={{ display: tab === 'issues' ? 'block' : 'none' }}>
+          <IssuesTab issues={issues} isCompleted={isCompleted} />
+        </div>
+        <div style={{ display: tab === 'source' ? 'block' : 'none' }}>
+          <SourceTab source={originalSource} />
+        </div>
+        {visited.has('suggestions') && (
+          <div style={{ display: tab === 'suggestions' ? 'block' : 'none' }}>
+            <AiListTab id={analysisId} isCompleted={isCompleted} loader={getSuggestions} />
+          </div>
+        )}
+        {visited.has('explanation') && (
+          <div style={{ display: tab === 'explanation' ? 'block' : 'none' }}>
+            <AiTextTab id={analysisId} isCompleted={isCompleted} loader={getExplanation} />
+          </div>
+        )}
+        {visited.has('refactored') && (
+          <div style={{ display: tab === 'refactored' ? 'block' : 'none' }}>
+            <RefactorTab id={analysisId} isCompleted={isCompleted} originalSource={originalSource} />
+          </div>
+        )}
       </div>
     </div>
   )
