@@ -6,6 +6,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A full-stack code analysis platform (Django REST Framework backend + React/Vite frontend): paste/upload code or connect a GitHub repo for static analysis, sandboxed runtime-error detection, AI-powered explanations/refactors/chat, and security scanning — plus automatic AI code review on every pull request. See `README.md` for the full feature list and environment variable reference.
 
+## Feature memory (`.claude/memory/`)
+
+This repo keeps a per-feature deep-dive memory file under `.claude/memory/`, checked into git, one level more detailed than the summaries in this file's Architecture section below. Each file covers one feature area: concrete file paths, function/class/endpoint names, request/response flow, and gotchas — written so a session can modify that feature without re-reading all its source first.
+
+Current files:
+| Feature | File |
+|---|---|
+| Auth & accounts (cookie JWT, CSRF, registration/login/reset/verify) | `.claude/memory/auth-accounts.md` |
+| AI assistance & chat (Groq client, floating + per-analysis chat, suggestions) | `.claude/memory/ai-chat.md` |
+| Analysis engine & sandbox (static analysis, macOS runtime sandbox) | `.claude/memory/analysis-engine.md` |
+| Security scanning (Bandit + custom rules + AI remediation) | `.claude/memory/security-scanning.md` |
+| GitHub integration (OAuth, webhooks, PR review pipeline) | `.claude/memory/github-integration.md` |
+| Infra & cross-cutting (settings, rate limiting, errors, logging, static/media, admin API, Docker) | `.claude/memory/infra-cross-cutting.md` |
+| Frontend application layer (api.js, resources.js, contexts, routing shell) | `.claude/memory/frontend-app.md` |
+
+Conventions to follow, every session:
+- **Before working on a feature** — the user names it, or you're about to read/modify files that clearly belong to one of the areas above — read that feature's `.claude/memory/*.md` file first, before exploring the code yourself. Treat it as a head start, not gospel: if what you find in the code contradicts the memory file, trust the code and fix the memory file.
+- **After changing any file belonging to a feature** — update that feature's memory file in the same piece of work so it reflects the new reality (new/renamed files, changed flow, new gotcha, resolved gotcha). Update the "Last updated" line with the date and a one-line reason. Do this even for small changes if they'd make the memory file misleading otherwise.
+- **New feature area with no existing file** — create `.claude/memory/<kebab-case-feature-name>.md` following the structure of the existing files (Overview / Key files / How it works / Gotchas / Related features / Last updated), and add a row to the table above.
+- **This is separate from Claude Code's personal cross-session memory** (user preferences, feedback, project status) — that lives outside the repo and isn't checked in. `.claude/memory/` is project documentation about how the *code* works, meant for any session or contributor, not personal-assistant context.
+
 ## Commands
 
 ### Docker
@@ -57,11 +78,11 @@ JWT access/refresh tokens live in httpOnly cookies (`accounts/cookies.py`), not 
 ### Settings: one `.env`, `ENVIRONMENT` drives everything
 `config/settings.py` reads a single `.env` file; `ENVIRONMENT` (`development` or `production`, validated against a fixed set) derives `DEBUG`, which `DATABASE_URL_*` is used, cookie `Secure`/`SameSite` flags, and whether HSTS/secure-cookie production hardening is applied. `_RUNNING_TESTS` (`'test' in sys.argv`) separately relaxes throttle rates and log verbosity during `manage.py test` — real rates would make unrelated tests trip shared IP-keyed throttle buckets, since Django's test client reuses one `REMOTE_ADDR` and `LocMemCache` persists for the whole test run.
 
-### Static files: WhiteNoise; media: nginx, not Django
-`django.contrib.staticfiles` only auto-serves under `runserver`/`DEBUG=True`, and this app has no cloud storage (S3/Cloudinary/etc.) or separate static-file server in front of it — so `STATIC_ROOT` + WhiteNoise (`whitenoise.middleware.WhiteNoiseMiddleware`, right after `SecurityMiddleware`) serve collected static files (admin CSS/JS) directly from gunicorn in every environment; nginx just proxies `/static/` to it. Media (user-uploaded avatars) is different: `config/urls.py`'s media route *is* `DEBUG`-gated, same as Django's default, since it's dev-only/inefficient by Django's own docs — in Docker Compose, nginx serves `/media/` directly from a `media_data` volume shared with the backend container instead (see `frontend/nginx.conf`), never through Django at all.
+### Static files: WhiteNoise; media: nginx in Docker, Django route elsewhere
+`django.contrib.staticfiles` only auto-serves under `runserver`/`DEBUG=True`, and this app has no cloud storage (S3/Cloudinary/etc.) or separate static-file server in front of it — so `STATIC_ROOT` + WhiteNoise (`whitenoise.middleware.WhiteNoiseMiddleware`, right after `SecurityMiddleware`) serve collected static files (admin CSS/JS) directly from gunicorn in every environment; nginx just proxies `/static/` to it. Media (user-uploaded avatars) is different: in Docker Compose, nginx serves `/media/` directly from a `media_data` volume shared with the backend container instead (see `frontend/nginx.conf`), never through Django at all. `config/urls.py`'s media route itself is **not** `DEBUG`-gated (despite matching Django's textbook dev-only pattern) — it was deliberately changed to serve in every environment, because deploy targets like Render put gunicorn directly behind their own router with no nginx in front, and a `DEBUG`-gated route was 404ing every avatar there. See `.claude/memory/infra-cross-cutting.md` for the full history/reasoning.
 
 ### AI: one client, three call sites
-`ai/client.py` wraps the Groq SDK (`generate_text`, `generate_chat_reply`) and is the only place that talks to Groq. It's shared by three otherwise-unrelated call sites, all of which catch AI-call exceptions the same way (503 "AI service is currently unavailable"): the floating chat (`ai/views.py`), per-analysis suggestions/explanation/refactor (`analyses/ai_views.py`), and per-analysis persisted chat (`chat/views.py`). Prompt-building for the chat surfaces is centralized in `ai/prompts.py` so the floating and per-analysis chats describe an `Analysis` identically.
+`ai/client.py` (`generate_text`, `generate_chat_reply`) is the only place that talks to an AI provider, and is itself a **fallback chain across three providers** (Groq → Gemini → OpenRouter), not a single-provider wrapper. It's shared by three otherwise-unrelated call sites, all of which catch AI-call exceptions the same way (503 "AI service is currently unavailable"): the floating chat (`ai/views.py`'s `ChatView` — implemented server-side but currently has no frontend caller, see `.claude/memory/ai-chat.md`), per-analysis suggestions/explanation/refactor (`analyses/ai_views.py`), and per-analysis persisted chat (`chat/views.py`). Prompt-building for the chat surfaces is centralized in `ai/prompts.py` so the floating and per-analysis chats describe an `Analysis` identically. See `.claude/memory/ai-chat.md` for the full flow.
 
 ### Analysis engine + sandbox
 `analyses/engine.py` does static analysis (`ast` + `pyflakes` for real syntax/undefined-name/unused-import checks, plus generic textual checks for TODOs/long lines/comments). For Python, it also runs `analyses/sandbox.py`, which executes the submitted code under macOS's Seatbelt sandbox (`sandbox-exec`) to catch runtime errors static analysis can't predict — network denied, filesystem writes confined to a scratch dir, project directory and the invoking user's home directory both denied for reads. It's macOS-only and self-disclosing: `is_available()` returns `False` on any other host, and that "unavailable" case surfaces as a zero-quality-score-impact informational issue (`runtime_check_unavailable` in `ISSUE_PENALTIES`) rather than degrading silently. `_run_analysis()` in `analyses/analysis_views.py` catches any unexpected engine failure and marks the `Analysis` row `FAILED` rather than leaving it stuck in `PENDING`/`RUNNING` or 500ing.
