@@ -1,6 +1,5 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../lib/AuthContext'
-import { useTheme } from '../lib/ThemeContext'
 import LogoMark from './LogoMark'
 
 const NAV_LINKS = [
@@ -14,7 +13,6 @@ export default function AppNav() {
   const location = useLocation()
   const navigate = useNavigate()
   const { user, isAdmin, logout } = useAuth()
-  const { theme, toggleTheme } = useTheme()
   const links = isAdmin ? [{ to: '/admin', label: 'Admin' }] : NAV_LINKS
   const homeRoute = isAdmin ? '/admin' : '/dashboard'
 
@@ -60,27 +58,6 @@ export default function AppNav() {
         </div>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-        <button
-          onClick={toggleTheme}
-          title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-          aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-          style={{
-            width: 30,
-            height: 30,
-            borderRadius: '50%',
-            border: '1px solid var(--color-border-2)',
-            background: 'none',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            fontSize: 14,
-            cursor: 'pointer',
-            color: 'var(--color-text)',
-            padding: 0,
-          }}
-        >
-          {theme === 'dark' ? '☀️' : '🌙'}
-        </button>
         <div
           onClick={() => navigate('/settings')}
           title="Settings"
