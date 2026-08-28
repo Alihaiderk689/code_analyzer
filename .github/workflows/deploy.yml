@@ -111,18 +111,31 @@ jobs:
           fi
           deploys=''
           for hook in "${hooks[@]}"; do
+            # Secrets carry whatever whitespace came with the paste. A newline
+            # inside the URL makes curl reject it outright, which reads like a
+            # wrong address rather than an invisible character.
+            hook="$(printf '%s' "$hook" | tr -d '[:space:]')"
             # The service id is already inside the hook URL
             # (.../deploy/srv-xxxx?key=...), so deriving it beats another
             # secret that can silently drift out of sync with the hook.
             service_id="$(sed -n 's#.*/deploy/\(srv-[^/?]*\).*#\1#p' <<<"$hook")"
             if [ -z "$service_id" ]; then
-              echo "No srv-... id found in one of the Render hook URLs." >&2
+              echo "No srv-... id found in one of the Render hook URLs. A Render deploy" >&2
+              echo "hook looks like https://api.render.com/deploy/srv-XXXX?key=YYYY." >&2
               exit 1
             fi
             response="$(curl -fsS -X POST "$hook")"
-            deploy_id="$(jq -r '.deploy.id // empty' <<<"$response")"
+            # jq must not be what fails here. Letting it abort the step under
+            # `set -e` replaced a message naming the service and quoting the
+            # response with a bare "parse error: Invalid numeric literal",
+            # which says nothing about which hook broke or what came back.
+            deploy_id="$(jq -r '.deploy.id // empty' <<<"$response" 2>/dev/null || true)"
             if [ -z "$deploy_id" ]; then
-              echo "Render hook for $service_id returned no deploy id. Response: $response" >&2
+              echo "Render hook for $service_id returned no deploy id." >&2
+              echo "It answered with:" >&2
+              printf '%s\n' "$response" | head -5 >&2
+              echo "A hook for a service that no longer exists, or a revoked key, answers" >&2
+              echo "like this. Re-copy it from that service's Settings > Deploy Hook." >&2
               exit 1
             fi
             echo "Queued Render deploy $deploy_id on $service_id."
