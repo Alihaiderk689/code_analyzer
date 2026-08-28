@@ -39,7 +39,7 @@ npx vitest run src/lib/api.test.js   # one file
 **Note:** `vitest.config.js` only runs `src/**/*.test.js` under a plain Node environment (no DOM/JSX) — it exercises pure-JS lib modules (`api.js`, `format.js`) only. There is no component/page-level test setup in this repo.
 
 ### CI
-`.github/workflows/ci.yml` runs on PRs to `main`/`dev` and on pushes to `main` only: backend (`check` + `test` against real Postgres) and frontend (`lint`, `test`, `build`) as separate jobs, then a `deploy` job gated on both. `push` deliberately excludes `dev` — listing it there ran every job twice on a `dev`→`main` PR (once for the branch push, once for the PR). The consequence is that a commit pushed straight to `dev` without a PR is not tested.
+Two workflows. `.github/workflows/ci.yml` is the gate — backend (`check` + `makemigrations --check` + `test` against real Postgres) and frontend (`lint`, `test`, `build`) as parallel jobs, plus advisory `pip-audit`/`npm audit`. It triggers on PRs to `main`/`dev` and declares `workflow_call:`, which is what makes it importable. `.github/workflows/deploy.yml` triggers on push to `main`, runs `uses: ./.github/workflows/ci.yml` as its `ci` job, and a `deploy` job with `needs: ci` — so there is exactly one definition of "the tests" and the deploy path cannot drift from what a PR was checked against. `ci.yml` deliberately has no `push:` trigger: `deploy.yml` calls it, and adding one would run every job twice for the same commit. A commit pushed straight to `dev` with no PR is therefore not tested.
 
 ## Architecture
 
