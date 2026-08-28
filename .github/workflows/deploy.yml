@@ -66,17 +66,27 @@ jobs:
           # without the other leaves two halves of the app on different
           # commits, which is worse than either being stale.
           #
-          # A missing worker hook is a hard error rather than a skip: quietly
-          # not deploying a service is the exact failure this job exists to
-          # prevent, and a warning in a log nobody reads is still quiet.
-          if [ -z "$WORKER_HOOK_URL" ]; then
-            echo "RENDER_WORKER_DEPLOY_HOOK_URL is not set, and the worker no longer" >&2
-            echo "auto-deploys. Create a deploy hook on the code-analyzer-celery-worker" >&2
-            echo "service (Settings > Deploy Hook) and add it as an Actions secret." >&2
+          # A missing worker hook used to `exit 1` right here, which meant a
+          # gap in configuration stopped the *web* service from deploying too
+          # - the guard against a half-deployed backend was itself preventing
+          # any deploy at all. Missing config is now recorded and reported by
+          # the last step in this job, so everything that CAN ship still does
+          # and the run still goes red until the gap is closed.
+          missing=''
+          hooks=("$WEB_HOOK_URL")
+          if [ -n "$WORKER_HOOK_URL" ]; then
+            hooks+=("$WORKER_HOOK_URL")
+          else
+            echo "::warning::RENDER_WORKER_DEPLOY_HOOK_URL is not set and the worker no longer auto-deploys. Create a deploy hook on code-analyzer-celery-worker (Settings > Deploy Hook) and add it as an Actions secret. The worker is NOT being deployed."
+            missing='RENDER_WORKER_DEPLOY_HOOK_URL'
+          fi
+          if [ -z "$WEB_HOOK_URL" ]; then
+            echo "RENDER_DEPLOY_HOOK_URL is not set - there is nothing to deploy the" >&2
+            echo "backend with. This one is fatal: it is the primary service." >&2
             exit 1
           fi
           deploys=''
-          for hook in "$WEB_HOOK_URL" "$WORKER_HOOK_URL"; do
+          for hook in "${hooks[@]}"; do
             # The service id is already inside the hook URL
             # (.../deploy/srv-xxxx?key=...), so deriving it beats another
             # secret that can silently drift out of sync with the hook.
@@ -94,7 +104,10 @@ jobs:
             echo "Queued Render deploy $deploy_id on $service_id."
             deploys="$deploys $service_id/$deploy_id"
           done
-          echo "deploys=${deploys# }" >> "$GITHUB_OUTPUT"
+          {
+            echo "deploys=${deploys# }"
+            echo "missing=$missing"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Wait for Render deploys
         env:
@@ -102,6 +115,15 @@ jobs:
           DEPLOYS: ${{ steps.render.outputs.deploys }}
         run: |
           set -euo pipefail
+          # An absent key and a rejected key are different failures and get
+          # different treatment. Absent means "verification was never wired
+          # up" - the deploy still fired, so skip the poll, warn, and let the
+          # final step redden the run. Rejected means a credential that exists
+          # and does not work, which is a genuine fault worth stopping on.
+          if [ -z "$RENDER_API_KEY" ]; then
+            echo "::warning::RENDER_API_KEY is not set, so the Render deploys were fired but not verified. They may still fail after this run goes green-ish."
+            exit 0
+          fi
           # Both were queued in the step above, so Render builds them
           # concurrently - watching them one after the other costs roughly the
           # slower of the two, not the sum.
@@ -174,6 +196,11 @@ jobs:
           TEAM_ID: ${{ secrets.VERCEL_TEAM_ID }}
         run: |
           set -euo pipefail
+          # Same absent-vs-rejected split as the Render wait above.
+          if [ -z "$VERCEL_TOKEN" ] || [ -z "$PROJECT_ID" ]; then
+            echo "::warning::VERCEL_TOKEN and/or VERCEL_PROJECT_ID are not set, so the Vercel deploy was fired but not verified. A build that fails after this point will not be reported."
+            exit 0
+          fi
           query="projectId=$PROJECT_ID&target=production&limit=20"
           if [ -n "$TEAM_ID" ]; then
             query="$query&teamId=$TEAM_ID"
@@ -295,3 +322,48 @@ jobs:
             exit 1
           fi
           echo "Production is up."
+
+      # Deploying and verifying are now separable: a missing secret skips a
+      # check rather than blocking the release, so everything that can ship
+      # still ships. This step is what stops that leniency turning into
+      # silence - the run goes red until every gap is closed, because a
+      # pipeline that deploys without verifying is exactly the state that let
+      # a stale frontend sit behind green checkmarks for weeks.
+      - name: Report configuration gaps
+        if: ${{ !cancelled() }}
+        env:
+          MISSING_HOOK: ${{ steps.render.outputs.missing }}
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          BACKEND_URL: ${{ vars.RENDER_BACKEND_URL }}
+          FRONTEND_URL: ${{ vars.VERCEL_FRONTEND_URL }}
+        run: |
+          set -uo pipefail
+          gaps=()
+          [ -n "$MISSING_HOOK" ] && gaps+=("secret  $MISSING_HOOK - the Celery worker is not being deployed at all")
+          [ -z "$RENDER_API_KEY" ]     && gaps+=("secret  RENDER_API_KEY - Render deploys fire unverified")
+          [ -z "$VERCEL_TOKEN" ]       && gaps+=("secret  VERCEL_TOKEN - Vercel deploys fire unverified")
+          [ -z "$VERCEL_PROJECT_ID" ]  && gaps+=("secret  VERCEL_PROJECT_ID - Vercel deploys fire unverified")
+          [ -z "$BACKEND_URL" ]        && gaps+=("var     RENDER_BACKEND_URL - backend smoke test skipped")
+          [ -z "$FRONTEND_URL" ]       && gaps+=("var     VERCEL_FRONTEND_URL - frontend smoke test skipped")
+
+          if [ "${#gaps[@]}" -eq 0 ]; then
+            echo "Deploy pipeline is fully configured."
+            exit 0
+          fi
+
+          {
+            echo "### Deploy pipeline is not fully configured"
+            echo
+            echo "The deploys that could be triggered **were** triggered. These gaps mean"
+            echo "parts of the release went out unverified:"
+            echo
+            for gap in "${gaps[@]}"; do echo "- \`${gap}\`"; done
+            echo
+            echo "Repository → Settings → Secrets and variables → Actions."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Deploy pipeline is not fully configured:" >&2
+          for gap in "${gaps[@]}"; do echo "  $gap" >&2; done
+          exit 1
