@@ -22,7 +22,7 @@ Companion docs: [ARCHITECTURE.md](ARCHITECTURE.md) · [ERROR_HANDLING.md](ERROR_
 | Startup config validation | 🟢 Implemented | `ENVIRONMENT`, `SECRET_KEY`, `ALLOWED_HOSTS` fail closed |
 | Secret management | 🟢 Implemented | Dashboard env vars, `sync: false`, `.dockerignore` excludes `.env` |
 | Health checks | 🟢 Implemented | `/api/health/` liveness + `/api/health/ready/` readiness probing the DB (§10) |
-| Celery worker on Render | 🟢 Implemented | `ALLOWED_HOSTS` in the shared env group; worker boot verified (§13.1) |
+| Celery worker on Render | 🔴 **Not provisioned** | `render.yaml` declares it; the Render dashboard has the web service only (§13.9) |
 | Long AI requests | 🟢 Implemented | Chain budget 3×30s, gunicorn `--timeout 120` (§13.2); repo-context capped at 90s total (§13.8) |
 | Avatar storage in production | 🟢 Implemented | 1GB Render disk + unconditional `/media/` route (§13.3) |
 | Rate-limit accuracy | 🟢 Implemented | Shared Redis cache; fails open if Redis is down (§13.4) |
@@ -46,7 +46,7 @@ Three environments. They differ in ways that matter during an incident.
 | Backend | `runserver :8000` | gunicorn, **no host port** | Render web (Docker) |
 | Database | Local PG (`DATABASE_URL_DEV`) | `postgres:16-alpine` | **External Supabase** (`DATABASE_URL_PROD`) |
 | Redis | Optional | `redis:7-alpine` | Render `keyvalue` |
-| Celery | Manual | `celery_worker` service | Render worker (**broken**, §13.1) |
+| Celery | Manual | `celery_worker` service | **Nothing runs it** (§13.9) |
 | Origins | Two | **One** (nginx proxies `/api/`) | Two |
 | `/media/` | Django (DEBUG only) | nginx from shared volume | **Nothing** (§13.3) |
 
@@ -620,6 +620,50 @@ guards against 120s).
 real analysis latency — a slow AI provider or a large file — not a
 misconfigured budget. Raising the number without also raising gunicorn's
 `--timeout` reintroduces the `502`.
+
+### 13.9 No Celery worker in production 🔴
+
+`render.yaml` declares `code-analyzer-celery-worker`, and every architecture
+note in this repo assumes it runs. **It has never been provisioned.** The
+Render dashboard contains the web service only — confirmed while wiring up
+deploy hooks, when the worker had no service page to take one from.
+
+`render.yaml` describes the intended topology, not the deployed one. It only
+creates services if the environment was set up through Render's Blueprint
+flow; a backend created by hand in the dashboard leaves the rest of the file
+inert. Nothing warns about the difference.
+
+**What this means in production:**
+
+| Feature | State |
+|---|---|
+| Auth, analysis, AI, chat, security scanning | ✅ unaffected — none of them touch Celery |
+| **GitHub PR review** | ❌ never runs |
+| **Repository indexing / push backfill** | ❌ never runs |
+
+`github_integration/tasks.py` is reached through `.delay()`. The webhook still
+verifies its signature and still returns `202`, so GitHub records a successful
+delivery and the queue grows with nobody consuming it. **The failure is
+completely silent from both ends** — the only symptom is that reviews never
+appear on pull requests, which is the repository's headline feature.
+
+Whether the `code-analyzer-redis` keyvalue service exists is unverified; if it
+does not, `.delay()` raises on connect and the webhook returns `500` instead,
+which at least surfaces in Render's logs.
+
+**To fix:** create a Background Worker on Render from the same repo and
+Dockerfile with `dockerCommand: celery -A config worker --loglevel=info`, give
+it the shared env group (`CELERY_BROKER_URL` must point at a real Redis), then
+set `RENDER_WORKER_DEPLOY_HOOK_URL` so `deploy.yml` deploys it alongside the
+web service. The workflow treats that secret as optional precisely because the
+service does not exist yet — setting it is what turns the worker back into
+something the pipeline keeps current.
+
+> **Do not "fix" this with `CELERY_TASK_ALWAYS_EAGER=true`.** It would run
+> reviews inline in the web request, and §3's whole reason for the queue is
+> that webhooks must be acknowledged in seconds. A full PR review inside the
+> webhook request would exceed gunicorn's `--timeout 120` and GitHub would
+> record the delivery as failed.
 
 ## 14. Incident Runbooks
 

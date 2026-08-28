@@ -101,8 +101,18 @@ jobs:
           if [ -n "$WORKER_HOOK_URL" ]; then
             hooks+=("$WORKER_HOOK_URL")
           else
-            echo "::warning::RENDER_WORKER_DEPLOY_HOOK_URL is not set and the worker no longer auto-deploys. Create a deploy hook on code-analyzer-celery-worker (Settings > Deploy Hook) and add it as an Actions secret. The worker is NOT being deployed."
-            missing='RENDER_WORKER_DEPLOY_HOOK_URL'
+            # Optional, because the Celery worker render.yaml declares has not
+            # actually been provisioned on Render - the dashboard has the web
+            # service only. Demanding a hook for a service that does not exist
+            # reddens every run over a gap nobody can close, and a warning
+            # nobody can act on is the kind that teaches people to skip
+            # warnings. See docs/OPERATIONS.md for what runs nowhere as a
+            # result: the GitHub PR review pipeline.
+            #
+            # Provisioning the worker later is what makes this worth setting;
+            # until then its absence is the accurate state, not a gap.
+            echo "No RENDER_WORKER_DEPLOY_HOOK_URL - deploying the web service only."
+            echo "That matches production today, which runs no Celery worker."
           fi
           if [ -z "$WEB_HOOK_URL" ]; then
             echo "RENDER_DEPLOY_HOOK_URL is not set - there is nothing to deploy the" >&2
@@ -110,6 +120,7 @@ jobs:
             exit 1
           fi
           deploys=''
+          seen_services=''
           for hook in "${hooks[@]}"; do
             # Secrets carry whatever whitespace came with the paste. A newline
             # inside the URL makes curl reject it outright, which reads like a
@@ -124,6 +135,21 @@ jobs:
               echo "hook looks like https://api.render.com/deploy/srv-XXXX?key=YYYY." >&2
               exit 1
             fi
+            # Two hooks naming the same service means one secret holds a copy
+            # of the other, and the worker is not being deployed despite a
+            # secret that looks present. Caught here rather than at the second
+            # POST, where Render answers "Accepted {}" - it is refusing a
+            # duplicate deploy, but reads like a broken hook.
+            case " $seen_services " in
+              *" $service_id "*)
+                echo "RENDER_DEPLOY_HOOK_URL and RENDER_WORKER_DEPLOY_HOOK_URL both point at" >&2
+                echo "$service_id. One is a copy of the other, so the worker is not being" >&2
+                echo "deployed. Take the worker's hook from ITS OWN service page:" >&2
+                echo "Render > code-analyzer-celery-worker > Settings > Deploy Hook." >&2
+                exit 1
+                ;;
+            esac
+            seen_services="$seen_services $service_id"
             response="$(curl -fsS -X POST "$hook")"
             # jq must not be what fails here. Letting it abort the step under
             # `set -e` replaced a message naming the service and quoting the
@@ -421,7 +447,10 @@ jobs:
         run: |
           set -uo pipefail
           gaps=()
-          [ -n "$MISSING_HOOK" ] && gaps+=("secret  $MISSING_HOOK - the Celery worker is not being deployed at all")
+          # Only ever set when a hook was expected and absent. The worker is
+          # not provisioned, so today this stays empty rather than billing
+          # every run for a service that does not exist.
+          [ -n "$MISSING_HOOK" ] && gaps+=("secret  $MISSING_HOOK - a declared service is not being deployed")
           [ -z "$RENDER_API_KEY" ]     && gaps+=("secret  RENDER_API_KEY - Render deploys fire unverified")
           [ -z "$VERCEL_TOKEN" ]       && gaps+=("secret  VERCEL_TOKEN - Vercel deploys fire unverified")
           [ -z "$VERCEL_PROJECT_ID" ]  && gaps+=("secret  VERCEL_PROJECT_ID - Vercel deploys fire unverified")
