@@ -283,6 +283,7 @@ jobs:
         run: |
           set -uo pipefail
           failed=0
+          checked=0
 
           check() {  # name, base-url, path, expected-substring (optional)
             local name="$1" base="$2" path="$3" want="${4:-}"
@@ -294,6 +295,7 @@ jobs:
               echo "SKIP $name - no URL configured (set the repo variable)."
               return 0
             fi
+            checked=$((checked + 1))
             local url="${base%/}$path" body
             # --retry covers a container still finishing its first request;
             # -f turns any 4xx/5xx into a non-zero exit.
@@ -321,7 +323,16 @@ jobs:
             echo "Production is not serving correctly after deploy." >&2
             exit 1
           fi
-          echo "Production is up."
+          # Zero checks is not a pass. Reporting "Production is up" after
+          # skipping every check states a fact this step did not establish -
+          # the same false all-clear the deploy hooks used to give, in the one
+          # step whose entire job is to catch that.
+          if [ "$checked" -eq 0 ]; then
+            echo "::warning::No smoke test ran - neither RENDER_BACKEND_URL nor VERCEL_FRONTEND_URL is set. Production was NOT verified."
+            echo "Production was not verified: no URLs configured." >&2
+            exit 0
+          fi
+          echo "Production is up ($checked of 2 checks ran and passed)."
 
       # Deploying and verifying are now separable: a missing secret skips a
       # check rather than blocking the release, so everything that can ship
