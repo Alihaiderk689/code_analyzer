@@ -70,6 +70,18 @@ services:
     dockerContext: ./backend
     plan: starter
     healthCheckPath: /api/health/
+    # Render defaults this to true, which deploys on every push to the
+    # connected branch - on *push*, not on "CI passed". That quietly made the
+    # CI gate meaningless for the backend: a merge that broke the test suite
+    # shipped anyway, and the red X arrived in Actions minutes after
+    # production was already running it. Deploys now come only from the
+    # ci.yml `deploy` job's hook, which runs after backend+frontend pass.
+    #
+    # This key only binds services Render manages through this Blueprint. If
+    # the service was created by hand in the dashboard, setting it here
+    # changes nothing - turn Auto-Deploy off on the service's Settings page
+    # too, and treat this as the statement of intent.
+    autoDeploy: false
     # Uploaded avatars (MEDIA_ROOT) live here. Without a disk the container
     # filesystem is ephemeral, so every deploy silently destroyed them.
     # Attached to the web service only - it is the sole process that writes or
@@ -102,6 +114,11 @@ services:
     dockerContext: ./backend
     dockerCommand: celery -A config worker --loglevel=info
     plan: starter
+    # Same reasoning as the web service above. The worker shares the web
+    # service's image, so leaving it on auto-deploy would put a worker built
+    # from an unreviewed commit alongside a gated web container - the two
+    # running different code is worse than either being briefly stale.
+    autoDeploy: false
     envVars:
       - fromGroup: code-analyzer-shared
       - key: ENVIRONMENT
