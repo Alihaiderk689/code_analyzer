@@ -459,13 +459,35 @@ class CookieAuthCSRFTests(APITestCase):
         self._login(client, email='csrf2@example.com')
 
         csrf_response = client.get(reverse('auth-csrf'))
-        self.assertEqual(csrf_response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(csrf_response.status_code, status.HTTP_200_OK)
         csrf_token = client.cookies['csrftoken'].value
 
         response = client.post(
             reverse('auth-change-password'),
             {'old_password': 'TestPass123!', 'new_password': 'NewPass456!', 'new_password2': 'NewPass456!'},
             HTTP_X_CSRFTOKEN=csrf_token,
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_unsafe_request_with_body_csrf_token_succeeds(self):
+        """The frontend's primary source for X-CSRFToken is the /auth/csrf/
+        response body, not document.cookie (see api.js's primeCsrf()) - that's
+        what makes CSRF work even when frontend/backend can't share a
+        registrable domain. Django masks the secret differently on every
+        get_token() call, so the body value is never byte-identical to the
+        cookie value (see CsrfCookieViewTests.test_also_returns_token_in_body)
+        - it must still be accepted on its own, unmasked-secret comparison."""
+        client = APIClient(enforce_csrf_checks=True)
+        self._login(client, email='csrf3@example.com')
+
+        csrf_response = client.get(reverse('auth-csrf'))
+        body_token = csrf_response.data['csrfToken']
+        self.assertNotEqual(body_token, client.cookies['csrftoken'].value)
+
+        response = client.post(
+            reverse('auth-change-password'),
+            {'old_password': 'TestPass123!', 'new_password': 'NewPass456!', 'new_password2': 'NewPass456!'},
+            HTTP_X_CSRFTOKEN=body_token,
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
@@ -537,12 +559,23 @@ class RefreshViewTests(APITestCase):
 class CsrfCookieViewTests(APITestCase):
     def test_sets_readable_csrf_cookie(self):
         response = self.client.get(reverse('auth-csrf'))
-        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
         csrf_cookie = response.cookies['csrftoken']
         self.assertTrue(csrf_cookie.value)
-        # Must be JS-readable (not httponly) - the frontend reads it via
-        # document.cookie to echo it back as X-CSRFToken.
+        # Must be JS-readable (not httponly) - same-site/subdomain deployments
+        # can still read it directly via document.cookie.
         self.assertFalse(csrf_cookie['httponly'])
+
+    def test_also_returns_token_in_body(self):
+        # The body is the primary channel the frontend relies on (see
+        # api.js's primeCsrf()) - document.cookie can't be read across
+        # genuinely unrelated domains, so the token must be handed over
+        # directly rather than requiring the frontend to parse the cookie.
+        # Not byte-identical to the cookie value - see
+        # CookieAuthCSRFTests.test_unsafe_request_with_body_csrf_token_succeeds
+        # for why that's expected and still valid.
+        response = self.client.get(reverse('auth-csrf'))
+        self.assertTrue(response.data['csrfToken'])
 
 
 class ForgotPasswordTests(APITestCase):
