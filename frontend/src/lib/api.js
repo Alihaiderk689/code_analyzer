@@ -85,9 +85,14 @@ function csrfHeaders() {
 // would 403 with "CSRF token missing". Reads the token from the response
 // body rather than trusting document.cookie to have picked it up (see
 // csrfHeaders() above for why that can't be relied on across domains).
+// Checked explicitly rather than swallowed: a non-2xx here (e.g. the backend
+// was briefly unreachable at boot) must surface so the caller knows the
+// token was never actually obtained, instead of every later mutating request
+// silently 403ing for the rest of the session.
 export async function primeCsrf() {
   const res = await safeFetch(`${API_BASE_URL}/auth/csrf/`, { credentials: 'include' })
   const data = await safeJson(res)
+  if (!res.ok) throw new ApiError(res.status, data)
   if (data?.csrfToken) csrfToken = data.csrfToken
 }
 
@@ -143,13 +148,28 @@ export async function apiFetch(path, opts = {}) {
     }
   }
 
+  let data = null
+  if (res.status === 403) {
+    data = await safeJson(res)
+    // DRF's CSRFCheck (see CookieJWTAuthentication) raises PermissionDenied
+    // as 'CSRF Failed: <reason>' - e.g. the cookie was never primed (backend
+    // was briefly down at boot) or went stale. Re-prime and retry once,
+    // mirroring the 401 refresh-and-retry above, instead of leaving the user
+    // stuck until a full page reload.
+    if (typeof data?.detail === 'string' && /^CSRF Failed/i.test(data.detail)) {
+      await primeCsrf()
+      res = await doFetch()
+      data = null
+    }
+  }
+
   if (!res.ok) {
-    throw new ApiError(res.status, await safeJson(res))
+    throw new ApiError(res.status, data ?? (await safeJson(res)))
   }
 
   if (responseType === 'blob') return res.blob()
   if (res.status === 204) return null
-  return safeJson(res)
+  return data ?? safeJson(res)
 }
 
 /**
