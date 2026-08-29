@@ -23,7 +23,7 @@ Companion docs: [ARCHITECTURE.md](ARCHITECTURE.md) · [ERROR_HANDLING.md](ERROR_
 | Secret management | 🟢 Implemented | Dashboard env vars, `sync: false`, `.dockerignore` excludes `.env` |
 | Health checks | 🟢 Implemented | `/api/health/` liveness + `/api/health/ready/` readiness probing the DB (§10) |
 | Celery worker on Render | 🔴 **Not provisioned** | `render.yaml` declares it; the Render dashboard has the web service only (§13.9) |
-| Long AI requests | 🟢 Implemented | Chain budget 3×30s, gunicorn `--timeout 120` (§13.2); repo-context capped at 90s total (§13.8) |
+| Long AI requests | 🟡 Bounded, not eliminated | Chain budget 3×20s, gunicorn `--timeout 120` (§13.2); repo-context capped at 90s total (§13.8); Render's own platform timeout is separate and unverified (§12) |
 | Avatar storage in production | 🟢 Implemented | 1GB Render disk + unconditional `/media/` route (§13.3) |
 | Rate-limit accuracy | 🟢 Implemented | Shared Redis cache; fails open if Redis is down (§13.4) |
 | Database outage response | 🟢 Implemented | `OperationalError` → `503`, no blind retries (§13.5) |
@@ -367,7 +367,7 @@ What exists is passive:
 CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3"]
 ```
 
-`--timeout 120`, no `--worker-class`, so workers are **sync**. The timeout sits above the bounded AI chain (3 × `AI_REQUEST_TIMEOUT_SECONDS`, default 90s) with headroom — the two must be changed together (§13.2).
+`--timeout 120`, no `--worker-class`, so workers are **sync**. The timeout sits above the bounded AI chain (3 × `AI_REQUEST_TIMEOUT_SECONDS`, default 60s) with headroom — the two must be changed together (§13.2).
 
 **Concurrency is 3.** Sync workers serve one request each. Because AI calls are synchronous and in-request, three concurrent AI requests saturate the service, and a slow AI call starves unrelated traffic — including registration.
 
@@ -377,11 +377,11 @@ CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers
 
 | Path | Budget | Fits? |
 |---|---|---|
-| AI only (suggestions / explanation / refactor / chat) | 3 × 30s = **90s** | yes |
-| Security scan (Bandit 20s **then** the full AI chain) | **110s** | yes, with 10s to spare |
+| AI only (suggestions / explanation / refactor / chat) | 3 × 20s = **60s** | yes |
+| Security scan (Bandit 20s **then** the full AI chain) | **80s** | yes, with 40s to spare |
 | Repo-context analyze (whole request) | `GITHUB_CONTEXT_REQUEST_BUDGET_SECONDS` = **90s**, a true total | yes, with 30s to spare (§13.8) |
 | ├ its GitHub fetch phase | `GITHUB_CONTEXT_FETCH_BUDGET_SECONDS` = **45s**, a share of the 90s, not an addition | yes (§13.7) |
-| └ its per-file analysis (sandbox 5s + Bandit 20s + AI 90s, ×7 files) | unbounded before §13.8 at **805s**; now inside the 90s | yes (§13.8) |
+| └ its per-file analysis (sandbox 5s + Bandit 20s + AI 60s, ×7 files) | unbounded before §13.8 at **595s**; now inside the 90s | yes (§13.8) |
 
 Two caveats on "budget". First, `requests` and `httpx` timeouts bound each I/O
 phase (connect, and the gap between received chunks), **not** total wall-clock
@@ -400,7 +400,7 @@ the *accumulation* — no number of calls, files or providers can push the reque
 past its total. Everywhere else, **gunicorn's `--timeout` remains the only hard
 wall-clock bound on a request.**
 
-Under Compose, `frontend/nginx.conf` sets `proxy_read_timeout 120s`, now matching gunicorn's. On Render there is no nginx; Render applies its own platform timeout.
+Under Compose, `frontend/nginx.conf` sets `proxy_read_timeout 120s`, now matching gunicorn's. On Render there is no nginx; Render applies its own platform timeout, of an unverified value — see the 🔴 Gap note at the end of EDGE_CASES.md §5.5. `AI_REQUEST_TIMEOUT_SECONDS`'s default was lowered 30s → 20s (§13.2) to buy margin against it; the real fix is `docs/PLANNED_AI_ASYNC.md`.
 
 Containers run as non-root (`appuser`, `backend/Dockerfile`). The Compose backend publishes **no host port** — nginx is the only ingress.
 
@@ -425,14 +425,27 @@ which asserts every non-Redis service inherits the shared group.
 
 Two changes that must stay in step:
 
-- All three providers share `settings.AI_REQUEST_TIMEOUT_SECONDS` (default 30s),
-  and the Groq client is built with `max_retries=0` so the SDK cannot multiply
-  its own timeout. Worst case: **3 × 30 = 90s**.
+- All three providers share `settings.AI_REQUEST_TIMEOUT_SECONDS` (default 20s,
+  lowered from 30s on 2026-08-29), and the Groq client is built with
+  `max_retries=0` so the SDK cannot multiply its own timeout. Worst case:
+  **3 × 20 = 60s**.
 - Gunicorn runs `--timeout 120`.
 
 **Raising one without the other reintroduces the bug** — a higher gunicorn
 timeout with unbounded providers just lets one request hold 1 of 3 workers for
 minutes. `core.tests.RenderDeploymentConfigTests` asserts the ordering.
+
+**Why 20s and not 30s.** Both fit under gunicorn's 120s with room to spare, so
+the gunicorn/provider relationship alone didn't require the lower number. It
+was lowered because gunicorn's timeout isn't the real constraint on Render:
+there's no nginx in front of it there to align proxy timeouts the way Compose
+does, and Render's own platform-level timeout is unverified from this repo
+(§12). A production user reported a 148-line refactor request failing with a
+raw network error ("Unable to reach the server") rather than a clean `503` -
+consistent with Render's edge killing the connection before gunicorn
+responded, on a request nearing the old 90s worst case. Lowering the budget to
+60s buys margin against an unknown ceiling; it does not remove the ceiling.
+`docs/PLANNED_AI_ASYNC.md` is the planned fix that does.
 
 ### 13.3 Avatar persistence ✅
 
@@ -557,9 +570,9 @@ each run has three stages that can block on wall clock:
 |---|---|---|
 | `sandbox.run_python` (runtime error detection) | `TIMEOUT_SECONDS` = 5s | Python, macOS hosts only |
 | `BanditScanner.scan` | `BANDIT_TIMEOUT_SECONDS` = 20s | Python only |
-| AI fallback chain (`_call_with_fallback`) | 3 × `AI_REQUEST_TIMEOUT_SECONDS` = 90s | any file with findings |
+| AI fallback chain (`_call_with_fallback`) | 3 × `AI_REQUEST_TIMEOUT_SECONDS` = 60s | any file with findings |
 
-115s per file × 7 files = **805s** with nothing bounding the sum. The sandbox
+85s per file × 7 files = **595s** with nothing bounding the sum. The sandbox
 stage is easy to miss — it is three call frames below `analyze_code` and only
 costs anything on a macOS host, where `sandbox.is_available()` is true.
 
@@ -707,7 +720,7 @@ Feature-specific?             -> RB-4 .. RB-8
 ### RB-5 — AI features failing
 
 1. `grep 'AI provider' <logs>` — shows which providers fell through.
-2. **No such lines but users report failures** → `grep 'WORKER TIMEOUT'`. The AI-only path budgets 90s against gunicorn's 120s and the repo-context path is now bounded at 90s too (§13.8), so a timeout points elsewhere — a security scan (110s budget, still unbounded in total), a slow query, or a provider timeout raised without a matching gunicorn change. `grep 'request_budget.exhausted'` / `'github_fetch_budget.exhausted'` shows the budgets *working*, not causing a `502`; those requests return `201` with a degraded body. See the table in §12.
+2. **No such lines but users report failures** → `grep 'WORKER TIMEOUT'`. The AI-only path budgets 60s against gunicorn's 120s and the repo-context path is now bounded at 90s too (§13.8), so a timeout points elsewhere — a security scan (80s budget, still unbounded in total), a slow query, a provider timeout raised without a matching gunicorn change, or (no `WORKER TIMEOUT` line at all) Render's own platform proxy timing out the connection before gunicorn even hit its 120s (§12). `grep 'request_budget.exhausted'` / `'github_fetch_budget.exhausted'` shows the budgets *working*, not causing a `502`; those requests return `201` with a degraded body. See the table in §12.
 3. All three failing at once usually means missing/expired keys, not simultaneous outages — verify `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`.
 
 ### RB-6 — GitHub PR reviews not appearing
@@ -739,7 +752,7 @@ Work through in order:
 ### RB-9 — Slow or timing-out requests
 
 1. `grep 'WORKER TIMEOUT'` → a request exceeded 120s (§12).
-2. Remember concurrency is **3** (§12). Three slow AI requests block everything, including registration — a 90s budget is still 90s of a worker.
+2. Remember concurrency is **3** (§12). Three slow AI requests block everything, including registration — a 60s budget is still 60s of a worker.
 3. There are no request-duration metrics (§11) — log timestamps are the only timing signal.
 
 ### After any incident
@@ -765,10 +778,10 @@ Full model in [SECURITY.md](SECURITY.md); pre-deploy verification in [SECURITY_C
 
 Real constraints of the implementation, distinct from the gaps above.
 
-- **Concurrency is 3 sync workers.** No async workers; AI calls block a worker for up to the bounded 90s.
+- **Concurrency is 3 sync workers.** No async workers; AI calls block a worker for up to the bounded 60s.
 - **Migrations are unattended and forward-only** (§5).
 - **Email is a hard signup dependency** — no queue, no retry (§8).
-- **AI latency budgets 90s** and is still synchronous — a slow chain occupies 1 of 3 workers for that long (§9). The budget is per-I/O-phase, not a hard total; gunicorn's `--timeout` is the hard bound (§12).
+- **AI latency budgets 60s** and is still synchronous — a slow chain occupies 1 of 3 workers for that long (§9). The budget is per-I/O-phase, not a hard total; gunicorn's `--timeout` is the hard bound (§12), and on Render an unverified platform proxy timeout may bind tighter still.
 - **Repo-context analyze is fully bounded, but degrades under load.** The whole request is capped at `GITHUB_CONTEXT_REQUEST_BUDGET_SECONDS` (§13.8), covering GitHub fetching, the sandbox, Bandit and the AI chain. The cost is that a slow run silently returns *less*: fewer neighbors, or findings with scanner-written rather than AI-written text. That is reported (`context_truncated`, `degraded_stages`) but the frontend does not yet render it — a user sees a thinner result with no on-screen explanation. Grep `request_budget.exhausted` to see how often it is happening.
 - **Repository indexing costs one GitHub API call per file**, capped at 300; large repos get a `truncated` partial graph.
 - **No data retention or cleanup.** `WebhookEvent` (full webhook payloads), `ChatMessage`, and `Analysis` (complete submitted source in `source_code`) grow without bound. Nothing prunes them.

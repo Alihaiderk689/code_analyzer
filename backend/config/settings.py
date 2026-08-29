@@ -271,7 +271,23 @@ FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:5173')
 # This must stay comfortably below gunicorn's --timeout (see backend/Dockerfile)
 # or a slow chain gets its worker killed (502) instead of falling through to
 # the next provider and returning a clean 503.
-AI_REQUEST_TIMEOUT_SECONDS = int(os.environ.get('AI_REQUEST_TIMEOUT_SECONDS', 30))
+#
+# Default was 30 (worst case 90s) until 2026-08-29. On Render there is no
+# nginx in front of gunicorn (unlike Docker Compose, where nginx's
+# proxy_read_timeout is set to match gunicorn's 120s exactly) - Render applies
+# its own platform-level proxy timeout instead, of an unverified/undocumented
+# value. A worst-case chain that long risks the platform proxy killing the
+# connection first, which surfaces to the frontend as a raw network failure
+# ("Unable to reach the server") rather than the intended clean 503 - worse,
+# because the user gets no explanation and can't tell it was AI-side at all.
+# Lowered to 20 (worst case 60s, 80s for the security-scan path which adds
+# BANDIT_TIMEOUT_SECONDS ahead of it) for more headroom under whatever that
+# platform timeout turns out to be. This is a stopgap, not a fix: the real
+# solution is moving AI calls off the synchronous request path entirely (see
+# docs/PLANNED_AI_ASYNC.md) so no per-request timeout budget is needed at
+# all. Override via env var if a deployment's actual platform timeout is
+# known and wider.
+AI_REQUEST_TIMEOUT_SECONDS = int(os.environ.get('AI_REQUEST_TIMEOUT_SECONDS', 20))
 
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 GROQ_MODEL = os.environ.get('GROQ_MODEL', 'llama-3.3-70b-versatile')

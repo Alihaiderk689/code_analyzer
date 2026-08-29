@@ -47,12 +47,12 @@ Scaling a request-per-second number is meaningless here without the latency prof
 
 | Path | Bounded at | Bound enforced by |
 |---|---|---|
-| AI only (suggestions / explanation / refactor / chat) | 90s | 3 × `AI_REQUEST_TIMEOUT_SECONDS` |
-| Security scan | 110s | Bandit 20s **then** the AI chain |
+| AI only (suggestions / explanation / refactor / chat) | 60s | 3 × `AI_REQUEST_TIMEOUT_SECONDS` (default 20s each) |
+| Security scan | 80s | Bandit 20s **then** the AI chain |
 | Repo-context analyze | 90s | `GITHUB_CONTEXT_REQUEST_BUDGET_SECONDS`, a true monotonic total |
 | Everything else (CRUD, auth, dashboard) | milliseconds | — |
 
-At 3 workers, **one slow AI request removes 33% of capacity for up to 90 seconds.** Three concurrent ones queue every other request behind gunicorn's backlog until one finishes or the 120s timeout fires.
+At 3 workers, **one slow AI request removes 33% of capacity for up to 60 seconds.** Three concurrent ones queue every other request behind gunicorn's backlog until one finishes or the 120s timeout fires.
 
 The daily quotas are what actually keep this survivable: 3 chat messages/user/day (`chat/rate_limit.py`), 1 file check/user/day, 1 context check/user/day. They are product limits, but their operational function is capping how much AI latency the system can be made to absorb.
 
