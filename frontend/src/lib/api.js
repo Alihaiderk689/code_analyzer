@@ -62,20 +62,33 @@ async function safeJson(res) {
 
 const CSRF_COOKIE_RE = /(?:^|;\s*)csrftoken=([^;]+)/
 
-// Read fresh from document.cookie rather than caching - primeCsrf() can
-// re-issue it and this is cheap. Only meaningful for cookie-authenticated
-// requests; Django's CSRF check itself only applies to unsafe methods.
+// Token handed back in the /auth/csrf/ response body (see accounts/views.py's
+// CsrfCookieView). This is the primary source: reading it from document.cookie
+// only works when frontend and backend share a registrable domain (JS can
+// never read a cookie whose Domain is a genuinely unrelated host, no matter
+// how CORS/SameSite are configured) - falling back to memory instead of the
+// cookie makes CSRF work regardless of hosting topology.
+let csrfToken = null
+
+// document.cookie fallback for the (rare) case a mutating request fires
+// before primeCsrf()'s response has resolved into csrfToken above - still
+// works whenever the cookie IS readable (same-site/subdomain deployments).
 function csrfHeaders() {
+  if (csrfToken) return { 'X-CSRFToken': csrfToken }
   if (typeof document === 'undefined') return {}
   const match = document.cookie.match(CSRF_COOKIE_RE)
   return match ? { 'X-CSRFToken': decodeURIComponent(match[1]) } : {}
 }
 
-// Primes the (JS-readable, non-httpOnly) csrftoken cookie so every mutating
-// request afterward has something to echo back. Call once on app boot -
-// before that, any POST/PUT/PATCH/DELETE would 403 with "CSRF token missing".
+// Primes the csrftoken so every mutating request afterward has something to
+// echo back. Call once on app boot - before that, any POST/PUT/PATCH/DELETE
+// would 403 with "CSRF token missing". Reads the token from the response
+// body rather than trusting document.cookie to have picked it up (see
+// csrfHeaders() above for why that can't be relied on across domains).
 export async function primeCsrf() {
-  await safeFetch(`${API_BASE_URL}/auth/csrf/`, { credentials: 'include' })
+  const res = await safeFetch(`${API_BASE_URL}/auth/csrf/`, { credentials: 'include' })
+  const data = await safeJson(res)
+  if (data?.csrfToken) csrfToken = data.csrfToken
 }
 
 let refreshPromise = null

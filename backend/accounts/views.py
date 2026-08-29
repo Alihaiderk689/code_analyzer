@@ -49,18 +49,32 @@ User = get_user_model()
 
 
 class CsrfCookieView(APIView):
-    """GET /api/auth/csrf/ - has no purpose beyond making Django issue the
-    (non-httpOnly) csrftoken cookie. The frontend reads it via document.cookie
-    and echoes it back as X-CSRFToken on every unsafe cookie-authenticated
+    """GET /api/auth/csrf/ - makes Django issue the (non-httpOnly) csrftoken
+    cookie AND returns the same token in the response body. The frontend
+    echoes it back as X-CSRFToken on every unsafe cookie-authenticated
     request (see accounts/authentication.py); it calls this once on boot,
-    before doing anything that might need it."""
+    before doing anything that might need it.
+
+    The body is not redundant with the cookie: document.cookie can only ever
+    read a cookie whose Domain attribute is the page's own domain (or a
+    parent domain it was explicitly scoped to via CSRF_COOKIE_DOMAIN) - that
+    is a same-origin/subdomain rule, unrelated to SameSite, which only
+    controls whether the browser *sends* a cookie, not who can *read* one via
+    JS. When frontend and backend are deployed on genuinely unrelated domains
+    (not subdomains of one registrable domain), the browser still sends the
+    csrftoken cookie back with SameSite=None requests, but frontend JS can
+    never see it to populate the header - every mutating request then 403s
+    "CSRF token missing" no matter how CORS/COOKIE_DOMAIN are configured.
+    Handing the token to the frontend directly in this response sidesteps
+    that entirely: the frontend caches it in memory (see api.js's
+    primeCsrf()/csrfHeaders()) instead of depending on document.cookie."""
 
     permission_classes = [AllowAny]
     authentication_classes = []
 
     def get(self, request):
-        get_token(request)
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        token = get_token(request)
+        return Response({'csrfToken': token})
 
 
 def _display_name_for(email):

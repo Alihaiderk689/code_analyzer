@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { apiFetch, ApiError } from './api'
+import { apiFetch, ApiError, primeCsrf } from './api'
 
 // ApiError's message-extraction logic decides what every page in the app
 // shows the user when a request fails, so it's worth pinning down directly.
@@ -41,5 +41,31 @@ describe('apiFetch network failures', () => {
       status: 0,
       message: 'Unable to reach the server. Check your connection and try again.',
     })
+  })
+})
+
+// primeCsrf() must read the token from the /auth/csrf/ response body, not
+// rely on document.cookie - that cookie is only readable by frontend JS when
+// frontend and backend share a registrable domain, which isn't true of every
+// deployment topology (e.g. a frontend and backend on unrelated hosts). This
+// test environment has no `document` at all (see vitest.config.js), which
+// doubles as proof the in-memory token path doesn't depend on one.
+describe('primeCsrf / csrfHeaders', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('caches the csrfToken from the response body and echoes it as X-CSRFToken', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ csrfToken: 'body-token-123' }) })
+      .mockResolvedValueOnce({ ok: true, status: 204 })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await primeCsrf()
+    await apiFetch('/some/endpoint/', { method: 'POST', body: { a: 1 } })
+
+    const [, requestInit] = fetchMock.mock.calls[1]
+    expect(requestInit.headers['X-CSRFToken']).toBe('body-token-123')
   })
 })
