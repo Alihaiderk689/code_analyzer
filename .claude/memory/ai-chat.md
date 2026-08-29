@@ -25,7 +25,7 @@ chain (Groq → Gemini → OpenRouter).
 - `backend/chat/urls.py` — mounted at `api/chat/` (`start/<id>/`, `message/`, `history/<id>/`, `limit/`).
 - `backend/core/throttling.py` — `AIRateThrottle` (scope `'ai'`, `30/min` in `settings.py`), applied to all five AI-calling views.
 - `backend/core/execution_budget.py` — `ExecutionBudget`/`BudgetExceeded`, an optional shared deadline `generate_text` can accept (only the GitHub repository-context path passes one; every other caller leaves it `None` and behaves exactly as before).
-- `backend/config/settings.py` (~lines 263-286) — `AI_REQUEST_TIMEOUT_SECONDS` (default 30s, applied per-provider) and the three providers' API keys/models (`GROQ_*`, `GEMINI_*`, `OPENROUTER_*`).
+- `backend/config/settings.py` (~lines 263-296) — `AI_REQUEST_TIMEOUT_SECONDS` (default 20s, applied per-provider — lowered from 30s on 2026-08-29, see Gotchas) and the three providers' API keys/models (`GROQ_*`, `GEMINI_*`, `OPENROUTER_*`).
 - `frontend/src/pages/AnalysisChat.jsx` — page wrapper that loads the `Analysis` and renders `AnalysisChatPanel`.
 - `frontend/src/components/AnalysisChatPanel.jsx` — the persisted per-analysis chat UI (history load, send, quota display/countdown, delete-chat).
 - `frontend/src/components/AnalysisTabs.jsx` — renders the Suggestions/Explanation/Refactor tabs on the Report page, calling `getSuggestions`/`getExplanation`/`getRefactor`.
@@ -154,6 +154,7 @@ shared `useLazyAi`-style hook calling `getSuggestions`/`getExplanation`/
 `?regenerate=true`.
 
 ## Gotchas / non-obvious behavior
+- `AI_REQUEST_TIMEOUT_SECONDS` default is 20s (60s worst-case 3-provider chain), not 30s/90s — lowered 2026-08-29 after a production report of the Refactored Code tab failing with a network-level error ("Unable to reach the server") rather than a clean 503, on a larger (~148-line) file. Root cause: on Render there's no nginx in front of gunicorn (unlike Docker Compose, where `frontend/nginx.conf`'s `proxy_read_timeout` is set to match gunicorn's `--timeout 120` exactly), so Render's own platform proxy timeout — unverified from this repo — can kill the connection before gunicorn responds, and the browser sees that as a raw network failure. This is a stopgap that narrows the risk window, not a fix; see `docs/PLANNED_AI_ASYNC.md` for the actual planned fix (moving these calls off the synchronous request path).
 - All five AI-calling views (`ChatView`, `SendMessageView`, `SuggestionsView`,
   `ExplanationView`, `RefactorView`) catch AI exceptions the same way — a bare
   `except Exception` around the client call, returning HTTP 503 with
@@ -217,4 +218,4 @@ shared `useLazyAi`-style hook calling `getSuggestions`/`getExplanation`/
   Refactor tabs alongside the Chat link.
 
 ## Last updated
-2026-08-28 — initial creation.
+2026-08-29 — `AI_REQUEST_TIMEOUT_SECONDS` default lowered 30s → 20s (worst-case chain 90s → 60s) to reduce the risk of Render's unverified platform proxy timeout killing a request before gunicorn responds. See Gotchas and `docs/PLANNED_AI_ASYNC.md`.

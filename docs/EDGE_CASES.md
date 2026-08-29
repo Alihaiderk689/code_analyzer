@@ -178,9 +178,9 @@ The budget only applies where it was added: PR review, OAuth, repo listing and i
 |---|---|---|
 | `sandbox.run_python` via `analyze_code` → `_python_issues` → `_python_runtime_issues` | `sandbox.TIMEOUT_SECONDS` = 5s | Python, macOS hosts (`sandbox.is_available()`) |
 | `BanditScanner.scan` | `BANDIT_TIMEOUT_SECONDS` = 20s | Python |
-| `AISecurityService.enrich` → `ai.client._call_with_fallback` | 3 × `AI_REQUEST_TIMEOUT_SECONDS` = 90s | any file with findings |
+| `AISecurityService.enrich` → `ai.client._call_with_fallback` | 3 × `AI_REQUEST_TIMEOUT_SECONDS` = 60s | any file with findings |
 
-**115s per file × 7 files = 805s**, with per-stage timeouts and no total. The sandbox stage is the easily-missed one: it sits three frames below `analyze_code` and costs nothing on Linux, so it is invisible in production traces but real on a macOS host.
+**85s per file × 7 files = 595s**, with per-stage timeouts and no total. The sandbox stage is the easily-missed one: it sits three frames below `analyze_code` and costs nothing on Linux, so it is invisible in production traces but real on a macOS host.
 
 **Fixed** by `core/execution_budget.py`. One `RequestBudget` per context analysis holds a **`time.monotonic()` deadline** of `settings.GITHUB_CONTEXT_REQUEST_BUDGET_SECONDS` (default **90s**) and is threaded to all four expensive stages, GitHub fetching included. `FetchBudget` (§3.12) is now a subclass of the same `ExecutionBudget` and is built as `min(fetch_budget_setting, request_budget.remaining())` — a share of the 90s, never added to it. 90s leaves a **30s margin** under gunicorn's 120s for the DB writes and CPU-bound static analysis that follow.
 
@@ -278,9 +278,11 @@ The last exception is re-raised; all three call sites return `503`. `chat/views.
 
 ### 5.5 The chain is bounded below the request timeout ✅ Handled *(fixed)*
 
-**Fixed.** All three providers now share `settings.AI_REQUEST_TIMEOUT_SECONDS` (default 30s), and the Groq client is constructed with `max_retries=0` so the SDK cannot silently multiply its own timeout. The AI-only path budgets 3 × 30 = **90s**, and gunicorn now runs with `--timeout 120`.
+**Fixed.** All three providers now share `settings.AI_REQUEST_TIMEOUT_SECONDS` (default 20s, lowered from 30s on 2026-08-29 - see below), and the Groq client is constructed with `max_retries=0` so the SDK cannot silently multiply its own timeout. The AI-only path budgets 3 × 20 = **60s**, and gunicorn now runs with `--timeout 120`.
 
-🔵 **Two things "bounded" does not mean here.** `requests` and `httpx` timeouts apply per I/O phase (connect, and the gap between received chunks), not to total wall-clock duration — so a trickling server can exceed its budget without tripping the timeout; for the AI chain, gunicorn's `--timeout` is the only hard bound. And the AI chain is not the longest synchronous path: a security scan runs Bandit (20s) *then* the full chain, for a **110s** budget, and repo-context analyze runs that whole pipeline once per file it fetched — see §3.12 and OPERATIONS.md §12.
+🔵 **Two things "bounded" does not mean here.** `requests` and `httpx` timeouts apply per I/O phase (connect, and the gap between received chunks), not to total wall-clock duration — so a trickling server can exceed its budget without tripping the timeout; for the AI chain, gunicorn's `--timeout` is the only hard bound. And the AI chain is not the longest synchronous path: a security scan runs Bandit (20s) *then* the full chain, for an **80s** budget, and repo-context analyze runs that whole pipeline once per file it fetched — see §3.12 and OPERATIONS.md §12.
+
+🔴 **Gap — gunicorn's timeout is not the actual ceiling on Render.** `--timeout 120` and the AI chain's budget are only bounded against *gunicorn's own* timeout. Under Docker Compose, `frontend/nginx.conf` sets `proxy_read_timeout 120s` to match it exactly, but Render puts no nginx in front of gunicorn and applies its own platform-level proxy timeout instead - a value this app doesn't control and hasn't verified. If that platform timeout is shorter than the app's worst-case chain, the platform kills the connection before gunicorn ever responds, and the frontend sees a raw network failure (`ApiError` status `0`, "Unable to reach the server") rather than the intended clean `503` - which is indistinguishable from the backend being down and gives the user no explanation. `AI_REQUEST_TIMEOUT_SECONDS`'s default was lowered from 30s to 20s specifically to buy margin against this (90s worst case → 60s), but that is a guess, not a verified fix - the actual solution is moving AI calls off the synchronous request path entirely (see `docs/PLANNED_AI_ASYNC.md`), which removes this ceiling instead of just narrowing it.
 
 Previously Groq had no explicit timeout (SDK default 60s read × 2 retries), making the chain's worst case ≈ 4 minutes against gunicorn's 30s default — so the request died before the fallback could finish being resilient, and the client got a `502` rather than the intended `503`.
 
