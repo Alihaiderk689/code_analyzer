@@ -81,6 +81,15 @@ MAX_MEMORY_BYTES = 256 * 1024 * 1024
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 HOME_DIR = str(Path.home())
 SYSTEM_PYTHON = '/usr/bin/python3'  # macOS only - see _run_python_darwin.
+# Two levels above sys.executable's *resolved* path (following symlinks, so a
+# venv still resolves to the real interpreter) - covers wherever Python was
+# actually installed even when that differs from _landlock.py's hardcoded
+# /usr/local: this repo's own Docker image puts it there, but e.g. GitHub
+# Actions' actions/setup-python installs under
+# /opt/hostedtoolcache/Python/<ver>/<arch>/bin/python instead. Landlock must
+# grant read+execute on whatever this resolves to, or the sandboxed
+# interpreter can't even exec itself - see _run_python_linux.
+INTERPRETER_ROOT_LINUX = str(Path(sys.executable).resolve().parent.parent)
 
 _PLATFORM = platform.system()
 
@@ -287,7 +296,14 @@ def _run_python_darwin(code):
                 argv, env={'PATH': '/usr/bin:/bin'}, cwd=scratch_dir,
                 preexec_fn=_limit_resources_darwin, timeout=TIMEOUT_SECONDS,
             )
-        except subprocess.SubprocessError:
+        except (subprocess.SubprocessError, OSError):
+            # OSError (not just SubprocessError) matters here: a preexec_fn
+            # failure is reported as SubprocessError, but a failed exec()
+            # itself - e.g. permission denied on the target binary - surfaces
+            # as a plain OSError subclass (PermissionError, FileNotFoundError,
+            # ...) raised directly from subprocess's child-error-reporting
+            # pipe, uncaught by SubprocessError alone (see the Linux sibling's
+            # comment for how this was actually hit).
             logger.exception('sandbox.darwin_preexec_failed')
             return {'status': 'unavailable'}
         if result is None:
@@ -322,7 +338,7 @@ def _run_python_linux(code):
             # here aborts before exec (see _run_with_group_timeout's docstring)
             # rather than exec'ing with a partial/weaker restriction.
             _limit_resources_linux()
-            _landlock.restrict_to(scratch_dir)
+            _landlock.restrict_to(scratch_dir, extra_read_exec_paths=(INTERPRETER_ROOT_LINUX,))
             _seccomp.apply_network_deny()
 
         # -I (isolated mode) + -S (skip all site init, including global
@@ -349,7 +365,18 @@ def _run_python_linux(code):
                 argv, env={'PATH': '/usr/bin:/bin'}, cwd=scratch_dir,
                 preexec_fn=_preexec, timeout=TIMEOUT_SECONDS,
             )
-        except subprocess.SubprocessError:
+        except (subprocess.SubprocessError, OSError):
+            # OSError, not just SubprocessError: a preexec_fn failure (e.g.
+            # Landlock/seccomp setup itself raising) is reported as
+            # SubprocessError, but a failed exec() of the interpreter binary
+            # - e.g. Landlock denying execute on a path outside the granted
+            # set - surfaces as a plain OSError subclass (PermissionError)
+            # raised directly from subprocess's child-error-reporting pipe.
+            # Hit for real in CI: GitHub Actions' actions/setup-python
+            # installs Python under /opt/hostedtoolcache/..., which wasn't
+            # covered before INTERPRETER_ROOT_LINUX was added above, and this
+            # except clause didn't catch the resulting PermissionError -
+            # it propagated uncaught instead of degrading to 'unavailable'.
             logger.exception('sandbox.linux_preexec_failed')
             return {'status': 'unavailable'}
         if result is None:

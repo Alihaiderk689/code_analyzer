@@ -159,13 +159,18 @@ def _add_rule(lib, ruleset_fd: int, path: str, access: int) -> None:
         os.close(parent_fd)
 
 
-def restrict_to(scratch_dir: str) -> None:
+def restrict_to(scratch_dir: str, extra_read_exec_paths=()) -> None:
     """Restricts the CURRENT process (meant to be called from a preexec_fn,
     i.e. after fork, before exec) to:
       - read+write+create/remove everything under scratch_dir
       - read+execute the specific system/interpreter paths actually needed to
         start Python and import stdlib modules (measured via strace, not
-        guessed - see module docstring)
+        guessed - see module docstring), plus any caller-supplied
+        `extra_read_exec_paths` - the interpreter Python actually runs as
+        isn't always under one of the hardcoded paths below (e.g. GitHub
+        Actions' `actions/setup-python` installs under
+        /opt/hostedtoolcache/..., not /usr/local like this repo's own Docker
+        image) - see sandbox.py's caller for how that path is derived.
       - nothing else at all (default-deny once any rule is installed)
 
     Raises LandlockUnsupported/LandlockSetupError rather than degrading
@@ -183,7 +188,7 @@ def restrict_to(scratch_dir: str) -> None:
         for path in ('/etc/ld.so.cache', '/etc/localtime'):
             _add_rule(lib, ruleset_fd, path, FS_READ_FILE)
 
-        for path in ('/lib', '/lib64', '/usr/lib', '/usr/local'):
+        for path in ('/lib', '/lib64', '/usr/lib', '/usr/local', *extra_read_exec_paths):
             _add_rule(lib, ruleset_fd, path, READ_ONLY_RIGHTS)
 
         _set_no_new_privs(lib)
