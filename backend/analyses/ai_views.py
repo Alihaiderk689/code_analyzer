@@ -6,6 +6,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ai.client import generate_text
+from ai.concurrency import AICapacityExhausted, ai_concurrency_slot
+from ai.prompts import UNTRUSTED_DATA_WARNING, wrap_untrusted
+from ai.validation import clean_ai_prose, is_valid_ai_code
 from core.throttling import AIRateThrottle
 
 from .models import Analysis
@@ -43,12 +46,21 @@ def _repo_context_block(analysis):
     a block describing related files so suggestions/explanation/refactor
     account for how the file is actually used elsewhere, not just its own
     contents in isolation."""
-    return f'\n\n{analysis.repo_context}\n' if analysis.repo_context else ''
+    if not analysis.repo_context:
+        return ''
+    return f'\n\n{wrap_untrusted("REPOSITORY CONTEXT", analysis.repo_context)}\n'
 
 
-def _call_ai(prompt, system_instruction):
+def _call_ai(prompt, system_instruction, user_id):
+    """Shared by Suggestions/Explanation/Refactor - centralizes both the
+    provider-failure handling (503) and the per-user/global concurrency
+    guard (429, see ai.concurrency), so a single fix in one place covers all
+    three views."""
     try:
-        return generate_text(prompt, system_instruction), None
+        with ai_concurrency_slot(user_id):
+            return generate_text(prompt, system_instruction), None
+    except AICapacityExhausted as exc:
+        return None, Response({'detail': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
     except Exception:
         return None, Response(
             {'detail': 'AI service is currently unavailable.'}, status=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -67,10 +79,16 @@ def _normalize_suggestions(raw):
     normalized = []
     for item in raw:
         if isinstance(item, dict) and isinstance(item.get('text'), str):
+            text = clean_ai_prose(item['text'])
+            if text is None:
+                continue
             category = item.get('category') if item.get('category') in _SUGGESTION_CATEGORIES else 'general'
-            normalized.append({'category': category, 'text': item['text']})
+            normalized.append({'category': category, 'text': text})
         elif isinstance(item, str):
-            normalized.append({'category': 'general', 'text': item})
+            text = clean_ai_prose(item)
+            if text is None:
+                continue
+            normalized.append({'category': 'general', 'text': text})
     return normalized
 
 
@@ -101,7 +119,7 @@ class SuggestionsView(APIView):
         prompt = (
             f'Language: {analysis.language}\n\n'
             f'Static analysis found {analysis.issues_count} issue(s):\n{json.dumps(analysis.issues, indent=2)}\n\n'
-            f'Source code:\n{analysis.source_code}'
+            f'{wrap_untrusted("SOURCE CODE", analysis.source_code)}'
             f'{_repo_context_block(analysis)}'
         )
         system_instruction = (
@@ -113,9 +131,9 @@ class SuggestionsView(APIView):
             'provided below, use them to judge how this file is actually used elsewhere (e.g. how a function '
             'is called, what a caller expects back) rather than judging the file in isolation. Respond with '
             'ONLY a JSON array of the shape [{"category": "security"|"general", "text": "<the suggestion>"}, ...], '
-            'no other text, no markdown fences.'
+            f'no other text, no markdown fences. {UNTRUSTED_DATA_WARNING}'
         )
-        text, error = _call_ai(prompt, system_instruction)
+        text, error = _call_ai(prompt, system_instruction, request.user.id)
         if error:
             return error
 
@@ -138,7 +156,7 @@ class ExplanationView(APIView):
             return Response({'explanation': analysis.ai_explanation, 'cached': True})
 
         prompt = (
-            f'Language: {analysis.language}\n\nSource code:\n{analysis.source_code}'
+            f'Language: {analysis.language}\n\n{wrap_untrusted("SOURCE CODE", analysis.source_code)}'
             f'{_repo_context_block(analysis)}'
         )
         system_instruction = (
@@ -146,13 +164,13 @@ class ExplanationView(APIView):
             'in 2-4 short paragraphs aimed at a developer unfamiliar with this code. If related files from the '
             'rest of the repository are provided below, use them to explain how this file fits into the wider '
             'codebase (what depends on it, what it depends on), not just what it does on its own. Respond with '
-            'plain text only.'
+            f'plain text only. {UNTRUSTED_DATA_WARNING}'
         )
-        text, error = _call_ai(prompt, system_instruction)
+        text, error = _call_ai(prompt, system_instruction, request.user.id)
         if error:
             return error
 
-        explanation = text.strip()
+        explanation = clean_ai_prose(text) or ''
         analysis.ai_explanation = explanation
         analysis.save(update_fields=['ai_explanation', 'updated_at'])
         return Response({'explanation': explanation, 'cached': False})
@@ -180,7 +198,7 @@ class RefactorView(APIView):
         prompt = (
             f'Language: {analysis.language}\n\n'
             f'Known issues:\n{json.dumps(analysis.issues, indent=2)}\n\n'
-            f'Source code:\n{analysis.source_code}'
+            f'{wrap_untrusted("SOURCE CODE", analysis.source_code)}'
             f'{_repo_context_block(analysis)}'
         )
         system_instruction = (
@@ -191,9 +209,9 @@ class RefactorView(APIView):
             'improve style. Respond with ONLY a JSON object of the shape '
             '{"code": "<the refactored code, no markdown fences>", "changes": [{"summary": "<what changed, one '
             'sentence>", "benefit": "<why it\'s better, one sentence>"}, ...]}, one entry per distinct change you '
-            'made, no other text.'
+            f'made, no other text. {UNTRUSTED_DATA_WARNING}'
         )
-        text, error = _call_ai(prompt, system_instruction)
+        text, error = _call_ai(prompt, system_instruction, request.user.id)
         if error:
             return error
 
@@ -208,10 +226,17 @@ class RefactorView(APIView):
 def _parse_refactor_response(text):
     """Parses the {"code", "changes"} JSON the refactor prompt asks for. Falls back to
     treating the whole response as raw code with no explanation if the model didn't
-    follow the format."""
+    follow the format - including when `code` parsed but isn't actually a usable
+    string (e.g. a malformed/adversarial response returning {"code": {...}} or
+    {"code": 123}): silently `.save()`-ing a non-string into a TextField would
+    otherwise raise uncaught at save time instead of taking this already-handled
+    fallback path. Never truncates `code` - see ai.validation's module docstring
+    for why silently cutting off code is worse than falling back."""
     try:
         data = json.loads(_strip_code_fences(text))
         code = data['code']
+        if not is_valid_ai_code(code):
+            raise TypeError('refactor response "code" field was not a usable string')
         changes = data.get('changes', [])
         if not isinstance(changes, list):
             changes = []

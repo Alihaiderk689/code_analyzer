@@ -76,8 +76,8 @@ def push_webhook_payload(
     }
 
 
-def make_webhook_event(delivery_id='d1', event_type='pull_request', payload=None, **payload_overrides):
+def make_webhook_event(delivery_id='d1', event_type='pull_request', payload=None, hook_id=None, **payload_overrides):
     if payload is None:
         payload = push_webhook_payload(**payload_overrides) if event_type == 'push' \
             else pull_request_webhook_payload(**payload_overrides)
-    return WebhookEvent.objects.create(event_type=event_type, delivery_id=delivery_id, payload=payload)
+    return WebhookEvent.objects.create(event_type=event_type, delivery_id=delivery_id, hook_id=hook_id, payload=payload)

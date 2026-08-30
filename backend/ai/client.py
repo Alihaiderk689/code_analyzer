@@ -6,7 +6,19 @@ from groq import Groq
 
 from core.execution_budget import STAGE_AI_ENRICHMENT, BudgetExceeded
 
+from .prompts import wrap_history_turn
+from .redaction import redact_secrets
+
 logger = logging.getLogger(__name__)
+
+# Only these two are ever legitimate for a history turn - 'system' is never
+# accepted here even if a caller's own validation somehow let one through
+# (see generate_chat_reply's docstring): replaying a client- or
+# provider-influenced turn as a system-role instruction would hand it the
+# highest-trust channel for no legitimate reason, since every real system
+# instruction in this app is server-authored and passed via
+# `system_instruction`, never as part of `history`.
+_ALLOWED_HISTORY_ROLES = {'user', 'assistant'}
 
 # A provider call given less than this has no realistic chance of returning a
 # usable completion; starting one anyway would burn what's left of the budget
@@ -137,18 +149,52 @@ def _call_with_fallback(messages, budget=None):
 
 
 def generate_text(prompt, system_instruction=None, budget=None):
+    """`system_instruction` must be server-authored/fixed only - never build
+    it by concatenating untrusted content (source code, repo context, ...);
+    put that in `prompt` instead, wrapped via ai.prompts.wrap_untrusted. Both
+    are redacted for repository-derived secrets immediately before the
+    provider request is built (see ai.redaction) - the last point before the
+    content leaves this application."""
     messages = []
     if system_instruction:
-        messages.append({'role': 'system', 'content': system_instruction})
-    messages.append({'role': 'user', 'content': prompt})
+        messages.append({'role': 'system', 'content': redact_secrets(system_instruction)})
+    messages.append({'role': 'user', 'content': redact_secrets(prompt)})
     return _call_with_fallback(messages, budget=budget)
 
 
-def generate_chat_reply(message, history=None, system_instruction=None):
+def generate_chat_reply(message, history=None, system_instruction=None, context=None):
+    """`system_instruction` must stay limited to trusted, server-authored
+    instructions - it is never a place for untrusted, submitted content.
+    `context` is exactly that untrusted content (e.g. the analysis being
+    discussed, built via ai.prompts.wrap_untrusted/build_analysis_context) -
+    it's placed as its own user-role message, the same trust tier every
+    other prompt-building call site already uses for untrusted data, rather
+    than folded into the system role.
+
+    `history` entries are replayed data, not verified conversation state -
+    each turn's role is restricted to {'user','assistant'} (a 'system' role
+    is dropped rather than honored, regardless of what a caller's own
+    validation allowed through) and its content is wrapped with
+    ai.prompts.wrap_history_turn, exactly like fresh untrusted content,
+    including a prior *assistant* turn - see that function's docstring for
+    why a previous reply doesn't get a free pass just because the app itself
+    generated it last time.
+
+    Everything reaching this function is redacted for repository-derived
+    secrets immediately before the provider request is built (see
+    ai.redaction) - the last point before it leaves this application."""
     messages = []
     if system_instruction:
-        messages.append({'role': 'system', 'content': system_instruction})
+        messages.append({'role': 'system', 'content': redact_secrets(system_instruction)})
     for turn in history or []:
-        messages.append({'role': turn['role'], 'content': turn['content']})
-    messages.append({'role': 'user', 'content': message})
+        role = turn.get('role')
+        if role not in _ALLOWED_HISTORY_ROLES:
+            continue
+        content = turn.get('content')
+        if not isinstance(content, str) or not content:
+            continue
+        messages.append({'role': role, 'content': redact_secrets(wrap_history_turn(role, content))})
+    if context:
+        messages.append({'role': 'user', 'content': redact_secrets(context)})
+    messages.append({'role': 'user', 'content': redact_secrets(message)})
     return _call_with_fallback(messages)

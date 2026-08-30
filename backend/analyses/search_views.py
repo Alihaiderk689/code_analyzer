@@ -4,10 +4,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import Analysis
+from .pagination import AnalysisPagination
 from .serializers import AnalysisSerializer
 
 
 class SearchView(APIView):
+    pagination_class = AnalysisPagination
+
     def get(self, request):
         query = request.query_params.get('q', '').strip()
         if not query:
@@ -25,5 +28,9 @@ class SearchView(APIView):
         if language_filter:
             queryset = queryset.filter(language__iexact=language_filter)
 
-        serializer = AnalysisSerializer(queryset, many=True)
-        return Response({'query': query, 'count': queryset.count(), 'results': serializer.data})
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(queryset, request)
+        serializer = AnalysisSerializer(page, many=True)
+        response = paginator.get_paginated_response(serializer.data)
+        response.data['query'] = query
+        return response

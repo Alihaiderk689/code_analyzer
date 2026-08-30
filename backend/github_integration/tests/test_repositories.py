@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+from django.conf import settings
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from rest_framework import status
@@ -13,8 +14,8 @@ from core.execution_budget import (
 )
 
 from ..services.fetch_budget import TRUNCATED_BUDGET_EXHAUSTED, FetchBudgetExceeded
-from ..services.github_client import GitHubAPIError, GitHubAuthError, GitHubRateLimitError
-from ..services.repository_service import RepositoryService
+from ..services.github_client import GitHubAPIError, GitHubAuthError, GitHubFileTooLargeError, GitHubRateLimitError
+from ..services.repository_service import RepositoryAccessDeniedError, RepositoryService
 from .factories import TEST_ENCRYPTION_KEY, make_authenticated_client, make_integration, make_repository, make_user
 
 _SETTINGS = dict(
@@ -30,6 +31,9 @@ class RepositoryServiceTests(TestCase):
     def test_select_repository_creates_webhook_and_stores_id(self, mock_client_cls, mock_build_index):
         integration = make_integration(make_user())
         mock_client_cls.return_value.create_webhook.return_value = {'id': 12345}
+        mock_client_cls.return_value.list_user_repositories.return_value = [
+            {'id': 99, 'full_name': 'octocat/hello-world'},
+        ]
 
         repository = RepositoryService().select_repository(integration, 99, 'octocat/hello-world')
 
@@ -54,11 +58,44 @@ class RepositoryServiceTests(TestCase):
         integration = make_integration(make_user())
         make_repository(integration, repository_id=99, webhook_id=None, is_active=False)
         mock_client_cls.return_value.create_webhook.return_value = {'id': 777}
+        mock_client_cls.return_value.list_user_repositories.return_value = [
+            {'id': 99, 'full_name': 'octocat/hello-world'},
+        ]
 
         repository = RepositoryService().select_repository(integration, 99, 'octocat/hello-world')
 
         self.assertEqual(repository.webhook_id, 777)
         self.assertTrue(repository.is_active)
+
+    @patch('github_integration.services.repository_service.GitHubClient')
+    def test_selecting_a_repository_not_owned_by_the_user_is_rejected(self, mock_client_cls):
+        integration = make_integration(make_user())
+        # The user's own GitHub account can't see this repo at all - only
+        # *other* repos are returned.
+        mock_client_cls.return_value.list_user_repositories.return_value = [
+            {'id': 1, 'full_name': 'octocat/some-other-repo'},
+        ]
+
+        with self.assertRaises(RepositoryAccessDeniedError):
+            RepositoryService().select_repository(integration, 99, 'someone-else/private-repo')
+
+        mock_client_cls.return_value.create_webhook.assert_not_called()
+        self.assertFalse(GitHubRepository.objects.filter(repository_id=99).exists())
+
+    @patch('github_integration.services.repository_service.GitHubClient')
+    def test_selecting_with_a_mismatched_id_and_name_pair_is_rejected(self, mock_client_cls):
+        integration = make_integration(make_user())
+        # The user really does own repo 99, but under a different name than
+        # what was submitted - a client sending a mismatched pair must not
+        # be able to get a webhook created under the wrong name.
+        mock_client_cls.return_value.list_user_repositories.return_value = [
+            {'id': 99, 'full_name': 'octocat/hello-world'},
+        ]
+
+        with self.assertRaises(RepositoryAccessDeniedError):
+            RepositoryService().select_repository(integration, 99, 'octocat/a-different-repo')
+
+        mock_client_cls.return_value.create_webhook.assert_not_called()
 
     @patch('github_integration.services.repository_service.GitHubClient')
     def test_deselect_repository_deletes_webhook_and_deactivates(self, mock_client_cls):
@@ -178,6 +215,19 @@ class RepositorySelectViewTests(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data['full_name'], 'octocat/hello-world')
+
+    @patch('github_integration.repository_views.RepositoryService')
+    def test_rejects_a_repository_not_accessible_to_the_user(self, mock_service_cls):
+        client, user = make_authenticated_client()
+        make_integration(user)
+        mock_service_cls.return_value.select_repository.side_effect = RepositoryAccessDeniedError('nope')
+
+        response = client.post(reverse('github-repositories-select'), {
+            'repository_id': 1, 'repository_name': 'octocat/hello-world',
+        })
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertFalse(GitHubRepository.objects.exists())
 
 
 @override_settings(**_SETTINGS)
@@ -320,7 +370,7 @@ class RepositoryFileContentViewTests(TestCase):
         self.assertEqual(response.data['content'], 'print("hi")\n')
         self.assertEqual(response.data['language'], 'Python')
         mock_client_cls.return_value.get_file_content.assert_called_once_with(
-            'octocat', 'hello-world', 'app.py', repository.default_branch,
+            'octocat', 'hello-world', 'app.py', repository.default_branch, max_size_bytes=settings.GITHUB_MAX_FILE_SIZE_BYTES,
         )
 
     @override_settings(GITHUB_MAX_FILE_SIZE_BYTES=5)
@@ -329,7 +379,9 @@ class RepositoryFileContentViewTests(TestCase):
         client, user = make_authenticated_client()
         integration = make_integration(user)
         repository = make_repository(integration)
-        mock_client_cls.return_value.get_file_content.return_value = 'this is way more than five bytes'
+        # The real GitHubClient now raises this itself, before ever
+        # returning oversized content.
+        mock_client_cls.return_value.get_file_content.side_effect = GitHubFileTooLargeError(33, 5)
 
         response = client.get(reverse('github-repository-file', args=[repository.pk]), {'path': 'app.py'})
 

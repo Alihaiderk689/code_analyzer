@@ -33,7 +33,7 @@ from core.execution_budget import (
 
 from ..models import FileAnalysis, PullRequestAnalysis, RepositoryIndex
 from .fetch_budget import TRUNCATED_BUDGET_EXHAUSTED, FetchBudget, FetchBudgetExceeded
-from .github_client import GitHubAPIError, GitHubClient
+from .github_client import GitHubAPIError, GitHubClient, GitHubFileTooLargeError
 from .performance_service import find_performance_issues
 
 logger = logging.getLogger(__name__)
@@ -410,13 +410,14 @@ class PRAnalysisService:
                 continue
 
             try:
-                content = client.get_file_content(owner, repo, path, pr_analysis.commit_sha)
+                content = client.get_file_content(
+                    owner, repo, path, pr_analysis.commit_sha, max_size_bytes=settings.GITHUB_MAX_FILE_SIZE_BYTES,
+                )
+            except GitHubFileTooLargeError:
+                logger.info('github_pr_analysis.file_skipped', extra={'path': path, 'reason': FileSkipReason.TOO_LARGE})
+                continue
             except GitHubAPIError:
                 logger.warning('github_pr_analysis.file_fetch_failed', exc_info=True, extra={'path': path})
-                continue
-
-            if len(content.encode('utf-8')) > settings.GITHUB_MAX_FILE_SIZE_BYTES:
-                logger.info('github_pr_analysis.file_skipped', extra={'path': path, 'reason': FileSkipReason.TOO_LARGE})
                 continue
 
             if language == 'Python' and settings_source is None:
@@ -470,9 +471,11 @@ class PRAnalysisService:
 
         owner, _, repo = repository.full_name.partition('/')
         client = GitHubClient(access_token, budget=budget)
-        content = client.get_file_content(owner, repo, path, repository.default_branch)
-
-        if len(content.encode('utf-8')) > settings.GITHUB_MAX_FILE_SIZE_BYTES:
+        try:
+            content = client.get_file_content(
+                owner, repo, path, repository.default_branch, max_size_bytes=settings.GITHUB_MAX_FILE_SIZE_BYTES,
+            )
+        except GitHubFileTooLargeError:
             return {
                 'path': path, 'language': language, 'skipped': True,
                 'skip_reason': FileSkipReason.TOO_LARGE, 'issues': [], 'score': None,
@@ -564,7 +567,12 @@ class PRAnalysisService:
                     continue
 
                 try:
-                    content = client.get_file_content(owner, repo, related_path, repository.default_branch)
+                    content = client.get_file_content(
+                        owner, repo, related_path, repository.default_branch,
+                        max_size_bytes=settings.GITHUB_MAX_FILE_SIZE_BYTES,
+                    )
+                except GitHubFileTooLargeError:
+                    continue
                 except GitHubAPIError:
                     # Not a FetchBudgetExceeded - that isn't a GitHubAPIError
                     # subclass precisely so it can't be swallowed here as a
@@ -572,9 +580,6 @@ class PRAnalysisService:
                     logger.warning(
                         'github_context_check.related_fetch_failed', exc_info=True, extra={'path': related_path},
                     )
-                    continue
-
-                if len(content.encode('utf-8')) > settings.GITHUB_MAX_FILE_SIZE_BYTES:
                     continue
 
                 if related_language == 'Python' and settings_source is None:

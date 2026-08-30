@@ -3,9 +3,10 @@ from unittest.mock import patch
 from django.test import TestCase, override_settings
 
 from ..models import PullRequestAnalysis, RepositoryFileNode, RepositoryIndex
-from ..services.github_client import GitHubAPIError
+from ..services.github_client import GitHubAPIError, GitHubFileTooLargeError
 from ..services.pr_analysis_service import MAX_CONTEXT_RELATED_FILES, FileSkipReason, PRAnalysisService, _classify_file
-from .factories import make_integration, make_pr_analysis, make_repository, make_user
+from ..services.repo_index_service import RepositoryIndexService
+from .factories import TEST_ENCRYPTION_KEY, make_integration, make_pr_analysis, make_repository, make_user
 
 
 class ClassifyFileTests(TestCase):
@@ -124,7 +125,11 @@ class PRAnalysisServiceTests(TestCase):
         mock_client_cls.return_value.list_pull_request_files.return_value = [
             {'filename': 'huge.py', 'status': 'modified', 'patch': '@@ -0,0 +1,1 @@\n+x = 1'},
         ]
-        mock_client_cls.return_value.get_file_content.return_value = 'x = 1\n' * 1000
+        # The real GitHubClient now raises this itself, from inside
+        # get_file_content, before ever returning oversized content - the
+        # mock simulates that pre-check, not the old "return it, then check
+        # its length" behavior.
+        mock_client_cls.return_value.get_file_content.side_effect = GitHubFileTooLargeError(999, 10)
 
         with override_settings(GITHUB_MAX_FILE_SIZE_BYTES=10):
             results = PRAnalysisService().analyze(self.pr_analysis, 'access-token')
@@ -296,3 +301,67 @@ class AnalyzeFileWithContextTests(TestCase):
         self.assertTrue(result['skipped'])
         self.assertEqual(result['related'], [])
         mock_client_cls.return_value.get_file_content.assert_not_called()
+
+
+@override_settings(GITHUB_MAX_FILE_SIZE_BYTES=500_000, GITHUB_TOKEN_ENCRYPTION_KEY=TEST_ENCRYPTION_KEY)
+class IndexToContextEndToEndTests(TestCase):
+    """Full flow the user actually exercises: connect a repo -> the repo gets
+    indexed (RepositoryIndexService, real dependency-graph build, not a
+    hand-built RepositoryFileNode fixture) -> click 'Analyze with repo
+    context' on views.py (PRAnalysisService.analyze_file_with_context).
+    Regression coverage for the bug where Django-style relative imports
+    (`from .serializers import X`, `from . import models`) never produced an
+    edge in the index, so this second step silently found no neighbors."""
+
+    def setUp(self):
+        self.repository = make_repository(make_integration(make_user()))
+        self.file_contents = {
+            'accounts/views.py': (
+                'from .serializers import UserSerializer\n'
+                'from . import models\n'
+                '\n'
+                'def get_user(request):\n'
+                '    return UserSerializer(models.User.objects.first()).data\n'
+            ),
+            'accounts/serializers.py': (
+                'from .models import User\n'
+                '\n'
+                'class UserSerializer:\n'
+                '    model = User\n'
+            ),
+            'accounts/models.py': 'class User:\n    pass\n',
+        }
+
+    def _fetch(self, owner, repo, path, ref, max_size_bytes=None):
+        return self.file_contents[path]
+
+    @patch('github_integration.services.pr_analysis_service.GitHubClient')
+    @patch('github_integration.services.repo_index_service.GitHubClient')
+    def test_views_py_discovers_serializers_and_models_after_real_indexing(
+        self, mock_index_client_cls, mock_analysis_client_cls,
+    ):
+        mock_index_client_cls.return_value.get_repository_tree.return_value = {
+            'entries': [{'path': p, 'type': 'file', 'size': 100} for p in self.file_contents],
+            'truncated': False,
+        }
+        mock_index_client_cls.return_value.get_file_content.side_effect = self._fetch
+
+        index = RepositoryIndexService().build(self.repository)
+        self.assertEqual(index.status, RepositoryIndex.Status.COMPLETED)
+        self.assertEqual(index.files_indexed, 3)
+
+        mock_analysis_client_cls.return_value.get_file_content.side_effect = self._fetch
+        # accounts/views.py is Python, so analyze_file_by_path also does a
+        # best-effort settings.py lookup (_find_settings_source) - give it an
+        # empty tree rather than leaving get_repository_tree() an
+        # unconfigured MagicMock.
+        mock_analysis_client_cls.return_value.get_repository_tree.return_value = {'entries': [], 'truncated': False}
+
+        result = PRAnalysisService().analyze_file_with_context(self.repository, 'accounts/views.py', 'token')
+
+        self.assertFalse(result['skipped'])
+        related_paths = {r['path'] for r in result['related']}
+        self.assertEqual(related_paths, {'accounts/serializers.py', 'accounts/models.py'})
+        relations = {r['path']: r['relation'] for r in result['related']}
+        self.assertEqual(relations['accounts/serializers.py'], 'imports')
+        self.assertEqual(relations['accounts/models.py'], 'imports')

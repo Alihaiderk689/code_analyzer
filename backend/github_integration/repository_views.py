@@ -15,9 +15,9 @@ from core.execution_budget import REASON_REQUEST_BUDGET_EXHAUSTED, BudgetExceede
 
 from .services.fetch_budget import TRUNCATED_BUDGET_EXHAUSTED, FetchBudgetExceeded
 from .services.file_check_rate_limit import get_file_check_status
-from .services.github_client import GitHubAPIError, GitHubAuthError, GitHubClient, GitHubRateLimitError
+from .services.github_client import GitHubAPIError, GitHubAuthError, GitHubClient, GitHubFileTooLargeError, GitHubRateLimitError
 from .services.pr_analysis_service import FileSkipReason, PRAnalysisService, classify_path
-from .services.repository_service import RepositoryService
+from .services.repository_service import RepositoryAccessDeniedError, RepositoryService
 from .tasks import build_repository_index
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,11 @@ class RepositorySelectView(APIView):
                 integration,
                 serializer.validated_data['repository_id'],
                 serializer.validated_data['repository_name'],
+            )
+        except RepositoryAccessDeniedError:
+            return Response(
+                {'detail': 'That repository is not accessible with your connected GitHub account.'},
+                status=status.HTTP_403_FORBIDDEN,
             )
         except GitHubAPIError as exc:
             return _handle_github_error(exc, integration)
@@ -180,15 +185,16 @@ class RepositoryFileContentView(APIView):
 
         owner, _, repo = repository.full_name.partition('/')
         try:
-            content = GitHubClient(integration.get_access_token()).get_file_content(owner, repo, path, repository.default_branch)
-        except GitHubAPIError as exc:
-            return _handle_github_error(exc, integration)
-
-        if len(content.encode('utf-8')) > settings.GITHUB_MAX_FILE_SIZE_BYTES:
+            content = GitHubClient(integration.get_access_token()).get_file_content(
+                owner, repo, path, repository.default_branch, max_size_bytes=settings.GITHUB_MAX_FILE_SIZE_BYTES,
+            )
+        except GitHubFileTooLargeError:
             return Response({
                 'path': path, 'language': language, 'skipped': True,
                 'skip_reason': FileSkipReason.TOO_LARGE, 'content': None,
             })
+        except GitHubAPIError as exc:
+            return _handle_github_error(exc, integration)
 
         return Response({'path': path, 'language': language, 'skipped': False, 'skip_reason': None, 'content': content})
 

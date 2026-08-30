@@ -61,6 +61,59 @@ class BuildInlineCommentsTests(TestCase):
         self.assertIn('Possible SQL injection.', body)
         self.assertIn('Use parameterized queries instead.', body)
 
+    def test_ai_explanation_containing_a_mention_is_defanged(self):
+        # Simulates a prompt-injection attempt succeeding against the AI
+        # enrichment step (analyses.services.ai_security_service) and the
+        # model returning text containing a live-looking @mention - this must
+        # not become a real GitHub notification when posted.
+        file_analysis = make_file_analysis(self.pr_analysis, issues=[
+            _issue(line=2, explanation='cc @someone-unrelated please review this urgently'),
+        ])
+        inline, _overflow = CommentService._build_inline_comments([(file_analysis, _PATCH)])
+        body = inline[0]['body']
+        self.assertNotIn('@someone-unrelated', body)
+        self.assertIn('someone-unrelated', body)  # text preserved, just defanged
+
+    def test_ai_remediation_containing_raw_html_is_stripped(self):
+        file_analysis = make_file_analysis(self.pr_analysis, issues=[
+            _issue(line=2, remediation='<img src=x onerror=alert(1)>Use a safer approach.'),
+        ])
+        inline, _overflow = CommentService._build_inline_comments([(file_analysis, _PATCH)])
+        body = inline[0]['body']
+        self.assertNotIn('<img', body)
+        self.assertNotIn('onerror', body)
+        self.assertIn('Use a safer approach.', body)
+
+    def test_ai_text_containing_a_url_is_defanged_not_auto_linked(self):
+        file_analysis = make_file_analysis(self.pr_analysis, issues=[
+            _issue(line=2, explanation='See https://evil.example.com/phish for details.'),
+        ])
+        inline, _overflow = CommentService._build_inline_comments([(file_analysis, _PATCH)])
+        body = inline[0]['body']
+        self.assertIn('`https://evil.example.com/phish`', body)
+
+    def test_oversized_ai_text_is_truncated(self):
+        file_analysis = make_file_analysis(self.pr_analysis, issues=[
+            _issue(line=2, explanation='A' * 5000),
+        ])
+        inline, _overflow = CommentService._build_inline_comments([(file_analysis, _PATCH)])
+        body = inline[0]['body']
+        # Well under the raw 5000 chars - proves truncation actually happened,
+        # without hardcoding the exact cap here.
+        self.assertLess(len(body), 2000)
+
+    def test_non_string_explanation_and_remediation_are_dropped_not_posted_raw(self):
+        # A malformed/adversarial AI response could in principle leave a
+        # non-string value on these fields (see ai_security_service's own
+        # type-checking) - CommentService must not choke on or blindly
+        # stringify one either, as a second, independent layer.
+        file_analysis = make_file_analysis(self.pr_analysis, issues=[
+            _issue(line=2, explanation={'not': 'a string'}, remediation=['also', 'not', 'a', 'string']),
+        ])
+        inline, _overflow = CommentService._build_inline_comments([(file_analysis, _PATCH)])
+        body = inline[0]['body']
+        self.assertNotIn('Suggested fix', body)  # remediation section omitted, not garbled
+
 
 class BuildSummaryBodyTests(TestCase):
     def setUp(self):
@@ -72,6 +125,22 @@ class BuildSummaryBodyTests(TestCase):
         self.assertIn('82.5/100', body)
         self.assertIn('Analyzed 3 file(s)', body)
 
+    def test_malicious_summary_is_sanitized(self):
+        # summary is currently always built from numeric counts (see
+        # pr_analysis_service._build_summary), but nothing enforces that at
+        # this layer - it must be sanitized like every other free-text field
+        # reaching a GitHub review body, not exempted because it happens to
+        # be safe today.
+        pr_analysis = make_pr_analysis(
+            self.repository,
+            summary='cc @someone <b>bold</b> see https://evil.example.com/phish for details',
+        )
+        body = CommentService._build_summary_body(pr_analysis, overflow=[])
+        self.assertNotIn('@someone', body)
+        self.assertNotIn('<b>', body)
+        self.assertIn('`https://evil.example.com/phish`', body)
+        self.assertIn('someone', body)  # text preserved, just defanged
+
     def test_overflow_issues_are_listed_with_file_and_line(self):
         pr_analysis = make_pr_analysis(self.repository)
         body = CommentService._build_summary_body(pr_analysis, overflow=[('app.py', _issue(line=42))])
@@ -82,6 +151,14 @@ class BuildSummaryBodyTests(TestCase):
         body = CommentService._build_summary_body(pr_analysis, overflow=[('app.py', _issue(line=None))])
         self.assertIn('`app.py`', body)
         self.assertNotIn('app.py:None', body)
+
+    def test_overflow_message_is_sanitized(self):
+        pr_analysis = make_pr_analysis(self.repository)
+        body = CommentService._build_summary_body(
+            pr_analysis, overflow=[('app.py', _issue(line=1, message='cc @someone <b>bold</b> attempt'))],
+        )
+        self.assertNotIn('@someone', body)
+        self.assertNotIn('<b>', body)
 
 
 class PostReviewTests(TestCase):

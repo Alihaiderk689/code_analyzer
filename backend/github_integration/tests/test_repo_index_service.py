@@ -46,6 +46,36 @@ class RepositoryIndexServiceTests(TestCase):
         self.assertIn('def helper', utils_node.summary)
 
     @patch('github_integration.services.repo_index_service.GitHubClient')
+    def test_builds_graph_for_django_style_relative_imports(self, mock_client_cls):
+        # Real Django app shape: views.py depends on serializers.py and
+        # models.py via `from .x import Y`/`from . import x`, and
+        # serializers.py depends on models.py the same way. Regression test
+        # for the bug where the old regex-based resolver mishandled every
+        # leading dot, so none of these edges were ever recorded.
+        mock_client_cls.return_value.get_repository_tree.return_value = _tree([
+            _entry('accounts/views.py'), _entry('accounts/serializers.py'), _entry('accounts/models.py'),
+        ])
+        mock_client_cls.return_value.get_file_content.side_effect = lambda owner, repo, path, ref: {
+            'accounts/views.py': (
+                'from .serializers import UserSerializer\n'
+                'from . import models\n'
+            ),
+            'accounts/serializers.py': 'from .models import User\n',
+            'accounts/models.py': 'from django.db import models\n',
+        }[path]
+
+        index = RepositoryIndexService().build(self.repository)
+
+        views_node = RepositoryFileNode.objects.get(index=index, path='accounts/views.py')
+        serializers_node = RepositoryFileNode.objects.get(index=index, path='accounts/serializers.py')
+        models_node = RepositoryFileNode.objects.get(index=index, path='accounts/models.py')
+
+        self.assertCountEqual(views_node.imports, ['accounts/serializers.py', 'accounts/models.py'])
+        self.assertCountEqual(serializers_node.imports, ['accounts/models.py'])
+        self.assertCountEqual(serializers_node.imported_by, ['accounts/views.py'])
+        self.assertCountEqual(models_node.imported_by, ['accounts/views.py', 'accounts/serializers.py'])
+
+    @patch('github_integration.services.repo_index_service.GitHubClient')
     def test_skips_non_indexable_language(self, mock_client_cls):
         mock_client_cls.return_value.get_repository_tree.return_value = _tree([_entry('main.go')])
 
