@@ -5,30 +5,51 @@ import { scoreColor, formatScore, STATUS_LABEL } from '../lib/format'
 import { ApiError } from '../lib/api'
 
 const GRID_COLUMNS = '1.3fr 0.9fr 0.7fr 0.9fr 0.6fr'
+const PAGE_SIZE = 20
 
 export default function History() {
   const navigate = useNavigate()
   const [rows, setRows] = useState(null)
+  const [count, setCount] = useState(0)
+  const [page, setPage] = useState(1)
   const [query, setQuery] = useState('')
   const [error, setError] = useState('')
   const [busyId, setBusyId] = useState(null)
   const [clearing, setClearing] = useState(false)
 
+  const applyPage = (data) => {
+    setRows(data.results)
+    setCount(data.count)
+  }
+
   useEffect(() => {
-    listHistory()
-      .then((data) => setRows(data.results))
+    listHistory({ page: 1 })
+      .then(applyPage)
       .catch((err) => setError(err instanceof ApiError ? err.message : 'Could not load history.'))
   }, [])
 
+  // Resets to page 1 whenever the search query changes (debounced), so
+  // switching from "browsing page 3 of everything" to a new search term
+  // doesn't silently request a page number that may not exist for the new
+  // result set.
   useEffect(() => {
     const trimmed = query.trim()
     const handle = setTimeout(() => {
-      const load = trimmed ? searchAnalyses(trimmed).then((d) => d.results) : listHistory().then((d) => d.results)
-      load.then(setRows).catch((err) => setError(err instanceof ApiError ? err.message : 'Search failed.'))
+      setPage(1)
+      const load = trimmed ? searchAnalyses(trimmed, { page: 1 }) : listHistory({ page: 1 })
+      load.then(applyPage).catch((err) => setError(err instanceof ApiError ? err.message : 'Search failed.'))
     }, 300)
     return () => clearTimeout(handle)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query])
+
+  useEffect(() => {
+    if (page === 1) return // already loaded by the effects above
+    const trimmed = query.trim()
+    const load = trimmed ? searchAnalyses(trimmed, { page }) : listHistory({ page })
+    load.then(applyPage).catch((err) => setError(err instanceof ApiError ? err.message : 'Could not load history.'))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [page])
 
   const handleDelete = async (e, row) => {
     e.stopPropagation()
@@ -45,12 +66,14 @@ export default function History() {
   }
 
   const handleClearAll = async () => {
-    if (!rows?.length) return
-    if (!window.confirm(`Delete all ${rows.length} analyses? This cannot be undone.`)) return
+    if (!count) return
+    if (!window.confirm(`Delete all ${count} analyses? This cannot be undone.`)) return
     setClearing(true)
     try {
       await clearHistory()
       setRows([])
+      setCount(0)
+      setPage(1)
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Could not clear history.')
     } finally {
@@ -74,7 +97,7 @@ export default function History() {
           <button
             className="btn btn-outline"
             style={{ padding: '9px 16px', fontSize: 13, whiteSpace: 'nowrap' }}
-            disabled={clearing || !rows?.length}
+            disabled={clearing || !count}
             onClick={handleClearAll}
           >
             {clearing ? 'Clearing…' : 'Clear all'}
@@ -140,6 +163,30 @@ export default function History() {
           </div>
         ))}
       </div>
+
+      {count > PAGE_SIZE && (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 16, marginTop: 20 }}>
+          <button
+            className="btn btn-outline"
+            style={{ padding: '8px 16px', fontSize: 13 }}
+            disabled={page <= 1}
+            onClick={() => setPage((p) => p - 1)}
+          >
+            ← Previous
+          </button>
+          <span style={{ fontSize: 13, color: 'var(--color-text-secondary-2)' }}>
+            Page {page} of {Math.max(1, Math.ceil(count / PAGE_SIZE))}
+          </span>
+          <button
+            className="btn btn-outline"
+            style={{ padding: '8px 16px', fontSize: 13 }}
+            disabled={page >= Math.max(1, Math.ceil(count / PAGE_SIZE))}
+            onClick={() => setPage((p) => p + 1)}
+          >
+            Next →
+          </button>
+        </div>
+      )}
     </div>
   )
 }

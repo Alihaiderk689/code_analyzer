@@ -26,7 +26,8 @@ class WebhookVerificationError(Exception):
 
 class WebhookService:
     def receive(
-        self, *, payload_body: bytes, signature_header: str, event_type: str, delivery_id: str, secret: str,
+        self, *, payload_body: bytes, signature_header: str, event_type: str, delivery_id: str,
+        secret: str, hook_id: int | None = None,
     ) -> tuple[WebhookEvent, bool]:
         """Returns (event, should_process). should_process is False for
         duplicate deliveries (an already-seen delivery_id) and for events/
@@ -43,7 +44,9 @@ class WebhookService:
             # poisoning whatever outer transaction this is called within
             # (tests wrap each test in one, and callers may too).
             with transaction.atomic():
-                event = WebhookEvent.objects.create(event_type=event_type, delivery_id=delivery_id, payload=payload)
+                event = WebhookEvent.objects.create(
+                    event_type=event_type, delivery_id=delivery_id, hook_id=hook_id, payload=payload,
+                )
         except IntegrityError:
             logger.info('github_webhook.duplicate_delivery', extra={'delivery_id': delivery_id})
             return WebhookEvent.objects.get(delivery_id=delivery_id), False

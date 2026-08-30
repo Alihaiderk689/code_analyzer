@@ -15,6 +15,15 @@ from .github_client import GitHubAPIError, GitHubClient
 logger = logging.getLogger(__name__)
 
 
+class RepositoryAccessDeniedError(Exception):
+    """The requested repository_id/repository_name isn't among the repos the
+    user's own GitHub token can actually access - raised *before* any webhook
+    is created or DB row written. Without this check, the only thing
+    stopping a request for a repo the user doesn't control was GitHub's own
+    403/404 on the webhook-creation call - relying solely on that is exactly
+    the gap this guards against."""
+
+
 class RepositoryService:
     def list_available_repositories(self, integration: GitHubIntegration) -> list[dict]:
         client = GitHubClient(integration.get_access_token())
@@ -28,6 +37,8 @@ class RepositoryService:
             # Already monitored with a live webhook - selecting it again is a
             # no-op, not an error, and mustn't create a second webhook.
             return existing
+
+        self._verify_user_can_access(integration, repository_id, repository_name)
 
         # Only one repository monitored at a time per integration - selecting a
         # new one stops monitoring (and removes the webhook from) whatever was
@@ -61,6 +72,25 @@ class RepositoryService:
         # tasks.process_push_webhook for what keeps it fresh afterward.
         build_repository_index.delay(repository.id)
         return repository
+
+    def _verify_user_can_access(self, integration: GitHubIntegration, repository_id: int, repository_name: str) -> None:
+        """Cross-checks the client-supplied repository_id/repository_name
+        against the user's own GitHub repos (GET /user/repos, scoped by
+        their token) *before* select_repository creates a webhook or DB row
+        - rather than finding out only when GitHub itself rejects the
+        webhook-creation call. Also catches a mismatched id/name pair (the
+        serializer validates each field's shape independently, not that they
+        actually refer to the same repo)."""
+        available = self.list_available_repositories(integration)
+        match = next((repo for repo in available if repo['id'] == repository_id), None)
+        if match is None or match['full_name'] != repository_name:
+            logger.warning(
+                'github_repository.access_denied',
+                extra={'repository_id': repository_id, 'repository_name': repository_name},
+            )
+            raise RepositoryAccessDeniedError(
+                f"Repository {repository_name!r} (id={repository_id}) is not accessible with this GitHub account.",
+            )
 
     def deselect_repository(self, integration: GitHubIntegration, repository: GitHubRepository) -> None:
         if repository.webhook_id:

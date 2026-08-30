@@ -45,6 +45,21 @@ class GitHubAuthError(GitHubAPIError):
     the GitHubIntegration as needing reconnect rather than retrying."""
 
 
+class GitHubFileTooLargeError(GitHubAPIError):
+    """The file's `size` (from the Contents API response, before any
+    base64-decoding is attempted) exceeds the caller's `max_size_bytes`.
+    Raised as early as possible specifically to avoid the decode/UTF-8-encode
+    cost (and holding both the raw and decoded copies in memory) for a file
+    that's going to be skipped anyway - the HTTP fetch itself already
+    happened by the time `size` is known, since the Contents API returns
+    both fields in one response."""
+
+    def __init__(self, size: int, max_size_bytes: int):
+        super().__init__(f'File is {size} bytes, over the {max_size_bytes}-byte limit.')
+        self.size = size
+        self.max_size_bytes = max_size_bytes
+
+
 class GitHubRateLimitError(GitHubAPIError):
     """403/429 with rate-limit headers exhausted. Carries `reset_at` (unix
     timestamp) so callers (Celery tasks) can retry at exactly the right time
@@ -243,9 +258,18 @@ class GitHubClient:
     def list_pull_request_files(self, owner: str, repo: str, pr_number: int) -> list[dict]:
         return self._paginated(f'/repos/{owner}/{repo}/pulls/{pr_number}/files')
 
-    def get_file_content(self, owner: str, repo: str, path: str, ref: str) -> str:
+    def get_file_content(
+        self, owner: str, repo: str, path: str, ref: str, max_size_bytes: Optional[int] = None,
+    ) -> str:
         import base64
         data = self._request('GET', f'/repos/{owner}/{repo}/contents/{path}', params={'ref': ref}).json()
+        # `size` is already in this same response, alongside `content` - check
+        # it before the base64-decode/UTF-8-encode work (and holding both the
+        # raw and decoded copies in memory) rather than after, for a file
+        # that's going to be discarded as too-large either way.
+        size = data.get('size')
+        if max_size_bytes is not None and isinstance(size, int) and size > max_size_bytes:
+            raise GitHubFileTooLargeError(size, max_size_bytes)
         if data.get('encoding') != 'base64':
             raise GitHubAPIError(f'Unexpected content encoding for {path}: {data.get("encoding")}')
         return base64.b64decode(data['content']).decode('utf-8', errors='replace')

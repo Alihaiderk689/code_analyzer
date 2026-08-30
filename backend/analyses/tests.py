@@ -274,6 +274,20 @@ class AnalysisOwnershipTests(APITestCase):
         own = self.client.get(reverse('analysis-list'))
         self.assertEqual(own.data['count'], 1)
 
+    def test_list_view_is_paginated(self):
+        for i in range(24):
+            Analysis.objects.create(owner=self.owner, name=f'extra-{i}.py', language='Python')
+        # self.analysis (from setUp) + 24 new ones = 25 total.
+
+        page_1 = self.client.get(reverse('analysis-list'))
+        self.assertEqual(page_1.data['count'], 25)
+        self.assertEqual(len(page_1.data['results']), 20)
+        self.assertIsNotNone(page_1.data['next'])
+
+        page_2 = self.client.get(reverse('analysis-list'), {'page': 2})
+        self.assertEqual(len(page_2.data['results']), 5)
+        self.assertIsNone(page_2.data['next'])
+
 
 class AnalysisLifecycleTests(APITestCase):
     def setUp(self):
@@ -561,6 +575,17 @@ class SearchTests(APITestCase):
         response = self.client.get(reverse('search'), {'q': 'payment'})
         self.assertEqual(response.data['count'], 1)
 
+    def test_results_are_paginated(self):
+        for i in range(24):
+            Analysis.objects.create(owner=self.user, name=f'payment_extra_{i}.py', language='Python')
+
+        response = self.client.get(reverse('search'), {'q': 'payment'})
+
+        self.assertEqual(response.data['count'], 25)
+        self.assertEqual(len(response.data['results']), 20)
+        self.assertIsNotNone(response.data['next'])
+        self.assertEqual(response.data['query'], 'payment')
+
 
 class SecurityAnalysisViewTests(APITestCase):
     def setUp(self):
@@ -570,6 +595,26 @@ class SecurityAnalysisViewTests(APITestCase):
             source_code='password = "hardcoded123"\n',
             status=Analysis.Status.COMPLETED, quality_score=90.0,
         )
+
+    def test_carries_both_the_analysis_create_and_ai_throttle_scopes(self):
+        # SecurityAnalysisView triggers the same AI fallback chain as
+        # Suggestions/Explanation/Refactor/chat (via AISecurityService) - it
+        # must draw on the same `ai` throttle budget, not let a user spend a
+        # second, separate budget on AI calls just by hitting this endpoint
+        # instead of one of the others.
+        from analyses.security_views import SecurityAnalysisView
+        from core.throttling import AIRateThrottle, AnalysisCreateRateThrottle
+        self.assertIn(AIRateThrottle, SecurityAnalysisView.throttle_classes)
+        self.assertIn(AnalysisCreateRateThrottle, SecurityAnalysisView.throttle_classes)
+
+    @patch('analyses.security_views.SecurityAnalysisService')
+    def test_concurrent_ai_request_from_same_user_is_rejected(self, mock_service_cls):
+        from ai.concurrency import ai_concurrency_slot
+        with ai_concurrency_slot(user_id=self.user.id):
+            response = self.client.post(reverse('analysis-security', args=[self.analysis.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        mock_service_cls.return_value.analyze.assert_not_called()
 
     def test_post_requires_authentication(self):
         anon = APIClient()
@@ -784,6 +829,32 @@ class RefactorViewTests(APITestCase):
         response = other_client.get(reverse('analysis-refactor', args=[self.analysis.id]))
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    @patch('analyses.ai_views.generate_text')
+    def test_malformed_code_field_falls_back_instead_of_saving_a_non_string(self, mock_generate):
+        # A malformed/adversarial provider response - {"code": {...}} instead
+        # of a string - must not reach analysis.ai_refactored_code (a
+        # TextField) unvalidated: that would raise uncaught at .save() time
+        # instead of taking the same graceful fallback a JSON-parse failure
+        # already gets.
+        mock_generate.return_value = '{"code": {"unexpected": "object"}, "changes": []}'
+        response = self.client.get(reverse('analysis-refactor', args=[self.analysis.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIsInstance(response.data['refactored_code'], str)
+        self.analysis.refresh_from_db()
+        self.assertIsInstance(self.analysis.ai_refactored_code, str)
+
+    @patch('analyses.ai_views.generate_text')
+    def test_concurrent_ai_request_from_same_user_is_rejected(self, mock_generate):
+        from ai.concurrency import ai_concurrency_slot
+        mock_generate.return_value = '{"code": "print(1)\\n", "changes": []}'
+
+        with ai_concurrency_slot(user_id=self.user.id):
+            response = self.client.get(reverse('analysis-refactor', args=[self.analysis.id]))
+
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        mock_generate.assert_not_called()
+
 
 class SuggestionsViewTests(APITestCase):
     """SuggestionsView is otherwise untested (pre-existing gap) - covering it
@@ -896,3 +967,14 @@ class SuggestionsViewTests(APITestCase):
         self.client.get(reverse('analysis-suggestions', args=[self.analysis.id]))
         prompt = mock_generate.call_args.args[0]
         self.assertNotIn('Repository context', prompt)
+
+    @patch('analyses.ai_views.generate_text', return_value='[]')
+    def test_source_code_is_delimited_and_flagged_as_untrusted(self, mock_generate):
+        # Prompt-injection hardening: the source code block must be clearly
+        # delimited, and the system instruction must tell the model not to
+        # follow instructions embedded inside it.
+        self.client.get(reverse('analysis-suggestions', args=[self.analysis.id]))
+        prompt, system_instruction = mock_generate.call_args.args[0], mock_generate.call_args.args[1]
+        self.assertIn('BEGIN SOURCE CODE', prompt)
+        self.assertIn('END SOURCE CODE', prompt)
+        self.assertIn('untrusted data', system_instruction.lower())

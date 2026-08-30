@@ -81,6 +81,22 @@ class SendMessageTests(APITestCase):
         })
         self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
 
+    @patch('chat.views.generate_chat_reply')
+    def test_concurrent_ai_request_from_same_user_is_rejected(self, mock_generate):
+        from ai.concurrency import ai_concurrency_slot
+        with ai_concurrency_slot(user_id=self.user.id):
+            response = self.client.post(reverse('chat-message'), {
+                'conversation_id': self.conversation.id, 'message': 'Explain this.',
+            })
+
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        mock_generate.assert_not_called()
+        # The user's message must still not be lost even though the AI call
+        # never happened - it's saved before the concurrency check runs its
+        # course, matching the existing "saved immediately" behavior for a
+        # provider failure.
+        self.assertTrue(ChatMessage.objects.filter(conversation=self.conversation, message='Explain this.').exists())
+
     def test_rejects_empty_message(self):
         response = self.client.post(reverse('chat-message'), {
             'conversation_id': self.conversation.id, 'message': '   ',
@@ -114,16 +130,37 @@ class SendMessageTests(APITestCase):
 
     @patch('chat.views.generate_chat_reply')
     def test_prompt_includes_source_code_and_numbered_issues(self, mock_generate):
+        # The analysis being discussed (source code, numbered issues) is
+        # untrusted, submitted content - it's passed as `context` (a separate
+        # user-role message), not baked into `system_instruction`, which
+        # stays limited to trusted, fixed text.
         mock_generate.return_value = 'ok'
         self.client.post(reverse('chat-message'), {
             'conversation_id': self.conversation.id, 'message': 'Explain this.',
         })
 
-        _args, kwargs = mock_generate.call_args
+        context = mock_generate.call_args.kwargs['context']
+        self.assertIn('def add(a, b):', context)
+        self.assertIn("1. [unused_import] line 1: 'os' imported but unused", context)
+
+    @patch('chat.views.generate_chat_reply')
+    def test_source_code_is_delimited_and_flagged_as_untrusted(self, mock_generate):
+        mock_generate.return_value = 'ok'
+        self.client.post(reverse('chat-message'), {
+            'conversation_id': self.conversation.id, 'message': 'Explain this.',
+        })
+
+        context = mock_generate.call_args.kwargs['context']
+        self.assertIn('BEGIN SOURCE CODE', context)
+        self.assertIn('END SOURCE CODE', context)
+
         call_args = mock_generate.call_args.args
+        _args, kwargs = mock_generate.call_args
         system_instruction = call_args[2] if len(call_args) > 2 else kwargs.get('system_instruction')
-        self.assertIn('def add(a, b):', system_instruction)
-        self.assertIn("1. [unused_import] line 1: 'os' imported but unused", system_instruction)
+        self.assertIn('untrusted data', system_instruction.lower())
+        # And the untrusted-data warning stays in the trusted system
+        # instruction, never the source code itself.
+        self.assertNotIn('def add(a, b):', system_instruction)
 
     @patch('chat.views.generate_chat_reply')
     def test_prior_messages_sent_as_history_in_chronological_order(self, mock_generate):

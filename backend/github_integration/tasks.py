@@ -21,6 +21,43 @@ MAX_RETRIES = 3
 DEFAULT_RETRY_COUNTDOWN_SECONDS = 60
 
 
+def _resolve_monitored_repository(repository_id, hook_id, *, select_integration=False):
+    """`repository_id` (GitHub's numeric repo id) is only unique *per
+    integration* (model constraint), not globally - two different users can
+    each connect their own GitHub account and monitor the same real repo,
+    each with their own webhook. A plain `.get(repository_id=...)` then
+    raises `MultipleObjectsReturned`, and a naive `.first()` would silently
+    attribute this delivery (and thus the PR review / rate-limit usage / any
+    error state) to whichever row happens to sort first - the wrong
+    integration's token would post the review, or the wrong integration's
+    quotas would be charged.
+
+    `hook_id` (from the delivery's X-GitHub-Hook-ID header, see
+    WebhookEvent.hook_id) disambiguates precisely: each monitored repo has
+    its *own* webhook (`GitHubRepository.webhook_id`, set at selection time),
+    so it identifies exactly which integration's connection this specific
+    delivery belongs to. Returns None (treated the same as "not monitored")
+    if the ambiguity can't be resolved, rather than guessing."""
+    queryset = GitHubRepository.objects.filter(repository_id=repository_id, is_active=True)
+    if select_integration:
+        queryset = queryset.select_related('integration')
+    matches = list(queryset)
+
+    if len(matches) <= 1:
+        return matches[0] if matches else None
+
+    if hook_id is not None:
+        exact = [r for r in matches if r.webhook_id == hook_id]
+        if len(exact) == 1:
+            return exact[0]
+
+    logger.warning(
+        'github_task.ambiguous_repository',
+        extra={'repository_id': repository_id, 'hook_id': hook_id, 'candidate_count': len(matches)},
+    )
+    return None
+
+
 def _mark_permanently_failed(pr_analysis: PullRequestAnalysis, webhook_event: WebhookEvent, message: str) -> None:
     pr_analysis.status = PullRequestAnalysis.Status.FAILED
     pr_analysis.error = message[:4000]
@@ -42,13 +79,14 @@ def process_pull_request_webhook(self, webhook_event_id: int) -> None:
     pr_data = payload['pull_request']
     repository_payload = payload['repository']
 
-    try:
-        repository = GitHubRepository.objects.select_related('integration').get(
-            repository_id=repository_payload['id'], is_active=True,
-        )
-    except GitHubRepository.DoesNotExist:
+    repository = _resolve_monitored_repository(
+        repository_payload['id'], webhook_event.hook_id, select_integration=True,
+    )
+    if repository is None:
         # Repo was deselected between the webhook firing and this task
-        # running - not an error, just nothing to do anymore.
+        # running (or the delivery couldn't be attributed to a specific
+        # monitored repo - see _resolve_monitored_repository) - not an
+        # error, just nothing to do.
         logger.info('github_task.repository_not_monitored', extra={'repository_id': repository_payload['id']})
         webhook_event.processed = True
         webhook_event.save(update_fields=['processed'])
@@ -199,11 +237,12 @@ def process_push_webhook(webhook_event_id: int) -> None:
 
     repository_payload = webhook_event.payload['repository']
 
-    try:
-        repository = GitHubRepository.objects.get(repository_id=repository_payload['id'], is_active=True)
-    except GitHubRepository.DoesNotExist:
+    repository = _resolve_monitored_repository(repository_payload['id'], webhook_event.hook_id)
+    if repository is None:
         # Deselected (or replaced by selecting a different repo) before this
-        # task ran - nothing to index anymore.
+        # task ran, or the delivery couldn't be attributed to a specific
+        # monitored repo (see _resolve_monitored_repository) - nothing to
+        # index.
         logger.info('github_task.repository_not_monitored_for_push', extra={'repository_id': repository_payload['id']})
         webhook_event.processed = True
         webhook_event.save(update_fields=['processed'])

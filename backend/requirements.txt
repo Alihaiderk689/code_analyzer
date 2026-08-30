@@ -49,6 +49,7 @@ pyhanko-certvalidator==0.31.1
 pyHanko==0.35.2
 PyJWT==2.13.0
 pypdf==6.14.2
+pyseccomp==0.1.2
 python-bidi==0.6.11
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2

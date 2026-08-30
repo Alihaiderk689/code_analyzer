@@ -4,7 +4,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ai.client import generate_chat_reply
+from ai.concurrency import AICapacityExhausted, ai_concurrency_slot
 from ai.prompts import BASE_CHAT_INSTRUCTION, build_analysis_context
+from ai.validation import clean_ai_prose
 from analyses.models import Analysis
 from core.throttling import AIRateThrottle
 
@@ -67,16 +69,24 @@ class SendMessageView(APIView):
             conversation.messages.exclude(pk=user_message.pk).order_by('-created_at')[:HISTORY_LIMIT]
         )
         history = [{'role': m.role, 'content': m.message} for m in reversed(recent)]
-        system_instruction = BASE_CHAT_INSTRUCTION + build_analysis_context(analysis)
+        # system_instruction stays limited to trusted, server-authored text -
+        # the analysis being discussed is untrusted, submitted content, so it
+        # goes in `context` (a user-role message) instead, same trust tier as
+        # every other prompt-building call site uses for untrusted data.
+        context = build_analysis_context(analysis)
 
         try:
-            reply = generate_chat_reply(data['message'], history, system_instruction)
+            with ai_concurrency_slot(request.user.id):
+                reply = generate_chat_reply(data['message'], history, BASE_CHAT_INSTRUCTION, context=context)
+        except AICapacityExhausted as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
         except Exception:
             return Response(
                 {'detail': 'AI service is currently unavailable. Your message was saved - try again shortly.'},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
 
+        reply = clean_ai_prose(reply) or ''
         ChatMessage.objects.create(conversation=conversation, role=ChatMessage.Role.ASSISTANT, message=reply)
         return Response({'reply': reply})
 
