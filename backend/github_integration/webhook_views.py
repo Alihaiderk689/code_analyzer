@@ -30,6 +30,12 @@ class GitHubWebhookView(APIView):
         event_type = request.headers.get('X-GitHub-Event', '')
         delivery_id = request.headers.get('X-GitHub-Delivery', '')
         signature = request.headers.get('X-Hub-Signature-256', '')
+        # Identifies *which* configured webhook sent this delivery - needed
+        # downstream (tasks.py) to disambiguate two different integrations
+        # both monitoring the same real repository_id. Not present on every
+        # GitHub event type, so left None rather than required.
+        hook_id_header = request.headers.get('X-GitHub-Hook-ID', '')
+        hook_id = int(hook_id_header) if hook_id_header.isdigit() else None
 
         if not event_type or not delivery_id:
             return Response(
@@ -42,6 +48,7 @@ class GitHubWebhookView(APIView):
                 signature_header=signature,
                 event_type=event_type,
                 delivery_id=delivery_id,
+                hook_id=hook_id,
                 secret=settings.GITHUB_WEBHOOK_SECRET,
             )
         except WebhookVerificationError:

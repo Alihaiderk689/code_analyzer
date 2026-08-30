@@ -5,7 +5,8 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from core.throttling import AnalysisCreateRateThrottle
+from ai.concurrency import AICapacityExhausted, ai_concurrency_slot
+from core.throttling import AIRateThrottle, AnalysisCreateRateThrottle
 
 from .models import Analysis
 from .serializers import SecurityReportSerializer
@@ -23,9 +24,16 @@ class SecurityAnalysisView(APIView):
     GET  /api/analysis/<id>/security/  - returns the cached report, if any.
     POST /api/analysis/<id>/security/  - runs the scan (or re-runs it with
                                           ?regenerate=true) and caches the result.
+
+    POST also triggers AI enrichment (AISecurityService, via
+    SecurityAnalysisService) - it carries *both* AnalysisCreateRateThrottle
+    (a full scan is a real, heavier operation) and AIRateThrottle, so this
+    endpoint can't be used to spend a second, separate AI budget on top of
+    Suggestions/Explanation/Refactor/chat - all of them draw on the same
+    per-user `ai` allowance.
     """
 
-    throttle_classes = [AnalysisCreateRateThrottle]
+    throttle_classes = [AnalysisCreateRateThrottle, AIRateThrottle]
 
     def _get_owned_completed_analysis(self, request, pk):
         analysis = get_object_or_404(Analysis, pk=pk, owner=request.user)
@@ -60,11 +68,14 @@ class SecurityAnalysisView(APIView):
             return Response({**serializer.data, 'cached': True})
 
         try:
-            report = SecurityAnalysisService().analyze(
-                source_code=analysis.source_code,
-                language=analysis.language,
-                filename=analysis.name,
-            )
+            with ai_concurrency_slot(request.user.id):
+                report = SecurityAnalysisService().analyze(
+                    source_code=analysis.source_code,
+                    language=analysis.language,
+                    filename=analysis.name,
+                )
+        except AICapacityExhausted as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_429_TOO_MANY_REQUESTS)
         except Exception:
             logger.exception('Security analysis failed for analysis #%s.', analysis.pk)
             return Response(

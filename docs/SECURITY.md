@@ -168,9 +168,90 @@ Separately, the **frontend** injects its own CSP `<meta>` tag at build time (`fr
 
 `CORS_ALLOWED_ORIGINS` is an explicit allowlist (no wildcard), read from environment configuration, with `CORS_ALLOW_CREDENTIALS = True` required for cookies to flow on cross-origin requests between the frontend and API origins.
 
-## 4. Data & Environment
+## 4. AI / LLM Trust Boundaries
 
-### 4.1 No hardcoded secrets
+Five endpoints call an AI provider: per-analysis Suggestions/Explanation/Refactor (`analyses/ai_views.py`), the floating assistant (`ai/views.ChatView`), the persisted "Chat with Your Code" panel (`chat/views.py`), and security-finding enrichment (`analyses/services/ai_security_service.py`, called from `SecurityAnalysisView`). All five route through `ai/client.py`'s `generate_text`/`generate_chat_reply`, which fan out to a three-provider fallback chain (Groq → Gemini → OpenRouter).
+
+**The operating assumption for everything below is that the model itself can be fully compromised or manipulated** (via prompt injection in submitted source code, GitHub repository content, or PR data) **and the application must remain secure regardless.** Nothing in this section treats a prompt instruction as a security boundary — every control listed is enforced in code, not requested from the model.
+
+### 4.1 Where each kind of control actually lives
+
+| Layer | What it actually stops | Example |
+|---|---|---|
+| **Kernel-enforced** | Code execution escaping its sandbox | The Linux/macOS sandbox (`analyses/sandbox.py`, documented separately, not in this file) — but AI output is never passed to it at all (see §4.7); this row exists for completeness, not because AI output reaches it. |
+| **Application-enforced** | What actually determines whether an unwanted outcome can happen | Ownership scoping on every AI endpoint; secret redaction before a provider request is built; output sanitization before a GitHub comment is posted; per-user/global AI concurrency limits; type/length validation on parsed AI responses. |
+| **Provider-enforced** | Best-effort, outside this app's control | Each provider's own content-safety filtering, if any; API keys sent via headers, never query strings, specifically so they can't leak into this app's own exception-message logging. |
+| **Model/prompt-enforced** | **Not a security boundary — informational only** | `UNTRUSTED_DATA_WARNING` and `wrap_untrusted()`'s `--- BEGIN/END ---` delimiters (`ai/prompts.py`), which ask the model not to treat submitted content as instructions. Treated throughout this codebase as a best-effort signal that reduces the *likelihood* of a successful injection, never as the reason a specific bad outcome can't happen — the rows above are what actually prevent it. |
+
+### 4.2 Untrusted-content prompt handling
+
+Every prompt-building call site wraps submitted content (source code, GitHub repository context, security-scanner code snippets) with `ai.prompts.wrap_untrusted(label, content)` before it enters a prompt, and every system/base instruction includes `ai.prompts.UNTRUSTED_DATA_WARNING` once. Untrusted content is kept in the **user**-role message, never concatenated into a system-role instruction — including in the two chat surfaces (`ai/views.ChatView`, `chat/views.SendMessageView`), where the analysis being discussed is passed as a separate `context` argument to `generate_chat_reply()` rather than appended to `system_instruction`. `system_instruction` is reserved exclusively for fixed, server-authored text.
+
+As stated above, this delimiting is a hardening measure, not a guarantee — the controls in §4.3–§4.6 are what hold even if a delimiter is ever defeated.
+
+### 4.3 Chat-history trust model
+
+Replayed conversation history — whether client-supplied per-request (the floating assistant) or persisted per-analysis (the "Chat with Your Code" panel) — is treated as untrusted data, not verified conversation state:
+
+- `generate_chat_reply()` restricts every history turn's role to `{'user', 'assistant'}`; a `'system'` role is dropped, never honored, regardless of what upstream validation allowed through (defense in depth on top of the request serializers, which already reject it).
+- Each turn's content is wrapped with `ai.prompts.wrap_history_turn()` — the same untrusted-data framing fresh source code gets — **including a prior `assistant` turn**: if an earlier injection attempt ever partially shaped a reply, replaying it unmarked would let it compound turn over turn instead of being re-flagged every time.
+- Non-string or empty turn content is dropped rather than passed through.
+- The floating assistant's history is additionally per-request size-bounded (`ai/serializers.py`: 8,000 chars/entry, last 20 entries); the persisted chat's history is server-controlled (`HISTORY_LIMIT = 20` most recent `ChatMessage` rows).
+
+### 4.4 Repository-secret redaction before any provider request
+
+`ai/redaction.py`'s `redact_secrets()` runs inside `generate_text`/`generate_chat_reply` — the last point before a request leaves this application — over every piece of content reaching a provider call: prompt, system instruction, chat message, chat context, and every history turn. It pattern-matches common secret shapes (assignment-style `KEY = "value"`, GitHub/Slack/AWS/OpenAI-style token prefixes, PEM private-key blocks, bearer tokens) and replaces matches with `[REDACTED_SECRET]`. This exists specifically because repository content reaching a prompt (a connected repo's own files, or a security finding's code snippet) can legitimately contain a real committed secret — the app does not ask the user's permission per-request before that content reaches a third-party provider, so redaction is unconditional, not opt-in. It is deliberately independent of `analyses/services/custom_rules_service.py`'s scanning rules (see that module's own docstring on why): scanning optimizes for reporting accuracy, redaction optimizes for never letting a plausible secret leave — over-redacting a harmless string is an acceptable cost, under-redacting a real one is not.
+
+### 4.5 AI output validation before it is trusted further
+
+A parsed AI response is not assumed well-formed. `ai/validation.py` provides two checks, applied wherever a response is about to be persisted or displayed:
+
+- `clean_ai_prose()` — type-checks (rejects non-strings) and length-caps free text (suggestions, explanations, remediations, chat replies). Truncation is safe for prose.
+- `is_valid_ai_code()` — type/size-checks a refactor's rewritten code, **never truncates it** (silently cutting off code could return something that looks valid but doesn't parse, which is worse than the existing "couldn't parse a refactor, fall back to raw text" path already handles).
+
+This closes a real gap: `RefactorView`'s parser previously trusted a parsed `code` field's type without checking it, so a malformed response (`{"code": {...}}`) would have reached a `.save()` call on a text-only DB field uncaught.
+
+### 4.6 AI output → GitHub: a centralized, code-level sanitization boundary
+
+`github_integration/services/comment_service.py`'s `_sanitize_for_github()` is the single point every free-text field reaching a GitHub review/comment payload passes through before becoming real, externally-visible GitHub content — per-issue fields (`message`, and especially the AI-written `explanation`/`remediation` from `ai_security_service`) as well as the review's overall `pr_analysis.summary` text. No free-text field is exempted, even one (like `summary`) that is currently built only from numeric counts and so has no attacker-influenced content today. It:
+
+- strips raw HTML tags outright,
+- defangs `@mentions` (a zero-width space after `@` breaks GitHub's mention detection while leaving the text readable),
+- wraps URLs (bare, or as a markdown link's target) in a code span, which GitHub does not auto-link or parse markdown inside,
+- caps each field's length,
+- and fails closed to an empty string for anything that isn't a usable, non-empty string — never coerces or raises.
+
+Ordinary markdown formatting (bold/italic/lists/code spans) is left alone; only the constructs that would make GitHub treat the text as *live* content are neutralized. This exists because the automatic PR-review pipeline (webhook → Celery task → AI enrichment → posted comment) has no human-approval step between AI output and a real write using the connecting user's own GitHub credentials — the sanitization boundary is what stands in for that missing review, not the prompt-level `UNTRUSTED_DATA_WARNING`.
+
+### 4.7 AI output can never execute code or invoke a privileged action
+
+There is no tool/function-calling anywhere in this codebase — every AI response is parsed for display fields only (`text`, `explanation`, `remediation`, `code`, `changes`) and never branches into a control-flow decision. Concretely:
+
+- `analyses/sandbox.py`'s `run_python()` is only ever called with user-submitted or GitHub-fetched source code (`analyses/engine.py`, `github_integration/services/pr_analysis_service.py`) — never with `ai_refactored_code` or any other AI-generated text. AI output cannot reach the sandbox, and the sandbox's own kernel-enforced isolation is documented separately (see the sandbox implementation notes in this repository).
+- No AI-derived value is ever used to build a raw SQL query, a shell command, or a filesystem path.
+- No AI response field is ever read as an action/command that the app then executes — deleting/modifying data, GitHub operations beyond posting the one sanitized review comment described in §4.6, sending email, or any admin-level operation are all triggered exclusively by explicit user HTTP actions, never by parsed AI content.
+
+### 4.8 Rate and concurrency controls
+
+Two independent mechanisms, for two different failure modes:
+
+- **`AIRateThrottle`** (`core/throttling.py`, scope `ai`, 30/min per user) bounds request *rate over time*, same mechanism as every other throttle in §3.1. `SecurityAnalysisView` carries both `AnalysisCreateRateThrottle` and `AIRateThrottle` together, so it draws on the same per-user AI budget as the other four AI-triggering endpoints rather than a separate one.
+- **`ai/concurrency.py`'s `ai_concurrency_slot()`** bounds *concurrent in-flight AI requests*, which a rate-over-time throttle does not: every AI-triggering endpoint calls its provider synchronously, in-request, occupying a gunicorn worker for up to the full fallback-chain duration (§4.9). A per-user slot (`cache.add`, atomic) caps one in-flight AI request per user; a small global slot pool caps total concurrent AI requests app-wide, below the total worker count, so at least one worker always stays available for non-AI traffic even if every AI slot is in use. Built on the same cache backend (`core.cache.ResilientRedisCache`/Redis in production, degrading to a cache-miss on outage) that already backs the rate throttles — no new infrastructure. Capacity exhaustion returns an immediate `429`, never a queued wait (queuing would tie up the very worker this exists to protect).
+
+### 4.9 Provider fallback and timeouts
+
+`ai/client.py`'s `_call_with_fallback` tries Groq, then Gemini, then OpenRouter, each bounded by `AI_REQUEST_TIMEOUT_SECONDS` (20s) with no SDK-level retries; if all three fail, the original exception from the last provider is re-raised (`raise last_error`) — **fail-closed**, never a silent default/empty "success" that a caller could mistake for a real response. Worst case per request: 3 × 20s = 60s, which is why `gunicorn --timeout 120` (`backend/Dockerfile`) sits comfortably above it.
+
+### 4.10 Remaining limitations / assumptions
+
+- The `UNTRUSTED_DATA_WARNING`/`wrap_untrusted()` framing (§4.2) has not been red-teamed against a live model with adversarial payloads in this codebase — it is documented here as a hardening measure precisely because its effectiveness against a specific attack is not proven, and every control in §4.4–§4.6 is designed to hold regardless of whether it succeeds or fails.
+- `_sanitize_for_github()`'s HTML-tag/mention/URL neutralization is pattern-based, not a full HTML/markdown parser — it targets the specific constructs known to make GitHub treat text as live content, not an exhaustive allowlist.
+- `ai/redaction.py`'s secret patterns are heuristic (assignment-style secrets, known vendor token prefixes, PEM blocks, bearer tokens) — a secret in a shape none of those patterns cover would not be redacted. This is a real residual risk for repository content sent to third-party AI providers, disclosed rather than implied to be fully solved.
+- The AI concurrency slot's global cap is a fixed pool size tuned to this app's current gunicorn worker count (3, `backend/Dockerfile`); if the worker count changes, the pool size should be reviewed alongside it.
+
+## 5. Data & Environment
+
+### 5.1 No hardcoded secrets
 
 Every credential, API key, and secret value in this codebase is read from an environment variable via `os.environ.get(...)` — there are **no hardcoded fallback values for secrets** anywhere in `config/settings.py`. `SECRET_KEY` in particular has no default at all (`os.environ['SECRET_KEY']`, not `.get()`) — a missing value fails Django startup loudly rather than silently falling back to a key that might already be sitting in git history.
 
@@ -183,11 +264,11 @@ Real `.env` files are gitignored and have never been committed; `.env.example` (
 
 Development is left alone (Django's own `DEBUG=True` behavior implicitly allows localhost), so no local configuration is needed to run the server. The leading-dot form `.example.com` — a domain and all its subdomains — remains allowed, since it is still an explicit allowlist entry rather than a wildcard.
 
-### 4.2 Lazy configuration validation
+### 5.2 Lazy configuration validation
 
 Third-party integrations that are optional at deploy time (Brevo, GitHub OAuth/webhooks, Google OAuth, each AI provider) validate their own configuration **on first actual use**, not at Django process startup — a missing key surfaces as a clear `503`/`ImproperlyConfigured` error from the specific endpoint that needed it, rather than preventing the entire application from booting. This is deliberate: it means, for example, a deployment without GitHub integration configured still serves every other feature correctly.
 
-### 4.3 API key inventory
+### 5.3 API key inventory
 
 | Variable | Purpose | Required? |
 |---|---|---|
@@ -202,16 +283,16 @@ Third-party integrations that are optional at deploy time (Brevo, GitHub OAuth/w
 
 Rotating any of these values requires only an environment-variable update and a redeploy — none are baked into build artifacts on the backend. (Frontend-side public values — `VITE_API_BASE_URL`, `VITE_GOOGLE_CLIENT_ID` — are compiled into the static JS bundle at build time, as is standard for Vite; OAuth client IDs are not treated as secret, since they are inherently public once shipped to a browser.)
 
-### 4.4 Data at rest
+### 5.4 Data at rest
 
 - Passwords: Django's default PBKDF2 hashing, never stored or logged in plaintext.
 - OTP codes: keyed HMAC-SHA256 hash only, never plaintext (§2.2).
-- GitHub access tokens: Fernet-encrypted (§2.4), single-key — see §5.2 for the key-rotation backlog item.
+- GitHub access tokens: Fernet-encrypted (§2.4), single-key — see §6.2 for the key-rotation backlog item.
 - No sensitive value (password, OTP code, JWT, API key) is ever written to application logs — structured log calls (`core/logging_formatters.py`) pass identifiers (user ID, email, request path) as context, not credentials.
 
-## 5. Backlog
+## 6. Backlog
 
-### 5.1 Dependency Auditing
+### 6.1 Dependency Auditing
 
 Both CI jobs (`.github/workflows/ci.yml`) run a dependency vulnerability scan on every push and pull request to `main`/`dev`:
 
@@ -231,7 +312,7 @@ Both steps are currently **advisory (`continue-on-error: true`), not gating.** T
 
 Removing `continue-on-error` from both steps is a one-line change per job, and should be done as soon as that list is cleared — at which point these become real gates rather than reports.
 
-### 5.2 GitHub encryption-key rotation
+### 6.2 GitHub encryption-key rotation
 
 **Status: not implemented, and not currently necessary.** Stored GitHub access tokens are encrypted with a single Fernet key (`GITHUB_TOKEN_ENCRYPTION_KEY`, `github_integration/services/encryption.py`). Rotating that key today makes every stored ciphertext undecryptable — the code handles this cleanly rather than crashing (`TokenDecryptionError`, surfaced to the user as "reconnect your GitHub account"), and the tokens are re-obtainable through the OAuth flow at any time, so the blast radius is a reconnect prompt, not data loss. Nothing else in the system is encrypted with this key.
 

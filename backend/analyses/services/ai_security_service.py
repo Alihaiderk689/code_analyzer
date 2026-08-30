@@ -16,6 +16,8 @@ import logging
 from typing import Optional
 
 from ai.client import generate_text
+from ai.prompts import UNTRUSTED_DATA_WARNING, wrap_untrusted
+from ai.validation import clean_ai_prose
 from core.execution_budget import STAGE_AI_ENRICHMENT, BudgetExceeded
 
 from .types import SecurityFinding
@@ -30,7 +32,7 @@ _SYSTEM_INSTRUCTION = (
     'explanation of why it is dangerous and a concrete, specific remediation. '
     'Respond with ONLY a JSON array, exactly one object per finding in the same order, each of the '
     'shape {"explanation": "<1-3 sentences>", "remediation": "<1-3 sentences, concrete>"}. '
-    'No other text, no markdown fences.'
+    f'No other text, no markdown fences. {UNTRUSTED_DATA_WARNING}'
 )
 
 
@@ -73,8 +75,11 @@ class AISecurityService:
             entries = [None] * len(findings)
 
         for finding, entry in zip(findings, entries):
-            finding.explanation = (entry or {}).get('explanation') or self._fallback_explanation(finding)
-            finding.remediation = (entry or {}).get('remediation') or self._fallback_remediation(finding)
+            # clean_ai_prose both type-checks (a malformed/adversarial response
+            # could return a non-string here, e.g. a nested object) and length-
+            # caps before this text is trusted enough to attach to a finding.
+            finding.explanation = clean_ai_prose((entry or {}).get('explanation')) or self._fallback_explanation(finding)
+            finding.remediation = clean_ai_prose((entry or {}).get('remediation')) or self._fallback_remediation(finding)
         return findings
 
     @staticmethod
@@ -86,7 +91,7 @@ class AISecurityService:
             f'Rule: {f.rule_id}\n'
             f'Line: {f.line_number}\n'
             f'Scanner message: {f.description}\n'
-            f'Code:\n{f.code_snippet}'
+            f'{wrap_untrusted("CODE SNIPPET", f.code_snippet)}'
             for i, f in enumerate(findings, start=1)
         ]
         return '\n\n'.join(blocks)

@@ -175,7 +175,7 @@ def _python_runtime_issues(code, budget=None):
             'line': None,
             'type': 'runtime_check_unavailable',
             'message': (
-                'Runtime error detection is unavailable on this server (requires macOS); '
+                'Runtime error detection is unavailable on this server; '
                 'only static analysis was performed for this submission.'
             ),
         }]

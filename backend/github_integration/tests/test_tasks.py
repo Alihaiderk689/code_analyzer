@@ -56,6 +56,62 @@ class UnmonitoredRepositoryTests(_TaskTestCase):
         self.assertEqual(PullRequestAnalysis.objects.count(), 0)
 
 
+class AmbiguousRepositoryTests(_TaskTestCase):
+    """Two different users can each connect their own GitHub account and
+    monitor the same real repository_id (e.g. two collaborators on a shared
+    repo) - repository_id is only unique *per integration*, not globally.
+    Each has their own webhook, so the delivery's X-GitHub-Hook-ID header
+    (WebhookEvent.hook_id) is what disambiguates which one this delivery
+    belongs to."""
+
+    @patch(_PATCHED_COMMENTS)
+    @patch(_PATCHED_SERVICE)
+    def test_pull_request_webhook_resolves_via_hook_id_not_first_match(self, mock_service_cls, _mock_comments_cls):
+        integration_a = make_integration(make_user('a@example.com'), github_user_id=101)
+        integration_b = make_integration(make_user('b@example.com'), github_user_id=102)
+        repo_a = make_repository(integration_a, repository_id=5001, webhook_id=111)
+        repo_b = make_repository(integration_b, repository_id=5001, webhook_id=222)
+        mock_service_cls.return_value.analyze.return_value = []
+
+        event = make_webhook_event(repository_id=5001, hook_id=222)
+        process_pull_request_webhook.apply(args=[event.id], throw=False)
+
+        # Only repo_b's (the one matching the delivering webhook) analysis
+        # should have been created - never repo_a's, and never both.
+        self.assertEqual(PullRequestAnalysis.objects.filter(repository=repo_b).count(), 1)
+        self.assertEqual(PullRequestAnalysis.objects.filter(repository=repo_a).count(), 0)
+
+    def test_pull_request_webhook_without_a_resolvable_hook_id_is_a_noop(self):
+        integration_a = make_integration(make_user('a@example.com'), github_user_id=101)
+        integration_b = make_integration(make_user('b@example.com'), github_user_id=102)
+        make_repository(integration_a, repository_id=5002, webhook_id=111)
+        make_repository(integration_b, repository_id=5002, webhook_id=222)
+
+        # No hook_id at all (e.g. header missing) - can't disambiguate, so
+        # this must not guess and attribute the delivery to either one.
+        event = make_webhook_event(repository_id=5002, hook_id=None)
+        process_pull_request_webhook.apply(args=[event.id], throw=False)
+
+        event.refresh_from_db()
+        self.assertTrue(event.processed)
+        self.assertEqual(PullRequestAnalysis.objects.count(), 0)
+
+    def test_push_webhook_resolves_via_hook_id_not_first_match(self):
+        integration_a = make_integration(make_user('a@example.com'), github_user_id=101)
+        integration_b = make_integration(make_user('b@example.com'), github_user_id=102)
+        repo_a = make_repository(integration_a, repository_id=5003, webhook_id=111, default_branch='main')
+        repo_b = make_repository(integration_b, repository_id=5003, webhook_id=222, default_branch='main')
+
+        event = make_webhook_event(
+            event_type='push', repository_id=5003, hook_id=222,
+            repository_full_name=repo_b.full_name,
+        )
+        with patch('github_integration.tasks.build_repository_index') as mock_index:
+            process_push_webhook.apply(args=[event.id], throw=False)
+
+        mock_index.delay.assert_called_once_with(repo_b.id)
+
+
 class AlreadyAnalyzedTests(_TaskTestCase):
     @patch(_PATCHED_COMMENTS)
     @patch(_PATCHED_SERVICE)

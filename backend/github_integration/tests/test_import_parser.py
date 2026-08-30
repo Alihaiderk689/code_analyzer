@@ -24,6 +24,29 @@ class ExtractImportsPythonTests(SimpleTestCase):
     def test_no_imports(self):
         self.assertEqual(extract_imports('x = 1\n', 'Python'), [])
 
+    def test_single_dot_relative_from_import(self):
+        self.assertEqual(extract_imports('from .serializers import UserSerializer\n', 'Python'), ['.serializers'])
+
+    def test_double_dot_relative_from_import(self):
+        self.assertEqual(extract_imports('from ..accounts.models import User\n', 'Python'), ['..accounts.models'])
+
+    def test_bare_dot_import_expands_each_name(self):
+        content = 'from . import serializers, models\n'
+        self.assertEqual(extract_imports(content, 'Python'), ['.serializers', '.models'])
+
+    def test_bare_double_dot_import_expands_name(self):
+        self.assertEqual(extract_imports('from .. import accounts\n', 'Python'), ['..accounts'])
+
+    def test_bare_dot_import_drops_alias(self):
+        self.assertEqual(extract_imports('from . import serializers as s\n', 'Python'), ['.serializers'])
+
+    def test_bare_dot_import_ignores_wildcard(self):
+        self.assertEqual(extract_imports('from . import *\n', 'Python'), [])
+
+    def test_bare_dot_import_with_parens(self):
+        content = 'from . import (serializers, models)\n'
+        self.assertEqual(extract_imports(content, 'Python'), ['.serializers', '.models'])
+
 
 class ExtractImportsJSTests(SimpleTestCase):
     def test_esm_default_import(self):
@@ -62,6 +85,58 @@ class ResolvePythonImportTests(SimpleTestCase):
     def test_third_party_import_does_not_resolve(self):
         all_paths = {'myapp/utils.py'}
         self.assertIsNone(resolve_import('requests', 'myapp/views.py', all_paths, 'Python'))
+
+
+class ResolvePythonRelativeImportTests(SimpleTestCase):
+    """Django-style relative imports (`from .serializers import X`,
+    `from . import serializers`, `from ..app.models import X`) - the bug this
+    covers: the old resolver mishandled every leading dot, so `views.py`
+    never linked to its own `serializers.py`/`models.py` in the same app."""
+
+    def test_single_dot_resolves_sibling_module(self):
+        all_paths = {'accounts/views.py', 'accounts/serializers.py'}
+        self.assertEqual(
+            resolve_import('.serializers', 'accounts/views.py', all_paths, 'Python'), 'accounts/serializers.py',
+        )
+
+    def test_single_dot_resolves_sibling_package_init(self):
+        all_paths = {'accounts/views.py', 'accounts/serializers/__init__.py'}
+        self.assertEqual(
+            resolve_import('.serializers', 'accounts/views.py', all_paths, 'Python'), 'accounts/serializers/__init__.py',
+        )
+
+    def test_single_dot_from_top_level_module(self):
+        # importing_path has no directory component - base_dir is '' and the
+        # relative target sits at the repo root alongside it.
+        all_paths = {'views.py', 'serializers.py'}
+        self.assertEqual(resolve_import('.serializers', 'views.py', all_paths, 'Python'), 'serializers.py')
+
+    def test_double_dot_walks_up_to_sibling_app(self):
+        all_paths = {'backend/orders/views.py', 'backend/accounts/models.py'}
+        self.assertEqual(
+            resolve_import('..accounts.models', 'backend/orders/views.py', all_paths, 'Python'),
+            'backend/accounts/models.py',
+        )
+
+    def test_relative_import_with_no_matching_file_returns_none(self):
+        all_paths = {'accounts/views.py'}
+        self.assertIsNone(resolve_import('.serializers', 'accounts/views.py', all_paths, 'Python'))
+
+    def test_relative_import_does_not_fall_back_to_suffix_match_elsewhere(self):
+        # A same-named serializers.py living in a *different* package must
+        # not be picked up for a relative import - unlike the absolute-import
+        # case, the anchor here is exact, so no shortest-suffix guessing.
+        all_paths = {'accounts/views.py', 'billing/serializers.py'}
+        self.assertIsNone(resolve_import('.serializers', 'accounts/views.py', all_paths, 'Python'))
+
+    def test_bare_dot_import_name_resolves_like_explicit_from_import(self):
+        # extract_imports() turns `from . import serializers` into '.serializers'
+        # - confirms resolve_import treats that identically to a normal
+        # `from .serializers import X` specifier.
+        all_paths = {'accounts/views.py', 'accounts/serializers.py'}
+        self.assertEqual(
+            resolve_import('.serializers', 'accounts/views.py', all_paths, 'Python'), 'accounts/serializers.py',
+        )
 
 
 class ResolveJSImportTests(SimpleTestCase):

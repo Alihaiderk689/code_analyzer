@@ -11,6 +11,7 @@ from core.throttling import AnalysisCreateRateThrottle
 
 from .engine import analyze_code, detect_language, detect_language_from_code
 from .models import Analysis
+from .pagination import AnalysisPagination
 from .serializers import (
     AnalysisDetailSerializer,
     AnalysisSerializer,
@@ -105,10 +106,14 @@ class UploadView(APIView):
 
 
 class AnalysisListView(APIView):
+    pagination_class = AnalysisPagination
+
     def get(self, request):
         queryset = Analysis.objects.filter(owner=request.user)
-        serializer = AnalysisSerializer(queryset, many=True)
-        return Response({'count': queryset.count(), 'results': serializer.data})
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(queryset, request)
+        serializer = AnalysisSerializer(page, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
 
 class AnalysisDetailView(APIView):

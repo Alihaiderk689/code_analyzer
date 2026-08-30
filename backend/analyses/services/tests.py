@@ -268,6 +268,14 @@ class AISecurityServiceTests(SimpleTestCase):
         self.assertEqual(result[0].explanation, 'e1')
         self.assertTrue(result[1].explanation)  # fallback text, not a crash
 
+    @patch('analyses.services.ai_security_service.generate_text', return_value='[]')
+    def test_code_snippet_is_delimited_and_flagged_as_untrusted(self, mock_generate):
+        self.service.enrich([make_finding()], 'x = 1')
+        prompt, system_instruction = mock_generate.call_args.args[0], mock_generate.call_args.args[1]
+        self.assertIn('BEGIN CODE SNIPPET', prompt)
+        self.assertIn('END CODE SNIPPET', prompt)
+        self.assertIn('untrusted data', system_instruction.lower())
+
 
 class RecordingScanner(BaseSecurityScanner):
     """Test double - records calls and returns a fixed list of findings."""

@@ -263,6 +263,14 @@ class WebhookEvent(models.Model):
 
     event_type = models.CharField(max_length=100)  # X-GitHub-Event header, e.g. "pull_request"
     delivery_id = models.CharField(max_length=100, unique=True)
+    # X-GitHub-Hook-ID header - identifies *which* configured webhook sent this
+    # delivery. Needed because `repository_id` alone isn't unique across
+    # integrations (two different users can each monitor the same real GitHub
+    # repo, each with their own webhook) - see tasks.py's repository
+    # resolution. Null for deliveries that predate this field, or lacked the
+    # header for some other reason - repository resolution falls back to
+    # repository_id-only matching in that case (see tasks.py).
+    hook_id = models.BigIntegerField(null=True, blank=True)
     payload = models.JSONField()
     processed = models.BooleanField(default=False)
     error = models.TextField(blank=True)

@@ -78,11 +78,20 @@ export const getRefactor = (id, regenerate = false) =>
   apiFetch(`/analysis/${id}/refactor/${regenerate ? '?regenerate=true' : ''}`)
 
 // History
-export const listHistory = () => apiFetch('/history/')
+export const listHistory = ({ page } = {}) => {
+  const params = new URLSearchParams()
+  if (page) params.set('page', page)
+  const qs = params.toString()
+  return apiFetch(`/history/${qs ? `?${qs}` : ''}`)
+}
 export const clearHistory = () => apiFetch('/history/clear/', { method: 'DELETE' })
 
 // Search
-export const searchAnalyses = (q) => apiFetch(`/search/?q=${encodeURIComponent(q)}`)
+export const searchAnalyses = (q, { page } = {}) => {
+  const params = new URLSearchParams({ q })
+  if (page) params.set('page', page)
+  return apiFetch(`/search/?${params.toString()}`)
+}
 
 // Dashboard
 export const getDashboard = () => apiFetch('/dashboard/')

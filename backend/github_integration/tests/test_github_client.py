@@ -7,6 +7,7 @@ from ..services.github_client import (
     GitHubAPIError,
     GitHubAuthError,
     GitHubClient,
+    GitHubFileTooLargeError,
     GitHubRateLimitError,
     build_authorize_url,
 )
@@ -172,6 +173,46 @@ class GitHubClientWebhookAndReviewTests(SimpleTestCase):
         mock_request.return_value = _mock_response(200, json_data={'encoding': 'none', 'content': ''})
         with self.assertRaises(GitHubAPIError):
             GitHubClient(access_token='tok').get_file_content('octocat', 'hello-world', 'app.py', 'main')
+
+    @patch('github_integration.services.github_client.requests.request')
+    def test_get_file_content_raises_before_decoding_an_oversized_file(self, mock_request):
+        # `content` is deliberately invalid base64 - if the size check didn't
+        # run *before* the decode attempt, this would raise a decode error
+        # instead of GitHubFileTooLargeError, proving the ordering.
+        mock_request.return_value = _mock_response(
+            200, json_data={'encoding': 'base64', 'content': 'not-valid-base64!!!', 'size': 1_000_000},
+        )
+        with self.assertRaises(GitHubFileTooLargeError) as ctx:
+            GitHubClient(access_token='tok').get_file_content(
+                'octocat', 'hello-world', 'huge.py', 'main', max_size_bytes=500_000,
+            )
+        self.assertEqual(ctx.exception.size, 1_000_000)
+        self.assertEqual(ctx.exception.max_size_bytes, 500_000)
+
+    @patch('github_integration.services.github_client.requests.request')
+    def test_get_file_content_within_size_limit_still_decodes_normally(self, mock_request):
+        import base64
+        encoded = base64.b64encode(b'print("hello")').decode()
+        mock_request.return_value = _mock_response(
+            200, json_data={'encoding': 'base64', 'content': encoded, 'size': 14},
+        )
+        content = GitHubClient(access_token='tok').get_file_content(
+            'octocat', 'hello-world', 'app.py', 'main', max_size_bytes=500_000,
+        )
+        self.assertEqual(content, 'print("hello")')
+
+    @patch('github_integration.services.github_client.requests.request')
+    def test_get_file_content_with_no_max_size_bytes_ignores_size(self, mock_request):
+        import base64
+        encoded = base64.b64encode(b'print("hello")').decode()
+        mock_request.return_value = _mock_response(
+            200, json_data={'encoding': 'base64', 'content': encoded, 'size': 999_999_999},
+        )
+        # Default max_size_bytes=None - existing call sites that don't pass
+        # it (none currently, but the parameter is optional) must keep
+        # working exactly as before.
+        content = GitHubClient(access_token='tok').get_file_content('octocat', 'hello-world', 'app.py', 'main')
+        self.assertEqual(content, 'print("hello")')
 
 
 @override_settings(
